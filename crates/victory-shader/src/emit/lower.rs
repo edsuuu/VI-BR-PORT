@@ -673,6 +673,8 @@ fn lane_uniform(
     wave_tid: Option<Value>,
 ) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let order = crate::ir::reverse_postorder(&p.blocks);
+    let regions = lane_regions(st);
     let mut same: HashSet<Value> = HashSet::new();
     loop {
         // An atom of a lane condition that every lane of a console wave holds alike.
@@ -686,10 +688,10 @@ fn lane_uniform(
         };
         // Blocks every lane of a console wave reaches together: `all`, or reached only past
         // branches on alike conditions.
-        let wave_all: Vec<bool> = match lane_regions(st) {
+        let wave_all: Vec<bool> = match &regions {
             Some(regions) => {
                 let mut w = vec![true; st.exits.len()];
-                for (d, region) in regions {
+                for &(d, ref region) in regions {
                     let LaneExit::Branch { when, .. } = st.exits[d] else {
                         continue;
                     };
@@ -707,7 +709,7 @@ fn lane_uniform(
             None => all.to_vec(),
         };
         let mut next: HashSet<Value> = HashSet::new();
-        for b in crate::ir::reverse_postorder(&p.blocks) {
+        for &b in &order {
             let block = &p.blocks[b];
             let whole = block
                 .preds
@@ -747,9 +749,11 @@ fn lane_uniform(
                     addr: Some(Operand::Vector { reg, .. }),
                     dst: Some(_),
                     data,
+                    gds: false,
                     ..
                 } = &inst.fields
                     && name.starts_with("ds_read")
+                    && !name.contains("_d16")
                     && data.is_empty()
                 {
                     if inst.read(Reg::V(*reg)).is_some_and(|a| known(&next, &a)) {
@@ -762,7 +766,7 @@ fn lane_uniform(
                     }
                     continue;
                 }
-                let ops: Vec<Operand> = match &inst.fields {
+                let ops = match &inst.fields {
                     Fields::Valu(v)
                         if v.dpp.is_none()
                             && v.sdwa.is_none()
@@ -770,7 +774,7 @@ fn lane_uniform(
                             && !name.starts_with("v_cmpx")
                             && !name.contains("lane") =>
                     {
-                        v.src.clone()
+                        v.src.as_slice()
                     }
                     _ => continue,
                 };
@@ -779,29 +783,32 @@ fn lane_uniform(
                 if let (
                     Some(tid),
                     "v_lshrrev_b32",
-                    [Operand::Const(k), Operand::Vector { reg, .. }, ..],
+                    [Operand::Const(k @ 128..=192), Operand::Vector { reg, .. }, ..],
                 ) = (wave_tid, name, ops.as_slice())
-                    && (134..=192).contains(k)
+                    && ((k - 128) & 31) >= 6
                     && inst.read(Reg::V(*reg)) == Some(tid)
                 {
                     next.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
                     continue;
                 }
                 let alike = ops.iter().all(|op| match *op {
-                    Operand::Vector { reg, .. } => {
-                        // every dword of the operand the instruction reads from that register on
-                        let read: Vec<Value> = inst
-                            .reads
-                            .iter()
-                            .filter(|r| matches!(r.0, Reg::V(x) if x >= reg))
-                            .map(|r| r.1)
-                            .collect();
-                        !read.is_empty() && read.iter().all(|x| known(&next, x))
+                    Operand::Vector { reg, dwords } => {
+                        // Only the explicit operand, not a preserved destination in `reads`.
+                        (0..dwords).all(|i| {
+                            reg.checked_add(i)
+                                .and_then(|r| inst.read(Reg::V(r)))
+                                .is_some_and(|v| known(&next, &v))
+                        })
                     }
-                    // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                    Operand::Scalar { code, .. } if code != NULL => inst
-                        .read(Reg::S(code))
-                        .is_none_or(|x| !is_mask(x) || known(&next, &x)),
+                    Operand::Scalar { code, dwords } if code != NULL => {
+                        (0..dwords).all(|i| {
+                            code.checked_add(i)
+                                .and_then(|r| inst.read(Reg::S(r)))
+                                .is_some_and(|v| !is_mask(v) || known(&next, &v))
+                        })
+                    }
+                    // These sources depend on execution or an implicit register.
+                    Operand::Const(251..=254) | Operand::Attr { .. } => false,
                     _ => true,
                 });
                 if alike {
@@ -824,7 +831,7 @@ fn wave_tid(p: &Program, x: &Parts<'_>) -> Option<Value> {
         return None;
     };
     let [tx, ty, tz] = cs.threads;
-    if !x.native.wave64 || !(tx % 64 == 0 || ty * tz == 1) {
+    if !x.native.wave64 || !(tx.is_multiple_of(64) || (ty, tz) == (1, 1)) {
         return None;
     }
     p.inputs
