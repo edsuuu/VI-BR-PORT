@@ -1128,6 +1128,145 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// Runs `list` (closed) on the host's queue and waits for it.
+    fn run_and_wait(host: &Host, list: &HostList) {
+        // SAFETY: a closed list of ours; a fence and event of the test's.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            host.queue.ExecuteCommandLists(&[Some(list.list.cast().unwrap())]);
+            host.queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+            let _ = windows::Win32::Foundation::CloseHandle(event);
+        }
+    }
+
+    /// A host list put away closed as it ran (`VICTORY_LIST_LAZY_RESET`):
+    /// emptied it runs nothing, as one put away reset and closed; reset it
+    /// records and runs as any. On the host's card (needs one; the switch is
+    /// not read, the calls are made directly).
+    #[test]
+    #[ignore = "uses the host's card: cargo test -p victory-gpu --lib rested -- --ignored --nocapture"]
+    fn a_rested_list_runs_empty_and_records_after_its_reset() {
+        let Some(host) = host() else {
+            return;
+        };
+        const N: usize = 256;
+        let (src, src_data) = host.shared_buffer(N as u64).unwrap();
+        let (dst, dst_data) = host.shared_buffer(N as u64).unwrap();
+        // SAFETY: both mapped for `N` bytes; the card is not using them
+        // between the runs below.
+        let (src_bytes, dst_bytes) =
+            unsafe { (std::slice::from_raw_parts_mut(src_data, N), std::slice::from_raw_parts_mut(dst_data, N)) };
+        let copy = |list: &HostList| {
+            // SAFETY: an open list; live buffers of `N` bytes.
+            unsafe { list.list.CopyBufferRegion(&dst, 0, &src, 0, N as u64) };
+        };
+        let list = host.new_list().unwrap();
+        // Not put away: nothing to do.
+        list.unrest();
+        assert!(!list.rested());
+        src_bytes.fill(0xAB);
+        dst_bytes.fill(0);
+        copy(&list);
+        list.close();
+        run_and_wait(host, &list);
+        assert!(dst_bytes.iter().all(|&b| b == 0xAB), "the copy ran");
+        // Put away as it ran, then run again before any reset: nothing.
+        list.rest();
+        assert!(list.rested());
+        dst_bytes.fill(0);
+        list.unrest();
+        assert!(!list.rested());
+        run_and_wait(host, &list);
+        assert!(dst_bytes.iter().all(|&b| b == 0), "an emptied list runs nothing");
+        // Put away again, and reset by whoever records next.
+        list.rest();
+        list.reset();
+        assert!(!list.rested());
+        src_bytes.fill(0xCD);
+        copy(&list);
+        list.close();
+        run_and_wait(host, &list);
+        assert!(dst_bytes.iter().all(|&b| b == 0xCD), "a list reset after its rest records and runs");
+    }
+
+    /// What a host list's cycle costs the thread that recycles and detaches
+    /// it, the old way (reset at its landing, closed empty when given to a
+    /// title's list, then the title's reset and close) and with
+    /// `VICTORY_LIST_LAZY_RESET` (put away closed: only the title's reset and
+    /// close). Prints microseconds a cycle; the title's reset and close are
+    /// not on the submitting thread, so the difference is what that thread
+    /// saves a list.
+    #[test]
+    #[ignore = "a measurement on the host's card: cargo test -p victory-gpu --release --lib list_cycle -- --ignored --nocapture"]
+    fn list_cycle_costs() {
+        let Some(host) = host() else {
+            return;
+        };
+        let (a, _) = host.shared_buffer(1 << 16).unwrap();
+        let (b, _) = host.shared_buffer(1 << 16).unwrap();
+        const LISTS: usize = 64;
+        const ROUNDS: usize = 20;
+        let lists: Vec<HostList> = (0..LISTS).map(|_| host.new_list().unwrap()).collect();
+        let record = |list: &HostList| {
+            // SAFETY: an open list; live buffers.
+            unsafe {
+                for _ in 0..16 {
+                    list.list.CopyBufferRegion(&b, 0, &a, 0, 1 << 16);
+                }
+            }
+            list.close();
+        };
+        let run_all = |lists: &[HostList]| {
+            for list in lists {
+                run_and_wait(host, list);
+            }
+        };
+        lists.iter().for_each(&record);
+        run_all(&lists);
+        // (submitting thread's part, whole cycle) in microseconds.
+        let mut old = (0u128, 0u128);
+        let mut new = (0u128, 0u128);
+        for _ in 0..ROUNDS {
+            let began = std::time::Instant::now();
+            let mut ours = std::time::Duration::ZERO;
+            for list in &lists {
+                let t = std::time::Instant::now();
+                list.reset();
+                list.close();
+                ours += t.elapsed();
+                list.reset();
+                record(list);
+            }
+            old.0 += ours.as_micros();
+            old.1 += began.elapsed().as_micros();
+            run_all(&lists);
+            let began = std::time::Instant::now();
+            let mut ours = std::time::Duration::ZERO;
+            for list in &lists {
+                let t = std::time::Instant::now();
+                list.rest();
+                ours += t.elapsed();
+                list.reset();
+                record(list);
+            }
+            new.0 += ours.as_micros();
+            new.1 += began.elapsed().as_micros();
+            run_all(&lists);
+        }
+        let per = |us: u128| us as f64 / (LISTS * ROUNDS) as f64;
+        eprintln!(
+            "a host list's cycle, us: reset at landing and closed empty {:.2} on the submitting thread ({:.2} with the title's reset, \
+             16 copies and close); put away closed {:.2} ({:.2})",
+            per(old.0),
+            per(old.1),
+            per(new.0),
+            per(new.1)
+        );
+    }
 }
 
 /// The batches of clamped records in one scratch buffer
@@ -1182,6 +1321,10 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// Put away after its run with its D3D12 list still closed as it ran
+    /// and not reset ([`HostList::rest`], [`lazy_reset`]): reset when it is
+    /// next recorded into, emptied if it is to run before that.
+    rested: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1206,6 +1349,27 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// Whether a host list that has run is put away for reuse with its D3D12
+/// list closed as it ran (`VICTORY_LIST_LAZY_RESET=1`; off by default: reset
+/// when it lands, as before).
+///
+/// Each host list went through two resets and two closes a cycle, one of
+/// each on the submitting thread for nothing: reset (allocator and list)
+/// when its submission landed (`crate::list::recycle`), closed empty when it
+/// was given to a title's list in place of the one a submission took
+/// (`crate::list::detach`), then reset by the title's own reset and closed by
+/// its close. With some 290 host lists a frame (the opening, thin lists) the
+/// detaching alone was 3.4% of the submitting thread and list resets 3.0%
+/// (profile intro-s-pfabre). With the switch the landing lets go of what the
+/// list held, as before, and leaves the D3D12 calls to the title's reset; a
+/// list that is to record before that (`crate::list::fresh_list`) is reset
+/// there, and one that is to run as it is (a title's list submitted again
+/// without a reset, [`Host::submit`]) is emptied first, as it was before.
+pub(crate) fn lazy_reset() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_LAZY_RESET").is_some_and(|v| v == "1"))
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -4455,6 +4619,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                rested: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6343,6 +6508,12 @@ impl Host {
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
+        // A list put away closed as it ran ([`lazy_reset`]) runs empty, as one
+        // put away reset and closed did: a title may submit its list again
+        // without recording into it.
+        if lazy_reset() {
+            runs.iter().for_each(|list| list.unrest());
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
@@ -7124,10 +7295,57 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
+        self.let_go();
+        // SAFETY: the list is not executing.
+        let reset = unsafe {
+            self.allocator
+                .Reset()
+                .and_then(|()| self.list.Reset(&self.allocator, None))
+        };
+        if let Err(e) = reset {
+            fail(format_args!("a host command list did not reset ({e})"));
+        }
+        self.rested.store(false, Ordering::Release);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// As [`HostList::reset`] for what the list holds, its D3D12 list left
+    /// closed as it ran ([`lazy_reset`]). Only after the list's last
+    /// submission finished.
+    pub(crate) fn rest(&self) {
+        let _resting = crate::timeline::span("letting go of what a host list held");
+        self.let_go();
+        self.rested.store(true, Ordering::Release);
+    }
+
+    /// Whether the list was put away by [`HostList::rest`] and not reset
+    /// since: closed, its D3D12 list still holding the commands it ran.
+    pub(crate) fn rested(&self) -> bool {
+        self.rested.load(Ordering::Acquire)
+    }
+
+    /// A list put away by [`HostList::rest`] that is to run before any reset
+    /// (a title's list submitted again as it was): emptied, as a list put
+    /// away was before, so that it runs nothing. Nothing for another list.
+    pub(crate) fn unrest(&self) {
+        if !self.rested() {
+            return;
+        }
+        self.reset();
+        // SAFETY: our list, open and empty.
+        if let Err(e) = unsafe { self.list.Close() } {
+            fail(format_args!("an emptied host command list did not close ({e})"));
+        }
+    }
+
+    /// What [`HostList::reset`] lets go of on our side: the work and states
+    /// recorded, the scratch memory's place.
+    fn let_go(&self) {
+        self.changed_something();
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
@@ -7147,17 +7365,6 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
-        }
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
     /// Something changed in this list that bringing a draw's textures and
