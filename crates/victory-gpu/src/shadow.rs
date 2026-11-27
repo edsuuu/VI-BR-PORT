@@ -2671,6 +2671,16 @@ mod piece_tests {
 /// shaders read zeros there (fxceless/victory-fork#206: missing geometry
 /// with `VICTORY_LATE_WAIT`/`VICTORY_RELAY`).
 fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
+    if stale_walk() {
+        let mut walk = StaleWalk::new(base, copied, a, e);
+        written.iter().for_each(|&(page, write)| walk.note(page, write));
+        return walk.done();
+    }
+    stale_pages_searched(base, copied, a, e, written)
+}
+
+/// [`stale_pages_in`] as it was: a search of `written` for each page.
+fn stale_pages_searched(base: usize, copied: &[u64], a: usize, e: usize, written: &[(usize, u64)]) -> Vec<usize> {
     (a / PAGE..e.div_ceil(PAGE))
         .filter(|&page| page >= base)
         .filter(|&page| match copied.get(page - base) {
@@ -2681,6 +2691,69 @@ fn stale_pages_in(base: usize, copied: &[u64], a: usize, e: usize, written: &[(u
                 .is_ok_and(|i| written[i].1 > at),
         })
         .collect()
+}
+
+/// Whether [`stale_pages_in`] walks the pages and the journal's notes side by
+/// side, once (`VICTORY_STALE_WALK=0`: a binary search of the notes for each
+/// page, as before; on by default), and [`Shadow::merge_under_writes`] walks
+/// the journal's notes where they lie instead of a list of them made for it.
+/// The same pages either way, by construction: the notes come in page order,
+/// each page once.
+///
+/// The submitting thread looks this way at every page of the ranges flights
+/// may be writing that each submission refreshes, which for the title's
+/// 182 MB buffer is some 2,900 pages a submission: the search was 1.6% of
+/// that thread in the opening (profile intro-s-pfabre, the collect of the
+/// filtered pages), the list of notes and its growth more beside it.
+fn stale_walk() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_WALK").is_none_or(|v| v != "0"))
+}
+
+/// [`stale_pages_in`] by one walk: the notes of the range (page, asking that
+/// last found it written) are given in page order, each page once, and the
+/// pages between them are decided by the copy alone.
+struct StaleWalk<'a> {
+    base: usize,
+    copied: &'a [u64],
+    /// The first page not decided yet, and the end of the range (both in
+    /// the copy).
+    next: usize,
+    last: usize,
+    stale: Vec<usize>,
+}
+
+impl<'a> StaleWalk<'a> {
+    fn new(base: usize, copied: &'a [u64], a: usize, e: usize) -> Self {
+        let first = (a / PAGE).max(base);
+        let last = e.div_ceil(PAGE).min(base + copied.len()).max(first);
+        StaleWalk { base, copied, next: first, last, stale: Vec::new() }
+    }
+
+    /// Pages up to `to` that have no note: stale if the copy never took them.
+    fn untouched_to(&mut self, to: usize) {
+        let (base, copied) = (self.base, self.copied);
+        self.stale.extend((self.next..to).filter(|&page| copied[page - base] == 0));
+        self.next = self.next.max(to);
+    }
+
+    /// The note of `page`: written last at asking `write`.
+    fn note(&mut self, page: usize, write: u64) {
+        if page < self.next || page >= self.last {
+            return;
+        }
+        self.untouched_to(page);
+        let at = self.copied[page - self.base];
+        if at == 0 || write > at {
+            self.stale.push(page);
+        }
+        self.next = page + 1;
+    }
+
+    fn done(mut self) -> Vec<usize> {
+        self.untouched_to(self.last);
+        self.stale
+    }
 }
 
 /// `runs` (from, to, whether the copy held it before), cut in those of pages
@@ -2802,6 +2875,93 @@ mod stale_tests {
         // Part of a page counts as the page; pages outside the copy do not.
         assert_eq!(stale_pages_in(base, &copied, at(0x101) + 8, at(0x101) + 16, &[]), [0x101]);
         assert!(stale_pages_in(base, &copied, at(0x104), at(0x106), &[(0x104, 9)]).is_empty());
+    }
+
+    /// A copy's pages and the journal's notes of them, made up: `pages`
+    /// pages from page `base`, some never taken, notes on about a third,
+    /// some of them older than the copy's and some newer, and notes on pages
+    /// before and after the copy.
+    fn made_up(seed: u64, base: usize, pages: usize) -> (Vec<u64>, Vec<(usize, u64)>) {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let copied: Vec<u64> = (0..pages).map(|_| if next() % 10 == 0 { 0 } else { 100 + next() % 50 }).collect();
+        let written: Vec<(usize, u64)> = (base.saturating_sub(5)..base + pages + 5)
+            .filter_map(|page| {
+                let r = next();
+                (r % 3 == 0).then_some((page, 100 + (r >> 8) % 60))
+            })
+            .collect();
+        (copied, written)
+    }
+
+    /// The walk (`VICTORY_STALE_WALK`) finds the pages the search for each
+    /// page found, in the same order, for ranges in, across and outside a
+    /// copy, partial pages at both ends, and notes before, among and after.
+    #[test]
+    fn the_walk_finds_what_the_search_found() {
+        let at = |page: usize| page * PAGE;
+        for seed in 1..200u64 {
+            let (base, pages) = (0x400 + seed as usize, 1 + (seed as usize * 37) % 300);
+            let (copied, written) = made_up(seed, base, pages);
+            for (a, e) in [
+                (at(base), at(base + pages)),
+                (at(base) + 100, at(base + pages) - 100),
+                (at(base.saturating_sub(3)), at(base + pages + 3)),
+                (at(base + pages / 2) + 1, at(base + pages / 2) + 2),
+                (at(base + pages + 1), at(base + pages + 4)),
+                (at(base.saturating_sub(4)), at(base.saturating_sub(1))),
+            ] {
+                let searched = stale_pages_searched(base, &copied, a, e, &written);
+                let mut walk = StaleWalk::new(base, &copied, a, e);
+                // As the journal gives them: those in the range's pages.
+                for &(page, write) in written.iter().filter(|&&(p, _)| p >= a / PAGE && p < e.div_ceil(PAGE)) {
+                    walk.note(page, write);
+                }
+                assert_eq!(walk.done(), searched, "seed {seed}, range {a:#x}..{e:#x}");
+                // And given every note, the journal's order beyond the range.
+                let mut walk = StaleWalk::new(base, &copied, a, e);
+                written.iter().for_each(|&(page, write)| walk.note(page, write));
+                assert_eq!(walk.done(), searched, "seed {seed}, all notes, range {a:#x}..{e:#x}");
+            }
+        }
+    }
+
+    /// What each way costs for a range as large as the title's 182 MB buffer
+    /// (2,920 pages), notes on a third of them. Prints microseconds a range.
+    #[test]
+    #[ignore = "a measurement: cargo test -p victory-gpu --release --lib stale_walk_costs -- --ignored --nocapture"]
+    fn stale_walk_costs() {
+        let (base, pages) = (0x10_0000, 2920);
+        let (copied, written) = made_up(7, base, pages);
+        let (a, e) = (base * PAGE, (base + pages) * PAGE);
+        const ROUNDS: u32 = 2000;
+        let began = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..ROUNDS {
+            n += std::hint::black_box(stale_pages_searched(base, &copied, a, e, std::hint::black_box(&written))).len();
+        }
+        let searched = began.elapsed();
+        let began = std::time::Instant::now();
+        let mut m = 0;
+        for _ in 0..ROUNDS {
+            let mut walk = StaleWalk::new(base, &copied, a, e);
+            std::hint::black_box(&written).iter().for_each(|&(page, write)| walk.note(page, write));
+            m += std::hint::black_box(walk.done()).len();
+        }
+        let walked = began.elapsed();
+        assert_eq!(n, m);
+        eprintln!(
+            "stale pages of a range of {pages} pages ({} notes, {} stale): searched {:.1} us, walked {:.1} us",
+            written.len(),
+            n / ROUNDS as usize,
+            searched.as_secs_f64() * 1e6 / f64::from(ROUNDS),
+            walked.as_secs_f64() * 1e6 / f64::from(ROUNDS)
+        );
     }
 }
 
@@ -3590,13 +3750,27 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
-                note_stale(1);
-                return true;
-            };
-            let stale: Vec<usize> = {
-                let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                stale_pages_in(base, &copied, a, e, &written)
+            // (With `stale_walk`: the journal's notes walked where they lie
+            // when the submission's asking holds the range, as `writes` would
+            // answer from them; the copy's lock first, as `nothing_new`
+            // takes the two.)
+            let walked = stale_walk()
+                .then(|| {
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut walk = StaleWalk::new(base, &copied, a, e);
+                    crate::watch::asked_each(a, e, |page, write| walk.note(page, write)).map(|now| (now, walk.done()))
+                })
+                .flatten();
+            let (now, stale) = match walked {
+                Some(found) => found,
+                None => {
+                    let Some((now, written)) = crate::watch::writes(a, e, true) else {
+                        note_stale(1);
+                        return true;
+                    };
+                    let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+                    (now, stale_pages_in(base, &copied, a, e, &written))
+                }
             };
             if stale.is_empty() {
                 continue;
