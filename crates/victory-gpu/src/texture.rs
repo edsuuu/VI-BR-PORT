@@ -459,9 +459,48 @@ fn through_copy() -> bool {
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
 /// through the kernel into this thread's read buffer; pages that are not
 /// there read as zeros. The bytes are those a read in place would see.
+/// (The refresh reads with [`with_title_held`].)
+#[cfg(test)]
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    with_title_held(memory, size, &mut None, false, f)
+}
+
+/// Whether a refresh that reads a texture through the kernel lets the
+/// runtime remap title memory as soon as the bytes are copied, before it
+/// hashes and detiles them (`VICTORY_SHORT_REMAP_LOCK=1`; off unless set:
+/// held to the end of the refresh, as before).
+///
+/// The lock (`crate::watch::title_memory_reading`) keeps memory found
+/// mapped mapped while it is read in place. A texture partly mapped (one
+/// streaming in) and one read with `VICTORY_TEXTURE_COPY=1` are not read in
+/// place: the kernel's copy into this thread's buffer stands pages that go
+/// away, and what follows reads only that buffer. Holding the lock past the
+/// copy made the title's mapping calls wait for the hashing and detiling of
+/// every such texture under way on any thread, and every refresh that came
+/// after them wait behind the mapping call (the lock lets a writer that
+/// waits go first). A remapping that comes in now finds the texture as it
+/// would have a moment later: its bytes are those copied, and the change
+/// makes it due as before. A texture read in place still holds the lock to
+/// the end.
+fn short_remap_lock() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SHORT_REMAP_LOCK").is_some_and(|v| v == "1"))
+}
+
+/// [`with_title`], with `held` (the lock a read in place takes) let go once
+/// the bytes are copied when `early`, else kept as it is.
+fn with_title_held<R>(
+    memory: *const u8,
+    size: usize,
+    held: &mut Option<crate::watch::Reading>,
+    early: bool,
+    f: impl FnOnce(&[u8]) -> R,
+) -> R {
     with_read(size, |read| {
         crate::host::copy_mapped(read.as_mut_ptr(), memory, size, false);
+        if early {
+            held.take();
+        }
         f(read)
     })
 }
@@ -1321,7 +1360,7 @@ impl Staging {
         // stays mapped (see `crate::watch::title_memory_reading`; without
         // it a page went between the asking and the read in runs 71 and
         // 74).
-        let _mapped = if no_wait() {
+        let mut mapped = Some(if no_wait() {
             // Not waited for: while the runtime remaps title memory the
             // texture is read through the kernel instead, whole or not at
             // all (`no_wait`).
@@ -1331,7 +1370,8 @@ impl Staging {
             mapped
         } else {
             waited(2, crate::watch::title_memory_reading)
-        };
+        });
+        let early = short_remap_lock();
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
             // there, the usual state while it streams in. Read through the
@@ -1347,8 +1387,7 @@ impl Staging {
             last.partial = Some(frame);
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-            let changed = with_read(size, |read| {
-                crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
+            let changed = with_title_held(self.memory, size, &mut mapped, early, |read| {
                 let hash = digest(read);
                 if last.hash == Some(hash) {
                     return false;
@@ -1370,7 +1409,7 @@ impl Staging {
             return size;
         }
         if through_copy() {
-            return with_title(self.memory, size, |tiled| {
+            return with_title_held(self.memory, size, &mut mapped, early, |tiled| {
                 let hash = digest(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
@@ -1385,6 +1424,9 @@ impl Staging {
                 size
             });
         }
+        // Read in place: held until the detiling is done, whatever
+        // `short_remap_lock` says.
+        let _mapped = mapped;
         // SAFETY: committed memory of the texture's layout size, and it
         // stays committed while `_mapped` is held.
         let tiled = unsafe { std::slice::from_raw_parts(self.memory, size) };
@@ -1925,7 +1967,59 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::with_title;
+    use super::{with_title, with_title_held};
+
+    /// With the short lock (`VICTORY_SHORT_REMAP_LOCK=1`) a remapping that
+    /// asks while a refresh hashes and detiles its copy goes on at once, and
+    /// the copy is what the memory held; without it the remapping waits for
+    /// the refresh to end. The next read sees what the remapping put there.
+    #[test]
+    fn a_short_lock_lets_a_remapping_in_once_the_bytes_are_copied() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use windows_sys::Win32::System::Memory::*;
+        const PAGE: usize = 0x1_0000;
+        for early in [false, true] {
+            // SAFETY: a private allocation of our own; only the thread that
+            // holds the remapping lock changes it.
+            unsafe {
+                let base = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE).cast::<u8>();
+                assert!(!base.is_null());
+                base.write_bytes(0x31, 2 * PAGE);
+                let address = base as usize;
+                std::thread::scope(|scope| {
+                    let (asking, asked) = mpsc::channel();
+                    let (done, remapped) = mpsc::channel();
+                    let mut held = Some(crate::watch::title_memory_reading());
+                    with_title_held(base, 2 * PAGE, &mut held, early, |copied| {
+                        scope.spawn(move || {
+                            asking.send(()).unwrap();
+                            let _changing = crate::watch::title_memory_remapping();
+                            (address as *mut u8).write_bytes(0xa7, PAGE);
+                            done.send(()).unwrap();
+                        });
+                        asked.recv().unwrap();
+                        if early {
+                            remapped.recv_timeout(Duration::from_secs(10)).expect("the remapping waited for the refresh");
+                        } else {
+                            assert!(remapped.recv_timeout(Duration::from_millis(200)).is_err());
+                        }
+                        assert!(copied.iter().all(|&b| b == 0x31), "the bytes as copied");
+                    });
+                    assert_eq!(held.is_some(), !early);
+                    drop(held);
+                    if !early {
+                        remapped.recv_timeout(Duration::from_secs(10)).expect("the remapping once the refresh is over");
+                    }
+                });
+                with_title(base, 2 * PAGE, |bytes| {
+                    assert!(bytes[..PAGE].iter().all(|&b| b == 0xa7));
+                    assert!(bytes[PAGE..].iter().all(|&b| b == 0x31));
+                });
+                assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+            }
+        }
+    }
 
     /// Title memory whose tail is reserved and not committed reads through
     /// the copy as its bytes and then zeros, without a fault; so does
