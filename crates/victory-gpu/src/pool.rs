@@ -149,15 +149,19 @@ fn grow_now(room: bool) -> Grow {
     }
 }
 
-/// Since the start: blocks of textures made; times a block was not made for
-/// want of room on the card (a texture then waited); blocks made without
-/// that room for a texture that could not wait; and blocks made without it
-/// for a texture that had waited past [`wait_bound`].
-pub(crate) static BLOCKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+/// Since the start: blocks of textures made; requests for a place turned
+/// down for want of room on the card (not blocks: a texture that waits asks
+/// again at every look at its slot, and some ask twice in one look, as a
+/// texture of levels on demand and then as a plain one); blocks made
+/// without that room for a texture that could not wait; blocks made
+/// without it for a texture that had waited past [`wait_bound`]; and waits
+/// begun, one per texture each time it is first turned down ([`Wait`]).
+pub(crate) static BLOCKS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 const MADE: usize = 0;
 const NOT_MADE: usize = 1;
 const PAST: usize = 2;
 const AFTER_WAIT: usize = 3;
+const WAITS: usize = 4;
 
 /// How long a texture waits for a place at most, in ms, before it is given
 /// a block whatever the card's room (`VICTORY_POOL_WAIT_MS`, 3000; 0: it
@@ -198,6 +202,7 @@ impl Wait {
             self.0.store(0, Ordering::Relaxed);
         } else if self.0.load(Ordering::Relaxed) == 0 {
             self.0.store(now.max(1), Ordering::Relaxed);
+            BLOCKS[WAITS].fetch_add(1, Ordering::Relaxed);
         }
     }
 }
