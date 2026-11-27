@@ -3131,8 +3131,9 @@ impl HostHeap {
     /// computes from wrong data reads it through there. The list's scratch
     /// chunks go back to the pool and are freed past its limit: session n02
     /// lost the device to a page fault in the memory of three freed ones.
-    /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
-    pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
+    /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before. Nor without
+    /// `hold`: the caller keeps the buffer alive for good.
+    pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32, hold: bool) {
         static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
         let Some(host) = host() else { return };
@@ -3170,7 +3171,7 @@ impl HostHeap {
         self.twin_made(index, twin.is_some());
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
-        self.keep(index, holds.then(|| buffer.clone()));
+        self.keep(index, (holds && hold).then(|| buffer.clone()));
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -5614,11 +5615,38 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             assert!(alive(), "a view of {size} bytes");
         }
         // SAFETY: a live upload buffer.
-        heap.constant_at(1, &buffer, unsafe { buffer.GetGPUVirtualAddress() }, 969_472);
+        heap.constant_at(1, &buffer, unsafe { buffer.GetGPUVirtualAddress() }, 969_472, true);
         assert!(alive(), "a view of the list's own memory");
         assert_eq!(constant_bytes(480), 512);
         assert_eq!(constant_bytes(64 << 10), 64 << 10);
         assert_eq!(constant_bytes(u32::MAX), 64 << 10);
+    }
+
+    /// A constant view made without `hold` (the steps' buffers, kept for the
+    /// run: `VICTORY_STEP_BUFFERS_KEPT`) leaves the slot holding nothing, and
+    /// the buffer it held before is let go; made with it, the slot holds its
+    /// buffer, as every one did before.
+    #[test]
+    fn a_constant_view_holds_its_buffer_only_when_told() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let (a, _) = host.upload_buffer(1 << 16).expect("an upload buffer");
+        let (b, _) = host.upload_buffer(1 << 16).expect("an upload buffer");
+        use windows::core::Interface;
+        // SAFETY: live upload buffers.
+        let (ga, gb) = unsafe { (a.GetGPUVirtualAddress(), b.GetGPUVirtualAddress()) };
+        heap.constant_at(1, &a, ga, 256, true);
+        assert_eq!(heap.kept_in(1).map(|r| r.as_raw()), Some(a.as_raw()), "held when told");
+        heap.constant_at(1, &b, gb, 256, false);
+        assert!(heap.kept_in(1).is_none(), "nothing held without it");
+        heap.constant_at(1, &b, gb + 256, 256, false);
+        assert!(heap.kept_in(1).is_none());
+        heap.constant_at(1, &b, gb, 256, true);
+        assert_eq!(heap.kept_in(1).map(|r| r.as_raw()), Some(b.as_raw()));
     }
 
     /// A null 3D UAV made on the real device leaves it alive.

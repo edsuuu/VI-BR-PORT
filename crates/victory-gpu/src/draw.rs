@@ -3883,7 +3883,7 @@ impl State {
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
-                        host.constant_at(index, &buffer, gpu, size);
+                        host.constant_at(index, &buffer, gpu, size, true);
                     }
                     Some(view) => {
                         match halved(self, slot, k * 8) {
