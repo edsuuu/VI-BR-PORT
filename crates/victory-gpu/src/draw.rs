@@ -781,6 +781,14 @@ fn reupload_when_full() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_REUPLOAD_WHEN_FULL").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_BAKE_ROOM=1`: the pass ahead of a decoration bake makes the textures due although the texture
+/// queue's line says the card has no room, as long as the card's memory in use is under
+/// [`crate::resource::room_for_bake`]'s share of its budget. Off by default: refused as any other pass.
+fn bake_room_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_ROOM").is_some_and(|v| v == "1"))
+}
+
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
 fn heap_recheck() -> bool {
@@ -2327,6 +2335,10 @@ impl State {
             host.texture_slots_waiting(frame);
         }
         let baking = crate::texture::BAKING.get();
+        // The pass ahead of a decoration bake, with the card over the queue's line but not over its own
+        // memory (`VICTORY_BAKE_ROOM=1`): its textures are made all the same, see where they are refused.
+        let mut bake_room = baking && bake_room_on() && crate::resource::room_for_bake(memory);
+        let mut past_the_line = 0u64;
         let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
@@ -2517,7 +2529,14 @@ impl State {
             // had its colour only in the launches that entered the world
             // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
             // before.
-            if !room {
+            // Not so either in the pass ahead of a decoration bake while the card itself still has
+            // memory (`bake_room`): what the bake samples and does not find is baked wrong for the
+            // run (a head in one flat colour, a tattooed forearm in coloured noise), and the line
+            // is mostly room kept for render targets not measured yet in a world's first frames.
+            if !room && bake_room {
+                past_the_line += 1;
+            }
+            if !room && !bake_room {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
@@ -2710,9 +2729,11 @@ impl State {
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
-            if room && since_asked >= 32 << 20 {
+            if (room || bake_room) && since_asked >= 32 << 20 {
                 since_asked = 0;
-                room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
+                let video = crate::host::host().and_then(|h| h.video_memory());
+                room = room && crate::resource::room(video);
+                bake_room = bake_room && crate::resource::room_for_bake(video);
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
@@ -2745,6 +2766,22 @@ impl State {
                     ms = began.elapsed().as_millis() as u64,
                     passes_so = n,
                     "the pass ahead of a bake draw left due textures as they were: the bake may sample what is not on the card"
+                );
+            }
+        }
+        if past_the_line > 0 {
+            static PAST: AtomicU64 = AtomicU64::new(0);
+            static PASSES: AtomicU64 = AtomicU64::new(0);
+            let so_far = PAST.fetch_add(past_the_line, Ordering::Relaxed) + past_the_line;
+            let n = PASSES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 32 || n.is_power_of_two() {
+                tracing::info!(
+                    frame,
+                    slots = past_the_line,
+                    so_far,
+                    refused_all_the_same = refused,
+                    passes_so = n,
+                    "the pass ahead of a bake draw made textures past the queue's line, the card having memory (VICTORY_BAKE_ROOM=1)"
                 );
             }
         }

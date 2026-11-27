@@ -1708,6 +1708,26 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     }
 }
 
+/// Whether the pass ahead of a decoration bake may make host copies of the textures due although
+/// [`room`] says no (`VICTORY_BAKE_ROOM=1`, `draw.rs`): by the card's memory this process really has in
+/// use against the system's budget, without what is kept for render targets and buffer copies not made
+/// yet. That kept room is what refuses the queue in a world's first frames (up to 3,072 MB while the
+/// targets are not measured), which is when the characters of a scene are baked. Under 94 % of the
+/// budget; with no budget known, no.
+#[cfg(windows)]
+pub(crate) fn room_for_bake(memory: Option<[u64; 4]>) -> bool {
+    match memory {
+        Some([budget, used, ..]) => bake_line(budget, used),
+        None => false,
+    }
+}
+
+/// [`room_for_bake`]'s arithmetic.
+#[cfg(any(windows, test))]
+fn bake_line(budget: u64, used: u64) -> bool {
+    budget > 0 && used < budget / 100 * 94
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet ([`targets_rule`]).
@@ -4848,5 +4868,17 @@ float4 lit() : SV_Target { return 1.0; }
         let d = unsafe { more.texture.GetDesc() };
         assert_eq!((more.base, d.Width, d.MipLevels), (0, 256, 9));
         assert!(more.serial != copy.serial && more.grown.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_bake_pass_goes_by_the_cards_memory_in_use() {
+        // The prison of 27 Nov with another program on the card: 5,792 MB in use of a budget of 5,666.
+        assert!(!bake_line(5666 << 20, 5792 << 20));
+        // The same scene alone on the card: 5,000 MB in use of 7,181.
+        assert!(bake_line(7181 << 20, 5000 << 20));
+        // Up to 94 % of the budget, and not without a budget.
+        assert!(bake_line(1000 << 20, 939 << 20));
+        assert!(!bake_line(1000 << 20, 941 << 20));
+        assert!(!bake_line(0, 0));
     }
 }
