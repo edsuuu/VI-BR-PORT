@@ -79,9 +79,19 @@ function Format-LauncherArgument {
     return $Value
 }
 
+# A PowerShell single-quoted string. PowerShell takes the typographic quotes U+2018 to U+201B
+# for single quotes too (a folder named "Dad's games" with U+2019 would end the string), so
+# every one of them is doubled.
+$script:LauncherSingleQuotes = @([char]0x27, [char]0x2018, [char]0x2019, [char]0x201A, [char]0x201B)
+
 function ConvertTo-LauncherQuoted {
     param([AllowEmptyString()][string]$Value)
-    return "'" + $Value.Replace("'", "''") + "'"
+    $text = New-Object System.Text.StringBuilder
+    foreach ($c in $Value.ToCharArray()) {
+        if ($c -in $script:LauncherSingleQuotes) { [void]$text.Append($c) }
+        [void]$text.Append($c)
+    }
+    return "'" + $text.ToString() + "'"
 }
 
 # The PowerShell line that starts the game through scripts\play.ps1.
