@@ -130,6 +130,7 @@
   "error.no_victory": "Não há {0}. Compile primeiro: {1}",
   "error.no_game_exe": "Nenhum executável do jogo escolhido ainda.",
   "error.game_exe_missing": "O executável {0} não está mais lá.",
+  "error.file_busy": "{0} está em uso por outro processo do launcher. Tente de novo.",
   "error.unknown_setting": "Não há configuração '{0}'.",
 
   "mcp.server.description": "Lê e muda as opções salvas do launcher, as mesmas que a janela mostra.",

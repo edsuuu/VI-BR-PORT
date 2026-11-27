@@ -130,6 +130,7 @@
   "error.no_victory": "No {0}. Build it first: {1}",
   "error.no_game_exe": "No executable of the game chosen yet.",
   "error.game_exe_missing": "The executable {0} is not there any more.",
+  "error.file_busy": "{0} is held by another process of the launcher. Try again.",
   "error.unknown_setting": "There is no setting '{0}'.",
 
   "mcp.server.description": "Reads and changes the launcher's saved options, the same ones its window shows.",

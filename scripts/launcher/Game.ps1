@@ -33,22 +33,24 @@ function Get-LauncherStampPath {
 
 function Get-LauncherStamp {
     $path = Get-LauncherStampPath
-    if (Test-Path -LiteralPath $path) {
-        try {
-            $stamp = Read-LauncherJson -Path $path
-            if ($stamp -is [System.Collections.IDictionary]) { return $stamp }
-        } catch { }
+    $stamp = Invoke-LauncherLocked -Path $path -Action {
+        if (Test-Path -LiteralPath $path) {
+            try { Read-LauncherJson -Path $path } catch { }
+        }
     }
+    if ($stamp -is [System.Collections.IDictionary]) { return $stamp }
     return [ordered]@{ format = 1 }
 }
 
 # One build's part of the stamp, written back at once.
 function Set-LauncherStampEntry {
     param([Parameter(Mandatory)][string]$Build, [Parameter(Mandatory)][hashtable]$Values)
-    $stamp = Get-LauncherStamp
-    if (-not $stamp.Contains($Build) -or $stamp[$Build] -isnot [System.Collections.IDictionary]) { $stamp[$Build] = [ordered]@{} }
-    foreach ($k in $Values.Keys) { $stamp[$Build][$k] = $Values[$k] }
-    Write-LauncherJson -Path (Get-LauncherStampPath) -Data $stamp
+    Invoke-LauncherLocked -Path (Get-LauncherStampPath) -Action {
+        $stamp = Get-LauncherStamp
+        if (-not $stamp.Contains($Build) -or $stamp[$Build] -isnot [System.Collections.IDictionary]) { $stamp[$Build] = [ordered]@{} }
+        foreach ($k in $Values.Keys) { $stamp[$Build][$k] = $Values[$k] }
+        Write-LauncherJson -Path (Get-LauncherStampPath) -Data $stamp
+    }
 }
 
 function Get-LauncherNow {

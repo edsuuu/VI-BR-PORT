@@ -29,8 +29,26 @@ function New-LauncherConfig {
 }
 
 # The saved file as it is, with 'options' always a dictionary. Values are not checked here
-# (Get-LauncherSettings does): a value this version does not know stays in the file.
+# (Get-LauncherSettings does): a value this version does not know stays in the file. Read
+# holding the file's lock, so a save of another process is never met half done.
 function Get-LauncherConfig {
+    return Invoke-LauncherLocked -Path (Get-LauncherConfigPath) -Action { Read-LauncherConfigFile }
+}
+
+# Changes the saved file: $Change gets the file as it is now and changes it; the file is then
+# written. All of it holds the lock, so a change another process saves in the meantime is not
+# lost. Returns the settings that are now saved.
+function Update-LauncherConfig {
+    param([Parameter(Mandatory)][scriptblock]$Change)
+    return Invoke-LauncherLocked -Path (Get-LauncherConfigPath) -Action {
+        $current = Read-LauncherConfigFile
+        & $Change $current
+        Save-LauncherConfig -Config $current
+        Get-LauncherSettings -Config $current
+    }
+}
+
+function Read-LauncherConfigFile {
     $path = Get-LauncherConfigPath
     if (-not [System.IO.File]::Exists($path)) { return New-LauncherConfig }
     # Reading can fail for a moment while another process saves (Read-LauncherTextFile tries
@@ -75,8 +93,5 @@ function Set-LauncherSetting {
         throw (Get-LauncherText -Key 'error.bad_value' -Arguments @($Name, $saved, ((Get-LauncherLanguages) -join ', ')))
     }
     if ($Name -eq 'game_exe' -and $null -ne $saved) { $saved = [System.IO.Path]::GetFullPath($saved) }
-    $config = Get-LauncherConfig
-    $config[$Name] = $saved
-    Save-LauncherConfig -Config $config
-    return Get-LauncherSettings -Config $config
+    return Update-LauncherConfig -Change { param($config) $config[$Name] = $saved }
 }

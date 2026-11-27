@@ -166,6 +166,16 @@ function Set-LauncherOption {
     if (-not (Test-LauncherValueAvailable -Option $option -Value $value)) {
         throw (Get-LauncherText -Key 'error.value_unavailable' -Arguments @($Id, [string]$value))
     }
+    # Read, changed and written holding the file's lock: a change another process saves in the
+    # meantime is not lost.
+    return Invoke-LauncherLocked -Path (Get-LauncherConfigPath) -Action { Set-LauncherOptionLocked -Id $Id -Option $option -Value $value }
+}
+
+# The part of Set-LauncherOption done holding the lock, with the value already checked.
+function Set-LauncherOptionLocked {
+    param([Parameter(Mandatory)][string]$Id, [Parameter(Mandatory)]$Option, $Value)
+    $option = $Option
+    $value = $Value
     $config = Get-LauncherConfig
     $before = (Get-LauncherSettings -Config $config)['options']
     $after = [ordered]@{}
@@ -202,12 +212,12 @@ function Set-LauncherOption {
 # Every option back to its default (saved as the defaults); the title's executable, the
 # language and unknown keys stay.
 function Reset-LauncherConfig {
-    $config = Get-LauncherConfig
-    $values = [ordered]@{}
-    foreach ($o in Get-LauncherOptions) { $values[$o['id']] = $o['default'] }
-    $config['options'] = $values
-    Save-LauncherConfig -Config $config
-    return Get-LauncherSettings -Config $config
+    return Update-LauncherConfig -Change {
+        param($config)
+        $values = [ordered]@{}
+        foreach ($o in Get-LauncherOptions) { $values[$o['id']] = $o['default'] }
+        $config['options'] = $values
+    }
 }
 
 # What one value of an option adds to a run.
