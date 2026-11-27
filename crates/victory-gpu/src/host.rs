@@ -2149,6 +2149,23 @@ fn card_pass_time() -> bool {
 /// timed.
 static CARD_TICKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Whether the list that sends up to copies in the card's memory and hashes
+/// what it sent is timed in two parts as well (`VICTORY_CARD_PASS_SPLIT=1`;
+/// off by default; with [`card_pass_time`]): the copies and scatters of the
+/// sends, and the barrier and hash passes behind them. A measurement only:
+/// walking in the prison these lists took 3.4-3.9 ms of the card a frame for
+/// some 350 copy commands (31 MB), 52,000 words scattered and 330 hash
+/// passes over 560 pieces (37 MB read), and which of them costs it is not
+/// known. Two pairs of timestamps more a send.
+fn card_pass_split() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_PASS_SPLIT").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame-rate line, with [`card_pass_split`]: ticks in the
+/// sends, ticks in the hash passes, lists timed.
+static SPLIT_TICKS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 /// The queue's timestamp ticks a second (0 until known).
 static CARD_TICK_RATE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -2318,6 +2335,9 @@ struct CardPlan {
     /// With [`card_pass_time`]: the timestamp pairs its lists took, and
     /// whether each is the compare's.
     stamped: Vec<(u64, bool)>,
+    /// With [`card_pass_split`]: the pairs around the sends and around the
+    /// hash passes of its list that sends up.
+    split: Option<(u64, u64)>,
     /// The submission it is for (of a cover the thread that lands flights
     /// made: the last one started then).
     number: u64,
@@ -4628,6 +4648,7 @@ impl Host {
         }
         let mut used: Vec<(bool, Prelude)> = Vec::new();
         let mut stamped: Vec<(u64, bool)> = Vec::new();
+        let mut split = None;
         let mut looks = None;
         // The bytes as they are now, whatever later submissions put there.
         let taking = crate::timeline::span("copies in the card's memory: taken");
@@ -4643,6 +4664,9 @@ impl Host {
             if let Some(n) = stamp {
                 stamped.push((n, false));
             }
+            // (`card_pass_split`: two pairs more, the sends and the passes.)
+            let parts = stamp.and(card_pass_split().then(|| work.stamps.as_mut().map(|s| (s.take(), s.take()))).flatten());
+            split = parts;
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
@@ -4652,6 +4676,9 @@ impl Host {
                     list.Reset(allocator, None)?;
                     if let (Some(stamps), Some(n)) = (&work.stamps, stamp) {
                         stamps.begin(list, n);
+                    }
+                    if let (Some(stamps), Some((sends, _))) = (&work.stamps, parts) {
+                        stamps.begin(list, sends);
                     }
                     if upcheck::on() {
                         looks = upcheck::record(self, list, &dirty);
@@ -4684,6 +4711,10 @@ impl Host {
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             ));
                         }
+                    }
+                    if let (Some(stamps), Some((sends, passes))) = (&work.stamps, parts) {
+                        stamps.end(list, sends);
+                        stamps.begin(list, passes);
                     }
                     if !sent.is_empty() {
                         list.ResourceBarrier(&sent);
@@ -4726,6 +4757,9 @@ impl Host {
                             card_pass(list, &run, size as u32, 0, 0);
                         }
                     }
+                    if let (Some(stamps), Some((_, passes))) = (&work.stamps, parts) {
+                        stamps.end(list, passes);
+                    }
                     if let (Some(stamps), Some(n)) = (&work.stamps, stamp) {
                         stamps.end(list, n);
                     }
@@ -4749,6 +4783,7 @@ impl Host {
             looks,
             sends: own.map(send::Own::memory),
             stamped,
+            split,
             number,
         };
         // Each byte once, as the copy-back joins the declared ranges. The
@@ -4954,6 +4989,7 @@ impl Host {
             looks: None,
             sends: None,
             stamped: Vec::new(),
+            split: None,
             number,
         };
         work.out += 1;
@@ -5085,6 +5121,14 @@ impl Host {
             return;
         };
         if let Some(stamps) = &work.stamps {
+            if let Some((sends, passes)) = plan.split {
+                // SAFETY: the plan's lists have run.
+                if let (Some(sends), Some(passes)) = unsafe { (stamps.ticks(sends), stamps.ticks(passes)) } {
+                    SPLIT_TICKS[0].fetch_add(sends, Ordering::Relaxed);
+                    SPLIT_TICKS[1].fetch_add(passes, Ordering::Relaxed);
+                    SPLIT_TICKS[2].fetch_add(1, Ordering::Relaxed);
+                }
+            }
             for &(n, check) in &plan.stamped {
                 // SAFETY: the plan's lists have run.
                 if let Some(ticks) = unsafe { stamps.ticks(n) } {
@@ -9868,6 +9912,18 @@ impl Meter {
                 )
             } else {
                 String::new()
+            };
+            let [sends, hashes, split] = [0, 1, 2].map(|i| SPLIT_TICKS[i].swap(0, Ordering::Relaxed));
+            let timed = if split > 0 {
+                format!(
+                    "{timed}; of those sends (VICTORY_CARD_PASS_SPLIT, {:.1} timed) {:.2} ms in their copies and scatters, \
+                     {:.2} ms in the barrier and hash passes behind them",
+                    split as f64 / frames,
+                    sends as f64 / rate * 1e3 / frames,
+                    hashes as f64 / rate * 1e3 / frames
+                )
+            } else {
+                timed
             };
             if passes + compares > 0.0 {
                 tracing::info!(
