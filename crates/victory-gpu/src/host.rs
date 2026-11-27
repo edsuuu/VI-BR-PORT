@@ -1677,6 +1677,47 @@ fn list_number(name: &str) -> Option<u32> {
 /// budget buffers, a run late).
 static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
+/// For [`mesh_dips`]: the groups indirect mesh dispatches asked for, and the list runs whose
+/// notes were taken, since the last present; and the same of the frame before.
+static FRAME_MESH: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// `VICTORY_MESH_DIPS=1` (off by default; diagnostics, a line only when it fires): a warning for
+/// each frame whose indirect mesh dispatches asked for less than half the groups the frame
+/// before did (of at least 2000), with the frame number and both counts. The geometry the card
+/// culls itself (walls, floors, most props) goes through those dispatches, the characters
+/// partly not: a frame in which the walls vanish while the characters stay shows here as a dip
+/// if the culling's output or the dispatches' arguments were empty, and does not if the
+/// arguments were right and the walls were lost after them. The counts are the lists' budget
+/// notes, taken when a list is next submitted, so a dip lands a frame or so after the frame it
+/// belongs to; `runs` says how many list runs were counted (a dip with as many runs as before is
+/// not a list that was merely counted late). A camera cut to a smaller view dips too.
+fn mesh_dips() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MESH_DIPS").is_some_and(|v| v == "1"))
+}
+
+/// [`mesh_dips`] at a present.
+fn mesh_dip_check() {
+    if !mesh_dips() {
+        return;
+    }
+    let groups = FRAME_MESH[0].swap(0, Ordering::Relaxed);
+    let runs = FRAME_MESH[1].swap(0, Ordering::Relaxed);
+    let before = FRAME_MESH[2].swap(groups, Ordering::Relaxed);
+    let runs_before = FRAME_MESH[3].swap(runs, Ordering::Relaxed);
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if before >= 2000 && groups * 2 < before && SAID.fetch_add(1, Ordering::Relaxed) < 500 {
+        tracing::warn!(
+            frame = crate::frame::current(),
+            groups,
+            before,
+            runs,
+            runs_before,
+            "a frame's indirect mesh dispatches asked for less than half the groups of the frame before (VICTORY_MESH_DIPS=1)"
+        );
+    }
+}
+
 /// Indirect records that ran empty for want of their list's budget, and the
 /// largest cost of one (told from 2^22 on), likewise.
 static BUDGET_NOTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -6888,6 +6929,10 @@ impl HostList {
                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+                if mesh_dips() {
+                    FRAME_MESH[0].fetch_add(u64::from(all), Ordering::Relaxed);
+                    FRAME_MESH[1].fetch_add(1, Ordering::Relaxed);
+                }
                 let (refused, biggest) = (words.add(3).read_volatile(), words.add(4).read_volatile());
                 BUDGET_NOTES[0].fetch_add(u64::from(refused), Ordering::Relaxed);
                 BUDGET_NOTES[1].fetch_max(u64::from(biggest), Ordering::Relaxed);
@@ -8868,6 +8913,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        mesh_dip_check();
         #[cfg(feature = "diagnostics")]
         {
             self.copy_stats_frames += 1;
