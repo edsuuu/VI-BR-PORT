@@ -495,7 +495,7 @@ fn loop_limit_exits(
                 }
             }
         }
-        if found.is_empty() {
+        if found.is_empty() || !exits_cover_rounds(&st.exits, h, &body, &latches, &found) {
             continue;
         }
         for (x, outside) in found {
@@ -503,6 +503,32 @@ fn loop_limit_exits(
         }
     }
     out
+}
+
+/// Whether every round of the loop at `h` (blocks `body`, back edges from `latches`) passes one
+/// of its exit branches (`found`): no path from the header to a latch avoids them. Only then may
+/// the back edge stop testing the limit ([`loop_limit_exits`]): an exit inside a conditional part
+/// of the body is never reached by a lane that keeps skipping that part, which would go round
+/// with no limit at all (a loop on data the host has not mirrored yet, [`LOOP_LIMIT`]).
+fn exits_cover_rounds(exits: &[LaneExit], h: usize, body: &[bool], latches: &[usize], found: &[(usize, usize)]) -> bool {
+    let exit = |x: usize| found.iter().any(|&(b, _)| b == x);
+    let mut seen = vec![false; body.len()];
+    let mut stack = vec![h];
+    while let Some(y) = stack.pop() {
+        if std::mem::replace(&mut seen[y], true) || exit(y) {
+            continue;
+        }
+        if latches.contains(&y) {
+            return false;
+        }
+        let next = match exits[y] {
+            LaneExit::Jump(t) => [Some(t), None],
+            LaneExit::Branch { taken, not_taken, .. } => [Some(taken), Some(not_taken)],
+            _ => [None, None],
+        };
+        stack.extend(next.into_iter().flatten().filter(|&t| t != h && body[t]));
+    }
+    true
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -13480,6 +13506,26 @@ mod tests {
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// A loop's back edge stops testing the iteration limit only when every round passes one of
+    /// the loop's exit branches: an exit inside a conditional part of the body would never stop
+    /// a lane that keeps skipping it.
+    #[test]
+    fn a_loops_limit_moves_to_its_exits_only_when_every_round_passes_one() {
+        use super::exits_cover_rounds;
+        use crate::structure::{Bool, LaneExit};
+        let br = |taken, not_taken| LaneExit::Branch { when: Bool::TRUE, taken, not_taken };
+        // 0 -> 1 (header) -> 2: exit to 4 or on to 3 -> back to 1
+        let covered = [LaneExit::Jump(1), br(2, 2), br(4, 3), LaneExit::Jump(1), LaneExit::End];
+        let body = [false, true, true, true, false];
+        assert!(exits_cover_rounds(&covered, 1, &body, &[3], &[(2, 4)]));
+        // 1 (header) -> 2 when a lane is valid, else straight to 3; 2: exit to 4 or on to 3
+        let skipped = [LaneExit::Jump(1), br(2, 3), br(4, 3), LaneExit::Jump(1), LaneExit::End];
+        assert!(!exits_cover_rounds(&skipped, 1, &body, &[3], &[(2, 4)]));
+        // an exit at the header covers every round
+        let at_header = [LaneExit::Jump(1), br(4, 2), br(3, 3), LaneExit::Jump(1), LaneExit::End];
+        assert!(exits_cover_rounds(&at_header, 1, &body, &[3], &[(1, 4)]));
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
