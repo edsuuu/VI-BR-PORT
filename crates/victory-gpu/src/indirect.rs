@@ -600,7 +600,7 @@ pub(crate) mod tests {
     use super::*;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
-    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_FORMAT_R32_TYPELESS, DXGI_SAMPLE_DESC};
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
     use windows::core::Interface;
@@ -1033,6 +1033,171 @@ void main() {
         assert_eq!(run(&mut warp, &[(0, 1), (1, 1), (3, 2)], 2), [0, 1, 7, 1, 0]);
         // Every piece looked at since: nothing more.
         assert_eq!(run(&mut warp, &[(0, PIECES)], 1), [0, 0, 0, 0, 0]);
+    }
+
+    /// Our passes as one dispatch over a table of pieces (`host::table`,
+    /// `VICTORY_CARD_HASH_TABLE`, `VICTORY_CARD_COMPARE_TABLE`), on the
+    /// software adapter: two copies, one not starting on a piece and not
+    /// ending on one, hashed whole, then written and compared in runs of
+    /// both modes, give the same stored hashes and the same results dword
+    /// for dword as a pass a run with root descriptors.
+    #[test]
+    fn warp_a_table_of_pieces_hashes_and_compares_as_passes_do() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let passes = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        let table = compile_cs(&warp.device, crate::host::CARD_COMPARE_TABLE).expect("the table compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        // (buffer bytes, hashed size, skew, pieces)
+        let copies = [(5 * PIECE, 5 * PIECE as u32, 0u32, 5u32), (4 * PIECE, 3 * PIECE as u32 + 20_000, 4096, 4)];
+        let nows: Vec<_> = copies
+            .iter()
+            .enumerate()
+            .map(|(c, &(bytes, ..))| {
+                let (buffer, ptr, gpu) = warp.shared_buffer(bytes as u64);
+                let content: Vec<u8> = (0..bytes).map(|i| (i * (7 + c) + i / 977) as u8).collect();
+                // SAFETY: the mapping holds `bytes` bytes.
+                unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), ptr, bytes) };
+                (buffer, ptr, gpu)
+            })
+            .collect();
+        // Hashes of each copy for each way, and the results of each way.
+        let hashes: Vec<[(ID3D12Resource, *mut u8, u64); 2]> =
+            copies.iter().map(|&(.., pieces)| [0, 1].map(|_| warp.shared_buffer(16 * u64::from(pieces + 2)))).collect();
+        const RESULTS: usize = 64;
+        let differs = [0, 1].map(|_| warp.shared_buffer(4 * RESULTS as u64));
+        let (_entries, entries_ptr, entries_gpu) = warp.shared_buffer(16 * 256);
+        let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        // SAFETY: plain heap creation and views of live buffers in its slots.
+        let (heap, srvs, uavs) = unsafe {
+            let heap: ID3D12DescriptorHeap = warp
+                .device
+                .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                    Type: kind,
+                    NumDescriptors: 2050,
+                    Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                    NodeMask: 0,
+                })
+                .unwrap();
+            let step = warp.device.GetDescriptorHandleIncrementSize(kind);
+            let cpu = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+            for (c, &(bytes, _, _, pieces)) in copies.iter().enumerate() {
+                let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                    Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                    Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_SRV {
+                            FirstElement: 0,
+                            NumElements: (bytes / 4) as u32,
+                            StructureByteStride: 0,
+                            Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                        },
+                    },
+                };
+                let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                    Format: DXGI_FORMAT_R32_TYPELESS,
+                    ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+                    Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                        Buffer: D3D12_BUFFER_UAV {
+                            FirstElement: 0,
+                            NumElements: 4 * (pieces + 2),
+                            StructureByteStride: 0,
+                            CounterOffsetInBytes: 0,
+                            Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                        },
+                    },
+                };
+                let at = |slot: usize| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + slot * step as usize };
+                warp.device.CreateShaderResourceView(&nows[c].0, Some(&srv), at(2 * c));
+                warp.device.CreateUnorderedAccessView(&hashes[c][1].0, None::<&ID3D12Resource>, Some(&uav), at(2 * c + 1));
+            }
+            let gpu = heap.GetGPUDescriptorHandleForHeapStart().ptr;
+            (heap.clone(), gpu, gpu + u64::from(step))
+        };
+        // A round of passes (copy, first piece, pieces, result dword, mode)
+        // each way; gives each way's results.
+        let round = |warp: &mut WarpHarness, runs: &[(usize, u32, u32, u32, u32)]| -> [Vec<u32>; 2] {
+            // SAFETY: our open list, live buffers and heap, each pipeline's
+            // own root signature; the mappings hold what is read and written.
+            unsafe {
+                for d in &differs {
+                    for i in 0..RESULTS {
+                        d.1.cast::<u32>().add(i).write_volatile(7);
+                    }
+                }
+                warp.list.SetComputeRootSignature(&passes.root);
+                warp.list.SetPipelineState(&passes.pso);
+                warp.list.SetComputeRootUnorderedAccessView(3, differs[0].2);
+                for &(c, first, pieces, at, mode) in runs {
+                    let (_, size, skew, _) = copies[c];
+                    warp.list.SetComputeRootShaderResourceView(1, nows[c].2);
+                    warp.list.SetComputeRootUnorderedAccessView(2, hashes[c][0].2);
+                    let constants = [first, skew, size, pieces, at * 4, mode];
+                    warp.list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                    warp.list.Dispatch(pieces, 1, 1);
+                }
+                let mut n = 0;
+                for &(c, first, pieces, at, mode) in runs {
+                    let (_, size, skew, _) = copies[c];
+                    for i in 0..pieces {
+                        let e = crate::host::card_table_entry(c as u32, mode, skew, first + i, at + i, size);
+                        entries_ptr.cast::<[u32; 4]>().add(n).write_unaligned(e);
+                        n += 1;
+                    }
+                }
+                warp.list.SetDescriptorHeaps(&[Some(heap.clone())]);
+                warp.list.SetComputeRootSignature(&table.root);
+                warp.list.SetPipelineState(&table.pso);
+                warp.list.SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: srvs });
+                warp.list.SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: uavs });
+                warp.list.SetComputeRootShaderResourceView(3, entries_gpu);
+                warp.list.SetComputeRootUnorderedAccessView(4, differs[1].2);
+                warp.list.SetComputeRoot32BitConstant(0, 0, 0);
+                warp.list.Dispatch(n as u32, 1, 1);
+            }
+            warp.submit_and_wait();
+            // SAFETY: as above.
+            differs.each_ref().map(|d| (0..RESULTS).map(|i| unsafe { d.1.cast::<u32>().add(i).read_volatile() }).collect())
+        };
+        let stored = |c: usize, way: usize| -> Vec<u32> {
+            let words = 4 * (copies[c].3 as usize + 2);
+            // SAFETY: the mapping holds the copy's hashes.
+            (0..words).map(|i| unsafe { hashes[c][way].1.cast::<u32>().add(i).read_volatile() }).collect()
+        };
+        // SAFETY (each): inside the mapping.
+        let set = |c: usize, at: usize| unsafe {
+            let p = nows[c].1.add(at);
+            p.write_volatile(p.read_volatile() ^ 0x5A);
+        };
+        // The hashes, whole.
+        let [a, b] = round(&mut warp, &[(0, 0, 5, 0, 0), (1, 0, 4, 0, 0)]);
+        assert_eq!(a, b);
+        for c in 0..2 {
+            assert_eq!(stored(c, 0), stored(c, 1), "hashes of copy {c} made whole");
+            assert!(stored(c, 0)[..16].iter().any(|&w| w != 0));
+        }
+        // Writes in some pieces (one at the very end of the second copy's
+        // hashed bytes), then compares that store and that do not.
+        set(0, PIECE + 333);
+        set(0, 3 * PIECE + 9);
+        set(1, 100);
+        set(1, 3 * PIECE - 4096 + 20_000 - 1);
+        let runs = [(0, 1, 2, 0, 2), (1, 0, 1, 2, 2), (0, 3, 2, 3, 1), (1, 2, 2, 5, 2)];
+        let [a, b] = round(&mut warp, &runs);
+        assert_eq!(a, b, "the results of the compares");
+        let flags: Vec<u32> = a[..7].iter().map(|d| d & 1).collect();
+        assert_eq!(flags, [1, 0, 1, 1, 0, 0, 1], "the pieces written are flagged");
+        for c in 0..2 {
+            assert_eq!(stored(c, 0), stored(c, 1), "hashes of copy {c} after the compares");
+        }
+        // Everything again, not stored: the pieces compared in mode 1 still
+        // differ, the others not.
+        let [a, b] = round(&mut warp, &[(0, 0, 5, 10, 1), (1, 0, 4, 20, 1)]);
+        assert_eq!(a, b);
+        let flags: Vec<u32> = a[10..15].iter().chain(&a[20..24]).map(|d| d & 1).collect();
+        assert_eq!(flags, [0, 0, 0, 1, 0, 0, 0, 0, 0]);
     }
 
     /// What the passes over copies in the card's memory cost on the card

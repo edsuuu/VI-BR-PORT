@@ -1978,6 +1978,9 @@ struct CardWork {
     /// With [`heat_on`]: the fence signalled behind each cover (a compare of
     /// owed pieces, [`heat`]) and the last value given.
     cover: Option<(ID3D12Fence, u64)>,
+    /// With `VICTORY_CARD_HASH_TABLE` or `VICTORY_CARD_COMPARE_TABLE`: what
+    /// a list's passes as one dispatch take ([`table`]), if it could be made.
+    table: Option<table::Table>,
 }
 
 // SAFETY: D3D12 objects (free-threaded) and persistent mappings, used only
@@ -2093,9 +2096,10 @@ pub(crate) fn piece_hash(bytes: &[u8]) -> u32 {
 /// # Safety
 /// The list is open with the compare's root signature, pipeline and buffers
 /// set, and the pieces lie in the buffer.
-unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::CardSpan, size: u32, at: u32, mode: u32) {
+unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::CardSpan, size: u32, at: u32, mode: u32) -> u64 {
     const MOST: u32 = D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION;
     let mut done = 0;
+    let mut dispatches = 0;
     while done < span.pieces {
         let n = (span.pieces - done).min(MOST);
         let constants = [span.first + done, span.skew, size, n, (at + done) * 4, mode];
@@ -2105,7 +2109,57 @@ unsafe fn card_pass(list: &ID3D12GraphicsCommandList, span: &crate::shadow::Card
             list.Dispatch(n, 1, 1);
         }
         done += n;
+        dispatches += 1;
     }
+    dispatches
+}
+
+/// Records `passes` into an open list: those `prepared` took as one dispatch
+/// over a table ([`table`]), the others (all without it) a pass each, with
+/// the compare's own root signature set for them. Gives the dispatches
+/// recorded; `lists` is the [`table::STATS`] counter of lists that went as
+/// one.
+///
+/// # Safety
+/// An open list of ours; live buffers, whose pieces the passes name, until
+/// it has run.
+unsafe fn card_passes(
+    work: &CardWork,
+    list: &ID3D12GraphicsCommandList,
+    passes: &[table::Pass],
+    prepared: Option<&(table::Prepared, Vec<usize>)>,
+    lists: usize,
+) -> u64 {
+    // SAFETY: a live buffer of ours.
+    let differs = unsafe { work.differs.0.GetGPUVirtualAddress() };
+    let mut dispatches = 0;
+    let all: Vec<usize>;
+    let left = match (prepared, work.table.as_ref()) {
+        (Some((prepared, left)), Some(t)) => {
+            // SAFETY: the caller's.
+            dispatches += unsafe { t.record(list, prepared, differs) };
+            table::STATS[lists].fetch_add(1, Ordering::Relaxed);
+            left
+        }
+        _ => {
+            all = (0..passes.len()).collect();
+            &all
+        }
+    };
+    // SAFETY: the caller's.
+    unsafe {
+        if !left.is_empty() {
+            list.SetComputeRootSignature(&work.root);
+            list.SetPipelineState(&work.pso);
+            list.SetComputeRootUnorderedAccessView(3, differs);
+        }
+        for p in left.iter().map(|&i| &passes[i]) {
+            list.SetComputeRootShaderResourceView(1, p.buffer.GetGPUVirtualAddress());
+            list.SetComputeRootUnorderedAccessView(2, p.before.GetGPUVirtualAddress());
+            dispatches += card_pass(list, &p.span, p.size, p.at, p.mode);
+        }
+    }
+    dispatches
 }
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
@@ -2125,8 +2179,10 @@ fn rehash_runs() -> bool {
 
 /// Since the last frame-rate line, of our own passes over copies in the
 /// card's memory: hash passes after ranges were sent up, the pieces they
-/// hashed, and compare passes after the lists.
-static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// hashed, and compare passes after the lists; then the dispatches the card
+/// was given for the hash passes and for the compares (one or more a pass,
+/// or a list's passes in one with [`table`]).
+static CARD_PASSES: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Whether our lists for copies in the card's memory are timed on the card
 /// (`VICTORY_CARD_PASS_TIME=0` leaves it out; on by default): two
@@ -4034,6 +4090,9 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 mod send;
+mod table;
+#[cfg(test)]
+pub(crate) use table::{CARD_COMPARE_TABLE, entry as card_table_entry};
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
@@ -4566,6 +4625,15 @@ impl Host {
                     true => Some((self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?, 0)),
                     false => None,
                 },
+                table: (table::hash_on() || table::compare_on())
+                    .then(|| match table::Table::make(self) {
+                        Ok(table) => Some(table),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "no table for our passes over copies in the card's memory: a dispatch a pass, as before");
+                            None
+                        }
+                    })
+                    .flatten(),
             })
         }
     }
@@ -4820,6 +4888,30 @@ impl Host {
                 fail(format_args!("no host list to compare pieces of host copies in the card's memory ahead of their sends"));
             };
             let (allocator, list) = &pre;
+            // (`table::compare_on`: the passes in one dispatch.)
+            let befores: Vec<(&CardRange, ID3D12Resource, u32)> = ahead
+                .iter()
+                .filter(|r| r.compared)
+                .filter_map(|r| match (r.shadow.card_sides(), r.shadow.card_hash_size()) {
+                    (Some((_, Some(before), _)), size) => Some((r, before, size as u32)),
+                    _ => None,
+                })
+                .collect();
+            let passes: Vec<table::Pass> = befores
+                .iter()
+                .map(|(r, before, size)| table::Pass {
+                    buffer: &r.shadow.buffer,
+                    before,
+                    size: *size,
+                    span: r.span,
+                    at: r.at,
+                    mode: 2,
+                })
+                .collect();
+            let prepared = match work.table.as_mut() {
+                Some(t) if table::compare_on() && !passes.is_empty() => t.prepare(&self.device, &passes),
+                _ => None,
+            };
             // SAFETY: the list's last run finished (it came back with its
             // plan, done when its submission or landing has run); live
             // buffers (the ranges hold the copies); the compare's own root
@@ -4828,18 +4920,9 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for r in ahead.iter().filter(|r| r.compared) {
-                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
-                            continue;
-                        };
-                        list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        card_pass(list, &r.span, size as u32, r.at, 2);
-                        CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
-                    }
+                    CARD_PASSES[2].fetch_add(passes.len() as u64, Ordering::Relaxed);
+                    let n = card_passes(work, list, &passes, prepared.as_ref(), table::stat::COMPARE_LISTS);
+                    CARD_PASSES[4].fetch_add(n, Ordering::Relaxed);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -4870,6 +4953,50 @@ impl Host {
             // (`card_pass_split`: two pairs more, the sends and the passes.)
             let parts = stamp.and(card_pass_split().then(|| work.stamps.as_mut().map(|s| (s.take(), s.take()))).flatten());
             split = parts;
+            // The hash passes behind the sends, per copy with hashes.
+            let befores: Vec<(&Arc<crate::shadow::Shadow>, ID3D12Resource, u32, Vec<crate::shadow::CardSpan>)> = dirty
+                .iter()
+                .filter_map(|(shadow, ranges)| {
+                    let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
+                        return None;
+                    };
+                    // No twin (it cost the card the copy's size again, 399
+                    // MB in run 75): `before` holds a 128-bit hash of each 64
+                    // KiB piece. The pieces just sent up are hashed again,
+                    // all of them the first time; the compare after the lists
+                    // hashes the declared pieces and flags those whose hash
+                    // is another.
+                    let joins = rehash_runs() || own.is_some();
+                    let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
+                        vec![shadow.card_run(0, usize::MAX)]
+                    } else {
+                        // (In order: the next of the same piece, of the
+                        // tens of thousands there are, says nothing.)
+                        let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
+                        for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
+                            match runs.last_mut() {
+                                Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
+                                _ => runs.push(run),
+                            }
+                        }
+                        runs
+                    };
+                    // The same pieces in fewer passes (`rehash_runs`).
+                    let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
+                    Some((shadow, before, size as u32, runs))
+                })
+                .collect();
+            let hash_passes: Vec<table::Pass> = befores
+                .iter()
+                .flat_map(|(shadow, before, size, runs)| {
+                    runs.iter().map(move |run| table::Pass { buffer: &shadow.buffer, before, size: *size, span: *run, at: 0, mode: 0 })
+                })
+                .collect();
+            // (`table::hash_on`: the passes in one dispatch.)
+            let hash_table = match work.table.as_mut() {
+                Some(t) if table::hash_on() && !hash_passes.is_empty() => t.prepare(&self.device, &hash_passes),
+                _ => None,
+            };
             // SAFETY: the list's last run finished (it ran ahead of a
             // submission that was waited for, and came back after that);
             // live buffers, and the ranges lie in them.
@@ -4922,44 +5049,10 @@ impl Host {
                     if !sent.is_empty() {
                         list.ResourceBarrier(&sent);
                     }
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    for (shadow, ranges) in &dirty {
-                        let (Some((_, Some(before), _)), size) = (shadow.card_sides(), shadow.card_hash_size()) else {
-                            continue;
-                        };
-                        // No twin (it cost the card the copy's size again,
-                        // 399 MB in run 75): `before` holds a 128-bit hash
-                        // of each 64 KiB piece. The pieces just sent up are
-                        // hashed again, all of them the first time; the
-                        // compare after the lists hashes the declared
-                        // pieces and flags those whose hash is another.
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        let joins = rehash_runs() || own.is_some();
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
-                        } else {
-                            // (In order: the next of the same piece, of the
-                            // tens of thousands there are, says nothing.)
-                            let mut runs: Vec<crate::shadow::CardSpan> = Vec::new();
-                            for run in ranges.iter().map(|&(a, b)| shadow.card_run(a, b)) {
-                                match runs.last_mut() {
-                                    Some(last) if joins && (last.first, last.pieces) == (run.first, run.pieces) => last.to = last.to.max(run.to),
-                                    _ => runs.push(run),
-                                }
-                            }
-                            runs
-                        };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if joins { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
-                            card_pass(list, &run, size as u32, 0, 0);
-                        }
-                    }
+                    CARD_PASSES[0].fetch_add(hash_passes.len() as u64, Ordering::Relaxed);
+                    CARD_PASSES[1].fetch_add(hash_passes.iter().map(|p| u64::from(p.span.pieces)).sum::<u64>(), Ordering::Relaxed);
+                    let n = card_passes(work, list, &hash_passes, hash_table.as_ref(), table::stat::HASH_LISTS);
+                    CARD_PASSES[3].fetch_add(n, Ordering::Relaxed);
                     if let (Some(stamps), Some((_, passes))) = (&work.stamps, parts) {
                         stamps.end(list, passes);
                     }
@@ -5050,6 +5143,45 @@ impl Host {
             if let Some(n) = stamp {
                 plan.stamped.push((n, true));
             }
+            // (Not the pieces compared ahead of the sends.)
+            let befores: Vec<(&CardRange, ID3D12Resource, u32)> = plan
+                .ranges
+                .iter()
+                .filter(|r| r.compared && !r.ahead)
+                .filter_map(|r| match (r.shadow.card_sides(), r.shadow.card_hash_size()) {
+                    (Some((_, Some(before), _)), size) => Some((r, before, size as u32)),
+                    _ => None,
+                })
+                .collect();
+            // Ranges of one copy whose pieces and result places follow each other,
+            // in one mode, go in one pass (`VICTORY_CARD_COMPARE_JOIN=0`: a pass each).
+            let join = compare_join();
+            let mut passes: Vec<table::Pass> = Vec::new();
+            for (r, before, size) in &befores {
+                // (What is only looked at keeps its hashes: what
+                // changed there is the next declared range's to land.)
+                let mode = if flown && !r.picked { 2 } else { 1 };
+                if join
+                    && let Some(p) = passes.last_mut()
+                    && p.buffer.as_raw() == r.shadow.buffer.as_raw()
+                    && p.before.as_raw() == before.as_raw()
+                    && p.size == *size
+                    && p.mode == mode
+                    && p.span.skew == r.span.skew
+                    && p.span.first + p.span.pieces == r.span.first
+                    && p.at + p.span.pieces == r.at
+                {
+                    p.span.pieces += r.span.pieces;
+                    p.span.to = r.span.to;
+                    continue;
+                }
+                passes.push(table::Pass { buffer: &r.shadow.buffer, before, size: *size, span: r.span, at: r.at, mode });
+            }
+            // (`table::compare_on`: the passes in one dispatch.)
+            let prepared = match work.table.as_mut() {
+                Some(t) if table::compare_on() && !passes.is_empty() => t.prepare(&self.device, &passes),
+                _ => None,
+            };
             // SAFETY: the list's last run finished (its submission was
             // waited for, and it came back after that); live buffers; the
             // compare's own root signature.
@@ -5071,48 +5203,9 @@ impl Host {
                     if let (Some(stamps), Some(n)) = (&work.stamps, stamp) {
                         stamps.begin(list, n);
                     }
-                    list.SetComputeRootSignature(&work.root);
-                    list.SetPipelineState(&work.pso);
-                    list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                    // Ranges of one copy whose pieces and result places follow each other,
-                    // in one mode, go in one pass (`VICTORY_CARD_COMPARE_JOIN=0`: a pass each).
-                    let join = compare_join();
-                    let mut pending: Option<(u64, u64, u32, crate::shadow::CardSpan, u32, u32)> = None;
-                    let flush = |p: Option<(u64, u64, u32, crate::shadow::CardSpan, u32, u32)>| {
-                        if let Some((buffer, before, size, span, at, mode)) = p {
-                            list.SetComputeRootShaderResourceView(1, buffer);
-                            list.SetComputeRootUnorderedAccessView(2, before);
-                            card_pass(list, &span, size, at, mode);
-                            CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
-                        }
-                    };
-                    // (Not the pieces compared ahead of the sends.)
-                    for r in plan.ranges.iter().filter(|r| r.compared && !r.ahead) {
-                        let (Some((_, Some(before), _)), size) = (r.shadow.card_sides(), r.shadow.card_hash_size()) else {
-                            continue;
-                        };
-                        let (buffer, before_at) = (r.shadow.buffer.GetGPUVirtualAddress(), before.GetGPUVirtualAddress());
-                        // (What is only looked at keeps its hashes: what
-                        // changed there is the next declared range's to land.)
-                        let mode = if flown && !r.picked { 2 } else { 1 };
-                        if join
-                            && let Some((b, h, s, span, at, m)) = pending.as_mut()
-                            && *b == buffer
-                            && *h == before_at
-                            && *s == size as u32
-                            && *m == mode
-                            && span.skew == r.span.skew
-                            && span.first + span.pieces == r.span.first
-                            && *at + span.pieces == r.at
-                        {
-                            span.pieces += r.span.pieces;
-                            span.to = r.span.to;
-                            continue;
-                        }
-                        flush(pending.take());
-                        pending = Some((buffer, before_at, size as u32, r.span, r.at, mode));
-                    }
-                    flush(pending.take());
+                    CARD_PASSES[2].fetch_add(passes.len() as u64, Ordering::Relaxed);
+                    let n = card_passes(work, list, &passes, prepared.as_ref(), table::stat::COMPARE_LISTS);
+                    CARD_PASSES[4].fetch_add(n, Ordering::Relaxed);
                     if let (Some(stamps), Some(n)) = (&work.stamps, stamp) {
                         stamps.end(list, n);
                     }
@@ -5138,7 +5231,7 @@ impl Host {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2)
+            .is_some_and(|work| u64::from(work.taken) * 8 > work.differs.2 || work.table.as_ref().is_some_and(table::Table::low))
     }
 
     /// A cover ([`heat`]): the owed pieces `taken` are compared on the card
@@ -5352,6 +5445,9 @@ impl Host {
         // not read yet: the area starts again only when none is out.
         if !relay() || work.out == 0 {
             work.taken = 0;
+            if let Some(table) = work.table.as_mut() {
+                table.restart();
+            }
         }
     }
 
@@ -10119,7 +10215,8 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {
-            let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [passes, pieces, compares, hash_dispatches, compare_dispatches] =
+                [0, 1, 2, 3, 4].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let [sync_ticks, check_ticks, syncs, checks] = [0, 1, 2, 3].map(|i| CARD_TICKS[i].swap(0, Ordering::Relaxed));
             let rate = CARD_TICK_RATE.load(Ordering::Relaxed).max(1) as f64;
             let timed = if syncs + checks > 0 {
@@ -10149,11 +10246,14 @@ impl Meter {
             if passes + compares > 0.0 {
                 tracing::info!(
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
-                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes{timed}",
+                     ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes, \
+                     in {hash_dispatches:.0} and {compare_dispatches:.0} dispatches (VICTORY_CARD_HASH_TABLE=1, \
+                     VICTORY_CARD_COMPARE_TABLE=1: one a list){timed}",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
         }
+        table::line(frames);
         compared_line(frames);
         heat::line(frames);
         heat::lean_line(frames);
