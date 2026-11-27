@@ -74,6 +74,15 @@ pub(crate) struct Gate {
     pub(crate) left: u64,
     /// Frames a sign was recorded in.
     pub(crate) signed: u64,
+    /// Frames whose sign was recorded after the frame had been decided
+    /// against the light. The title records its lists on several threads at
+    /// once, and the resolve (list 236 in the boat capture) and the light (list
+    /// 245) need not be recorded in the order they are submitted in; nor need
+    /// both get the same `frame::current()`, a counter the frame wait moves on
+    /// the title's main thread. The hold hides this while water stays on
+    /// screen; it can only happen in the first frame of water after more than
+    /// [`HOLD`] frames without it, and this count says whether it does.
+    pub(crate) late: u64,
 }
 
 impl Gate {
@@ -82,6 +91,9 @@ impl Gate {
         if self.seen.is_none_or(|s| s < frame) {
             self.seen = Some(frame);
             self.signed += 1;
+            if self.decided == Some((frame, false)) {
+                self.late += 1;
+            }
         }
     }
 
@@ -111,6 +123,7 @@ static GATE: Mutex<Gate> = Mutex::new(Gate {
     ran: 0,
     left: 0,
     signed: 0,
+    late: 0,
 });
 
 #[cfg(windows)]
@@ -183,13 +196,19 @@ pub(crate) fn report() {
     if mode() != Mode::Auto {
         return;
     }
-    let (ran, left, signed) = {
+    let (ran, left, signed, late) = {
         let mut g = gate();
-        (std::mem::take(&mut g.ran), std::mem::take(&mut g.left), std::mem::take(&mut g.signed))
+        (
+            std::mem::take(&mut g.ran),
+            std::mem::take(&mut g.left),
+            std::mem::take(&mut g.signed),
+            std::mem::take(&mut g.late),
+        )
     };
     tracing::info!(
         "the water's tiled light (VICTORY_WATER_LIGHT=auto), since the last line: run in {ran} frames, left out of {left}; \
-         water drawn in {signed} frames (it runs while water was drawn in that frame or the {HOLD} before)"
+         water drawn in {signed} frames (it runs while water was drawn in that frame or the {HOLD} before), \
+         {late} of them drawn after the frame was decided without the light"
     );
 }
 
@@ -259,6 +278,23 @@ mod tests {
         assert!(g.runs(6));
         // Counted once a frame, not once a dispatch.
         assert_eq!((g.ran, g.left), (1, 1));
+        // The sign that came after the frame was decided is counted as late.
+        assert_eq!(g.late, 1);
+    }
+
+    #[test]
+    fn a_sign_before_the_decision_is_not_late() {
+        let mut g = Gate::default();
+        g.seen(5);
+        assert!(g.runs(5));
+        // A frame decided with the light: a later sign of it is not late either.
+        g.seen(6);
+        assert!(g.runs(6));
+        g.seen(6);
+        // Within the hold a frame runs anyway, so its sign is never late.
+        assert!(g.runs(7));
+        g.seen(7);
+        assert_eq!(g.late, 0);
     }
 
     #[test]
