@@ -66,6 +66,7 @@
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
 
+mod budget;
 mod extents;
 
 use std::collections::HashMap;
@@ -105,9 +106,24 @@ const BUILT: u64 = 4 << 20;
 const BACK: u64 = 256 << 10;
 /// Pages taken from the faults, of one frame and in all, at most: a ray in a
 /// structure that is not right goes anywhere, and 2,048 a frame took all the
-/// pages there are in the first seconds (run light-4).
+/// pages there are in the first seconds (run light-4). The limit for the
+/// run holds unless `VICTORY_FAULT_MB` makes it a budget that goes round
+/// ([`budget`]).
 const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
+
+/// `VICTORY_FAULT_MB=<MiB>` (unset: off): at most so much of arena pages is
+/// held because a shader found them empty, and at that limit the oldest
+/// such page is given back for the new one ([`budget`]), in place of
+/// [`FAULTS_ALL`] for the run. `VICTORY_FAULT_BUDGET=0` keeps the run's
+/// limit whatever it says. The budget's pages; none: the limit for the run.
+fn fault_budget() -> Option<usize> {
+    static PAGES: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *PAGES.get_or_init(|| {
+        let var = |name: &str| std::env::var(name).ok();
+        budget::asked(var("VICTORY_FAULT_MB").as_deref(), var("VICTORY_FAULT_BUDGET").as_deref(), PAGE)
+    })
+}
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
 /// Frames after an arena could not be had before another is asked for
@@ -142,6 +158,12 @@ struct Held {
     /// The frame it was last looked at in, and the one it came in.
     looked: u64,
     born: u64,
+    /// Which of all holdings this is (a page given back may come again).
+    serial: u64,
+    /// Taken from a fault and named by no list since ([`budget`] only): 1
+    /// if the programs that walk found it empty, 2 if the builder did (0:
+    /// not so).
+    fault: u8,
     /// Packed structures that have bytes in it, and whether it is held for
     /// them alone.
     owners: u32,
@@ -169,8 +191,9 @@ struct Memory {
     arenas: Vec<(usize, usize)>,
     /// By title page.
     pages: HashMap<u64, Held>,
-    /// Their numbers in the order they came, and where the sweep is.
-    order: Vec<u64>,
+    /// Their numbers and holding serials in the order they came, and where
+    /// the sweep is.
+    order: Vec<(u64, u64)>,
     sweep: usize,
     /// Windows of title memory itself ([`Memory::map`]).
     windows: usize,
@@ -183,8 +206,18 @@ struct Memory {
     free: Vec<(usize, usize)>,
     /// Copies of title buffers the builder may store in.
     open: std::collections::HashSet<usize>,
-    /// Pages taken from faults.
+    /// Pages taken from faults, in all.
     faulted: usize,
+    /// Holdings so far ([`Held::serial`]).
+    holdings: u64,
+    /// With `VICTORY_FAULT_MB`: the pages held from faults ([`budget`]).
+    budget: Option<budget::Budget>,
+    /// Whether the card has room for another arena, once asked this frame.
+    room: Option<bool>,
+    /// No room was found for a page from a fault this frame (not looked for
+    /// again in it); the page last asked for got no place for want of room.
+    full: bool,
+    turned: bool,
     /// Per host view heap (by address): the first slot of its run, and how
     /// many copies have their view there.
     heaps: HashMap<usize, (u32, u32)>,
@@ -224,6 +257,19 @@ struct Stats {
     sized: [u64; 2],
     /// Times an arena could not be had ([`arenas_fallback`]).
     no_arena: u64,
+    /// With the budget ([`budget`]), of the pages shaders found empty: made;
+    /// left over the frame's limit, without room, not the title's, without a
+    /// place; below 4 GiB; left by the builder.
+    made: u64,
+    left: [u64; 4],
+    low: u64,
+    builders: u64,
+    /// Pages from faults given back for others, of them wanted again at
+    /// once; gone with the title's memory; named by a list since.
+    given: u64,
+    again: u64,
+    dead: u64,
+    adopted: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -248,10 +294,21 @@ impl Memory {
         let entries = crate::upload::reserve(bytes as usize)?;
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
-        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
+        // With the budget, twice the notes a shader knows of: the programs
+        // that walk leave theirs in the first half, the builder in the
+        // second ([`ready`]).
+        let halves = if fault_budget().is_some() { 2 } else { 1 };
+        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4 * halves)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
-        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4) };
+        unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4 * halves as usize) };
+        if let Some(pages) = fault_budget() {
+            tracing::info!(
+                pages,
+                mb = (pages as u64 * PAGE) >> 20,
+                "title memory by address: pages from fault notes are a budget that goes round (VICTORY_FAULT_MB)"
+            );
+        }
         // SAFETY: a live buffer.
         let gpu = unsafe { faults.GetGPUVirtualAddress() };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
@@ -271,6 +328,11 @@ impl Memory {
             free: Vec::new(),
             open: Default::default(),
             faulted: 0,
+            holdings: 0,
+            budget: fault_budget().map(|pages| budget::Budget::new(pages, MEMORY_PAGES as usize)),
+            room: None,
+            full: false,
+            turned: false,
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
@@ -340,10 +402,20 @@ impl Memory {
         Some(n)
     }
 
-    /// Gives `page` a place, if it has none and the memory is the title's;
-    /// whether it has one then.
+    /// Gives `page` a place for a list that names it, if it has none and the
+    /// memory is the title's; whether it has one then.
     fn map(&mut self, page: u64) -> bool {
+        self.map_for(page, None)
+    }
+
+    /// [`Memory::map`]; `fault`: for a page a shader found empty (whether the
+    /// builder did), which takes an arena's place only within the budget
+    /// ([`Memory::fault_room`]; only with [`fault_budget`]).
+    fn map_for(&mut self, page: u64, fault: Option<bool>) -> bool {
         if self.copy_of(page).is_some() {
+            if fault.is_none() {
+                self.adopt(page);
+            }
             return true;
         }
         if !self.possible(page) {
@@ -391,6 +463,10 @@ impl Memory {
             }
             return false;
         }
+        if fault.is_some() && (self.full || !self.fault_room()) {
+            (self.full, self.turned) = (true, true);
+            return false;
+        }
         if self.pages.len() >= MOST {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
@@ -398,6 +474,7 @@ impl Memory {
         }
         if let Some((copy, at)) = self.free.pop() {
             self.hold(page, at, copy);
+            self.held_from_fault(page, fault);
             return true;
         }
         if !self.another() {
@@ -407,7 +484,94 @@ impl Memory {
             return false;
         };
         self.hold(page, at, copy);
+        self.held_from_fault(page, fault);
         true
+    }
+
+    /// `page`, just held, came from a fault the builder (`Some(true)`) or a
+    /// walking program left: it counts against the budget.
+    fn held_from_fault(&mut self, page: u64, fault: Option<bool>) {
+        if let Some(builds) = fault
+            && let Some(budget) = self.budget.as_mut()
+            && let Some(held) = self.pages.get_mut(&page)
+        {
+            held.fault = u8::from(builds) + 1;
+            budget.took(page, held.serial, builds);
+        }
+    }
+
+    /// A list names `page`, or a packed structure is unpacked in it: if it
+    /// was held from a fault it is not given back any more (it may hold what
+    /// is on the card alone, as any page a list names).
+    fn adopt(&mut self, page: u64) {
+        let Some(budget) = self.budget.as_mut() else { return };
+        if budget.total() == 0 {
+            return;
+        }
+        if let Some(held) = self.pages.get_mut(&page)
+            && held.fault != 0
+        {
+            budget.left(usize::from(held.fault) - 1);
+            held.fault = 0;
+            self.stats.adopted += 1;
+        }
+    }
+
+    /// Whether the card has room for another arena, by the rule its copy is
+    /// made by ([`crate::shadow::by_address`]: under 97 hundredths of the
+    /// budget; past it the arena lies in the PC's memory and every step of
+    /// every ray crosses the bus). Asked once a frame.
+    fn card_room(&mut self) -> bool {
+        *self.room.get_or_insert_with(|| {
+            host().and_then(|h| h.video_memory()).is_none_or(|[budget, used, ..]| used + ARENA < budget / 100 * 97)
+        })
+    }
+
+    /// Room for one more page from a fault: under the budget while the card
+    /// has room for the arena it may come to take; else the place of the
+    /// oldest such page, given back.
+    fn fault_room(&mut self) -> bool {
+        let Some(under) = self.budget.as_ref().map(budget::Budget::under) else {
+            return true;
+        };
+        (under && self.card_room()) || self.give_back()
+    }
+
+    /// Gives back the oldest page held from a fault, unless it is too young
+    /// ([`budget::YOUNG`]). Whether it is still read is not known (a present
+    /// page leaves no note): if it is, its note comes back with the next
+    /// frame and [`Memory::take_faults`] makes it again, first.
+    fn give_back(&mut self) -> bool {
+        let Some(budget) = self.budget.as_mut() else { return false };
+        let pages = &self.pages;
+        let live = |page: u64, serial: u64| pages.get(&page).filter(|h| h.serial == serial && h.fault != 0).map(|h| h.born);
+        let Some(page) = budget.give_back(self.frame, live) else {
+            return false;
+        };
+        self.let_go(page);
+        self.stats.given += 1;
+        true
+    }
+
+    /// `page`, held from a fault, is given up: its place is free and shaders
+    /// find it empty again.
+    fn let_go(&mut self, page: u64) {
+        let Some(held) = self.pages.remove(&page) else { return };
+        if held.fault != 0
+            && let Some(budget) = self.budget.as_mut()
+        {
+            budget.left(usize::from(held.fault) - 1);
+        }
+        self.free.push((held.copy, held.at));
+        // SAFETY: an entry of the directory, under the mutex.
+        unsafe { self.entry(page).write_volatile(0) };
+    }
+
+    /// The age in frames of the oldest page held from a fault.
+    fn oldest(&mut self) -> u64 {
+        let Some(budget) = self.budget.as_mut() else { return 0 };
+        let pages = &self.pages;
+        budget.oldest(self.frame, |page, serial| pages.get(&page).filter(|h| h.serial == serial && h.fault != 0).map(|h| h.born))
     }
 
     /// Another arena's pages.
@@ -480,8 +644,13 @@ impl Memory {
 
     /// `page` is held at `at` in the arena that is `copy`.
     fn hold(&mut self, page: u64, at: usize, copy: usize) {
-        self.pages.insert(page, Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, owners: 0, theirs: false });
-        self.order.push(page);
+        self.holdings += 1;
+        let serial = self.holdings;
+        self.pages.insert(
+            page,
+            Held { at, copy, taken: 0, looked: u64::MAX, born: self.frame, serial, fault: 0, owners: 0, theirs: false },
+        );
+        self.order.push((page, serial));
         fill(self.entry(page), copy, at as u64 - self.copies[copy].span().0);
     }
 
@@ -515,8 +684,22 @@ impl Memory {
     fn look_again(&mut self) {
         for _ in 0..self.order.len().div_ceil(SWEEP) {
             self.sweep = (self.sweep + 1) % self.order.len();
-            let page = self.order[self.sweep];
-            if self.pages.contains_key(&page) {
+            let (page, serial) = self.order[self.sweep];
+            // (Without the budget a page is known by its number alone, as
+            // before: one held again keeps both of its places in the sweep.)
+            let on = self.budget.is_some();
+            let fault = self.pages.get(&page).filter(|h| !on || h.serial == serial).map(|h| h.fault);
+            // The title's memory under a page from a fault is gone: so is
+            // what was read there. (A question to the system: put for a page
+            // every fourth time the sweep comes to it.)
+            let dead = fault.is_some_and(|f| f != 0)
+                && (self.frame / SWEEP as u64 + page).is_multiple_of(4)
+                && !crate::texture::committed((page * PAGE) as *const u8, PAGE as usize);
+            if dead {
+                self.let_go(page);
+                self.stats.dead += 1;
+            }
+            if fault.is_some() && !dead {
                 self.bring(page, page + 1);
             } else {
                 self.order.swap_remove(self.sweep);
@@ -675,6 +858,8 @@ impl Memory {
                     held.owners += 1;
                     held.theirs |= new;
                 }
+                // (Unpacked in place, on the card alone.)
+                self.adopt(page);
             }
             self.stats.packed_bytes += len;
         }
@@ -733,6 +918,10 @@ impl Memory {
 
     /// The pages shaders found empty since the last frame.
     fn take_faults(&mut self) {
+        if self.budget.is_some() {
+            self.take_faults_budget();
+            return;
+        }
         let mut pages = Vec::new();
         for i in 1..MEMORY_FAULTS as usize {
             // SAFETY: inside the faults' mapping; the GPU may be writing,
@@ -773,6 +962,115 @@ impl Memory {
                 pages = pages.len(),
                 made,
                 held = self.pages.len(),
+                ?some,
+                "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); those that are the title's are there now"
+            );
+        }
+    }
+
+    /// [`Memory::take_faults`] with the budget ([`budget`]): the notes come
+    /// in two halves (the walking programs', the builder's); those pages
+    /// that are the title's get a place, at most [`FAULTS`] a frame, those
+    /// given back and wanted again first, and at the budget the oldest page
+    /// held from a fault is given back for each new one.
+    fn take_faults_budget(&mut self) {
+        let mut raw = Vec::new();
+        // (Dword 0 of each half is a sink.)
+        for i in (1..2 * MEMORY_FAULTS as usize).filter(|&i| i != MEMORY_FAULTS as usize) {
+            // SAFETY: inside the faults' mapping (two halves with the
+            // budget); the GPU may be writing, a number missed now is
+            // written again next frame.
+            let at = unsafe { self.faults.1.add(i) };
+            // SAFETY: as above.
+            let page = unsafe { at.read_volatile() };
+            if page != 0 {
+                raw.push((u64::from(page), i > MEMORY_FAULTS as usize));
+                // SAFETY: as above.
+                unsafe { at.write_volatile(0) };
+            }
+        }
+        if raw.is_empty() {
+            return;
+        }
+        let mut pages = budget::noted(raw);
+        let builders = pages.iter().filter(|p| p.1).count();
+        // Below 4 GiB there is no title memory a shader reads by address: a
+        // pointer made of zeros, or of something that is no pointer.
+        let low = pages.partition_point(|p| p.0 < 0x1_0000);
+        let frame = self.frame;
+        let mut again = 0u64;
+        if let Some(budget) = self.budget.as_mut() {
+            for &(page, _) in &pages[low..] {
+                again += u64::from(budget.wanted(page, frame));
+            }
+            budget.first(&mut pages);
+        }
+        // Each is an access that read 0 or was dropped.
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let said = SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let say = said < 40 || said.is_multiple_of(100);
+        let given_before = self.stats.given;
+        let mut made = 0;
+        // Why the others got none: the frame's limit; no room (the budget
+        // with its oldest too young to go, or the card's memory); not the
+        // title's memory; no place (a copy that cannot be numbered, no
+        // arena).
+        let mut left = [0u32; 4];
+        for &(page, builds) in &pages {
+            if self.copy_of(page).is_some() {
+                continue;
+            }
+            if page < 0x1_0000 || page >= u64::from(MEMORY_PAGES) - 1 || self.refused.contains(&page) {
+                left[2] += 1;
+            } else if made >= FAULTS {
+                left[0] += 1;
+            } else if self.map_for(page, Some(builds)) {
+                made += 1;
+                self.faulted += 1;
+                self.bring(page, page + 1);
+            } else if self.refused.contains(&page) {
+                left[2] += 1;
+            } else if std::mem::take(&mut self.turned) {
+                left[1] += 1;
+            } else {
+                left[3] += 1;
+            }
+        }
+        let s = &mut self.stats;
+        s.faults += pages.len() as u64;
+        s.made += made as u64;
+        for (sum, n) in s.left.iter_mut().zip(left) {
+            *sum += u64::from(n);
+        }
+        s.low += low as u64;
+        s.builders += builders as u64;
+        s.again += again;
+        if say {
+            // (Of those above 4 GiB: the others tell nothing.)
+            let above: Vec<u64> = {
+                let mut above: Vec<u64> = pages.iter().map(|p| p.0).filter(|&p| p >= 0x1_0000).collect();
+                above.sort_unstable();
+                above
+            };
+            let some: Vec<String> =
+                above.iter().step_by(above.len().div_ceil(12).max(1)).map(|&p| format!("{:#x}", p * PAGE)).collect();
+            let (given_back, oldest) = (self.stats.given - given_before, self.oldest());
+            let from_faults = self.budget.as_ref().map_or(0, budget::Budget::total);
+            tracing::warn!(
+                frame = self.frame,
+                pages = pages.len(),
+                made,
+                held = self.pages.len(),
+                over_the_frame = left[0],
+                no_room = left[1],
+                not_the_titles = left[2],
+                no_place = left[3],
+                below_4_gib = low,
+                by_the_builder = builders,
+                from_faults,
+                given_back,
+                wanted_again = again,
+                oldest,
                 ?some,
                 "title memory by address: shaders touched pages that had no copy (those accesses read 0 or were dropped); those that are the title's are there now"
             );
@@ -875,6 +1173,42 @@ impl Memory {
                 s.sized[1] as f64 / frames,
                 EXTENTS.read().unwrap_or_else(|e| e.into_inner()).len()
             );
+        }
+        if self.budget.is_some() {
+            let oldest = self.oldest();
+            let now_frame = self.frame;
+            let pages = &self.pages;
+            let live = |page: u64, serial: u64| pages.get(&page).filter(|h| h.serial == serial && h.fault != 0).map(|h| h.born);
+            if let Some(budget) = self.budget.as_mut() {
+                let wanted = budget.tidy(now_frame, live);
+                tracing::info!(
+                    "title memory by address: from faults {} pages held ({} MB of at most {}: the walking programs' {}, the builder's {}), \
+                     the oldest {} frames old; since the last line {} made, {} given back for others ({} of them wanted again within {} frames), \
+                     {} gone with the title's memory, {} named by a list since; per frame {:.1} not the title's ({:.1} of them below 4 GiB), \
+                     {:.1} over the frame's limit, {:.1} without room, {:.1} without a place, {:.1} left by the builder; \
+                     pages wanted above 4 GiB: {} since the last line, {} in all",
+                    budget.total(),
+                    (budget.total() as u64 * PAGE) >> 20,
+                    (budget.pages as u64 * PAGE) >> 20,
+                    budget.held[0],
+                    budget.held[1],
+                    oldest,
+                    s.made,
+                    s.given,
+                    s.again,
+                    budget::SOON,
+                    s.dead,
+                    s.adopted,
+                    s.left[2] as f64 / frames,
+                    s.low as f64 / frames,
+                    s.left[0] as f64 / frames,
+                    s.left[1] as f64 / frames,
+                    s.left[3] as f64 / frames,
+                    s.builders as f64 / frames,
+                    wanted[1],
+                    wanted[0]
+                );
+            }
         }
         if s.no_arena > 0 {
             tracing::warn!(
@@ -1065,6 +1399,7 @@ pub(crate) fn ready(
     if m.frame != frame {
         m.frame = frame;
         m.refused.clear();
+        (m.room, m.full) = (None, false);
         m.take_faults();
         m.look_again();
         m.report();
@@ -1225,7 +1560,9 @@ pub(crate) fn ready(
     let directory = &m.directory.1;
     Some(Ready {
         directory: directory.gpu(directory.span().0),
-        faults: m.faults.2,
+        // With the budget the builder's notes go to the second half (the
+        // shader's places are the same in either half).
+        faults: m.faults.2 + if builds && m.budget.is_some() { u64::from(MEMORY_FAULTS) * 4 } else { 0 },
         base,
     })
 }
