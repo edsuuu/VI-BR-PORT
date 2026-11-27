@@ -47,6 +47,8 @@
 //! `VICTORY_AMBIENT_CUT=<factor>` follows a cut at once ([`cut`]).
 //! `VICTORY_AMBIENT_AIR_SOFT=1` bends the air's bound in ([`air_soft`]).
 //! `VICTORY_AMBIENT_EDGE=<pixels>` blends a room's edge ([`edge`]).
+//! `VICTORY_AMBIENT_FILE=<file>` reads these again from a file while the game
+//! runs ([`tuned`]).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -187,13 +189,152 @@ fn parse(set: &str) -> Set {
 /// in every frame, not only when a sample falls on it (which made the
 /// estimate flicker as the camera turned). Unset: 5x5, as before.
 fn full_cells() -> bool {
+    if let Some(v) = tuned().and_then(|t| t.cells) {
+        return v;
+    }
     static SET: OnceLock<bool> = OnceLock::new();
-    *SET.get_or_init(|| std::env::var("VICTORY_AMBIENT_CELLS").is_ok_and(|v| v.trim() == "full"))
+    *SET.get_or_init(|| parse_cells(&std::env::var("VICTORY_AMBIENT_CELLS").unwrap_or_default()))
+}
+
+fn parse_cells(set: &str) -> bool {
+    set.trim() == "full"
 }
 
 fn set() -> Set {
+    if let Some(v) = tuned().and_then(|t| t.set) {
+        return v;
+    }
+    set_from_environment()
+}
+
+fn set_from_environment() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
     *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
+}
+
+/// `VICTORY_AMBIENT_FILE=<file>`: the stand-in's settings are read again
+/// from the file about twice a second, to tune the light by eye in a
+/// running game. The file holds `NAME=value` lines for the switches of
+/// [`TUNED`] (`VICTORY_AMBIENT=constant:0.1`, `VICTORY_AMBIENT_AIR=0.8`,
+/// ...); a line that is not there leaves that switch's environment value, a
+/// line with nothing after `=` sets it unset. A line without `=` is taken
+/// as `VICTORY_AMBIENT` (the file of the fork the idea came from:
+/// Leandroazc/Azc-Low-End f6eb49c5e, after Spaghetih/victory-sley-fork and
+/// Belobug). Empty lines and lines starting with `#` are skipped. A file
+/// that cannot be read leaves every switch's environment value. Unset (the
+/// default): the environment's values, read once, as before.
+///
+/// What is read only once stays so: `VICTORY_AMBIENT_TRUE_DEPTH` and
+/// `VICTORY_LAMP_SHADOWS` (they choose views and passes, not the passes'
+/// constants).
+fn tuned() -> Option<Tuned> {
+    static FILE: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let file = FILE
+        .get_or_init(|| std::env::var_os("VICTORY_AMBIENT_FILE").filter(|v| !v.is_empty()).map(Into::into))
+        .as_ref()?;
+    static LAST: Mutex<Option<(std::time::Instant, Option<Tuned>)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((read, tuned)) = *last
+        && read.elapsed().as_millis() < 500
+    {
+        return tuned;
+    }
+    let was = last.and_then(|l| l.1);
+    let read = std::fs::read_to_string(file).ok().map(|text| parse_tuned(&text));
+    let now = read.as_ref().map(|r| r.0);
+    if last.is_none() || now != was {
+        let unknown = read.as_ref().map(|r| r.1.clone()).unwrap_or_default();
+        tracing::info!(
+            file = %file.display(),
+            readable = read.is_some(),
+            ?now,
+            ?unknown,
+            known = ?TUNED,
+            "the indirect light's stand-in: settings from VICTORY_AMBIENT_FILE"
+        );
+        // Turned on after being off: what the passes kept of a frame is
+        // from before (or nothing), so the estimate waits for a new one, as
+        // at the start. (The slow measures follow at their own pace, or at
+        // once with VICTORY_AMBIENT_CUT.)
+        let effective = |t: Option<Tuned>| t.and_then(|t| t.set).unwrap_or_else(set_from_environment);
+        if last.is_some() && effective(was) == Set::Off && effective(now) != Set::Off {
+            KEPT.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    *last = Some((std::time::Instant::now(), now));
+    now
+}
+
+/// The switches [`tuned`] reads from its file.
+const TUNED: [&str; 12] = [
+    "VICTORY_AMBIENT",
+    "VICTORY_AMBIENT_SHADE",
+    "VICTORY_AMBIENT_CELLS",
+    "VICTORY_AMBIENT_AIR",
+    "VICTORY_AMBIENT_LAMPS",
+    "VICTORY_AMBIENT_KEY",
+    "VICTORY_AMBIENT_OUTSIDE",
+    "VICTORY_AMBIENT_DAY",
+    "VICTORY_AMBIENT_CONTRAST",
+    "VICTORY_AMBIENT_CUT",
+    "VICTORY_AMBIENT_AIR_SOFT",
+    "VICTORY_AMBIENT_EDGE",
+];
+
+/// The settings a file of `VICTORY_AMBIENT_FILE` gives ([`tuned`]); `None`:
+/// the switch's environment value.
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+struct Tuned {
+    set: Option<Set>,
+    shade: Option<[f32; 2]>,
+    cells: Option<bool>,
+    air: Option<f32>,
+    lamps: Option<f32>,
+    key: Option<[f32; 2]>,
+    key_words: Option<KeyWords>,
+    key_tint: Option<bool>,
+    outside: Option<[f32; 2]>,
+    day: Option<[f32; 2]>,
+    contrast: Option<[f32; 2]>,
+    cut: Option<f32>,
+    air_soft: Option<bool>,
+    edge: Option<f32>,
+}
+
+/// A file's text as [`tuned`] takes it, and the names in it it does not
+/// know (said in the log).
+fn parse_tuned(text: &str) -> (Tuned, Vec<String>) {
+    let mut t = Tuned::default();
+    let mut unknown = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, value) = match line.split_once('=') {
+            Some((name, value)) => (name.trim(), value.trim()),
+            None => ("VICTORY_AMBIENT", line),
+        };
+        match name {
+            "VICTORY_AMBIENT" => t.set = Some(parse(value)),
+            "VICTORY_AMBIENT_SHADE" => t.shade = Some(parse_shade(value)),
+            "VICTORY_AMBIENT_CELLS" => t.cells = Some(parse_cells(value)),
+            "VICTORY_AMBIENT_AIR" => t.air = Some(parse_air(value)),
+            "VICTORY_AMBIENT_LAMPS" => t.lamps = Some(parse_lamps(value)),
+            "VICTORY_AMBIENT_KEY" => {
+                t.key = Some(parse_key(value));
+                t.key_words = Some(key_words(value));
+                t.key_tint = Some(parse_key_tint(value));
+            }
+            "VICTORY_AMBIENT_OUTSIDE" => t.outside = Some(parse_outside(value)),
+            "VICTORY_AMBIENT_DAY" => t.day = Some(parse_day(value)),
+            "VICTORY_AMBIENT_CONTRAST" => t.contrast = Some(parse_contrast(value)),
+            "VICTORY_AMBIENT_CUT" => t.cut = Some(parse_cut(value)),
+            "VICTORY_AMBIENT_AIR_SOFT" => t.air_soft = Some(parse_air_soft(value)),
+            "VICTORY_AMBIENT_EDGE" => t.edge = Some(parse_edge(value)),
+            other => unknown.push(other.to_owned()),
+        }
+    }
+    (t, unknown)
 }
 
 /// Whether the stand-in is on: set, and the title's rays find nothing.
@@ -204,11 +345,15 @@ pub(crate) fn on() -> bool {
 /// The most the air scatters, as a multiple of the light around
 /// (`VICTORY_AMBIENT_AIR=<multiple>`; unset or 0: what the title has).
 fn air() -> f32 {
+    if let Some(v) = tuned().and_then(|t| t.air) {
+        return v;
+    }
     static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
-    })
+    *SET.get_or_init(|| parse_air(&std::env::var("VICTORY_AMBIENT_AIR").unwrap_or_default()))
+}
+
+fn parse_air(set: &str) -> f32 {
+    set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(0.0)
 }
 
 /// How bright (luminance of the kept radiance) a texel counts at most in the
@@ -219,11 +364,15 @@ fn air() -> f32 {
 /// bright on screen: a higher bound lets the tubes raise the estimate and
 /// the slow mean the constant's share follows.
 fn lamps() -> f32 {
+    if let Some(v) = tuned().and_then(|t| t.lamps) {
+        return v;
+    }
     static SET: OnceLock<f32> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_LAMPS").unwrap_or_default();
-        set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(20.0)
-    })
+    *SET.get_or_init(|| parse_lamps(&std::env::var("VICTORY_AMBIENT_LAMPS").unwrap_or_default()))
+}
+
+fn parse_lamps(set: &str) -> f32 {
+    set.trim().parse().ok().filter(|v: &f32| v.is_finite() && *v > 0.0).unwrap_or(20.0)
 }
 
 /// `VICTORY_AMBIENT_KEY=<mean>:<most gain>`: the constant light (of
@@ -239,15 +388,19 @@ fn lamps() -> f32 {
 /// darker on screen. The corridor, right with the constant 0.1, has a mean of
 /// about 0.19 in the kept radiance; the common room 0.075.
 fn key() -> [f32; 2] {
+    if let Some(v) = tuned().and_then(|t| t.key) {
+        return v;
+    }
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default();
-        let mut parts = set.split(':').take(2).map(|v| v.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0));
-        match (parts.next().flatten(), parts.next().flatten()) {
-            (Some(key), most) => [key, most.unwrap_or(8.0)],
-            _ => [0.0, 1.0],
-        }
-    })
+    *SET.get_or_init(|| parse_key(&std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default()))
+}
+
+fn parse_key(set: &str) -> [f32; 2] {
+    let mut parts = set.split(':').take(2).map(|v| v.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0));
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(key), most) => [key, most.unwrap_or(8.0)],
+        _ => [0.0, 1.0],
+    }
 }
 
 /// Words after the key's two numbers: `inside` raises only texels the stencil
@@ -268,6 +421,9 @@ fn key() -> [f32; 2] {
 /// prison's rooms (about 98% inside, agente-interior.md 14.3) are raised as
 /// before. Without the word: the whole screen's measure, as before.
 fn key_flags() -> KeyWords {
+    if let Some(v) = tuned().and_then(|t| t.key_words) {
+        return v;
+    }
     static SET: OnceLock<KeyWords> = OnceLock::new();
     *SET.get_or_init(|| key_words(&std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default()))
 }
@@ -325,6 +481,9 @@ fn whole_gain(gain: f32, share: f32) -> f32 {
 /// halo of its lamps and of the police lights goes. Inside (the prison's
 /// rooms, about 98% of their screen) nothing changes.
 fn outside() -> [f32; 2] {
+    if let Some(v) = tuned().and_then(|t| t.outside) {
+        return v;
+    }
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
     *SET.get_or_init(|| parse_outside(&std::env::var("VICTORY_AMBIENT_OUTSIDE").unwrap_or_default()))
 }
@@ -351,6 +510,9 @@ fn parse_outside(set: &str) -> [f32; 2] {
 /// street 0.002-0.03, the diner cutscene 0.1-0.25, the prison's rooms
 /// 0.1-0.2).
 fn day() -> [f32; 2] {
+    if let Some(v) = tuned().and_then(|t| t.day) {
+        return v;
+    }
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
     *SET.get_or_init(|| parse_day(&std::env::var("VICTORY_AMBIENT_DAY").unwrap_or_default()))
 }
@@ -392,6 +554,9 @@ fn day_share(mean: f32, [from, to]: [f32; 2]) -> f32 {
 /// its lamps and the floor: its mean is 1.5-4 times its log-average (run
 /// intro-s-luz3), and with a ratio above that it gets no gain.
 fn contrast() -> [f32; 2] {
+    if let Some(v) = tuned().and_then(|t| t.contrast) {
+        return v;
+    }
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
     *SET.get_or_init(|| parse_contrast(&std::env::var("VICTORY_AMBIENT_CONTRAST").unwrap_or_default()))
 }
@@ -428,6 +593,9 @@ fn contrast_step(log_gain: f32, mean: f32, bulk: f32, [ratio, most]: [f32; 2], o
 /// rooms' share still rising (0.16 then 0.92, run barco-ab-agua0), and a
 /// room is raised by the gain of the last room seen, minutes before.
 fn cut() -> f32 {
+    if let Some(v) = tuned().and_then(|t| t.cut) {
+        return v;
+    }
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| parse_cut(&std::env::var("VICTORY_AMBIENT_CUT").unwrap_or_default()))
 }
@@ -457,8 +625,15 @@ fn is_cut(was: f32, now: f32, cut: f32) -> bool {
 /// prison), so it cuts off far more often than with the constant alone: the
 /// tester's banding on the prison corridor's wall came with the new set.
 fn air_soft() -> bool {
+    if let Some(v) = tuned().and_then(|t| t.air_soft) {
+        return v;
+    }
     static SET: OnceLock<bool> = OnceLock::new();
-    *SET.get_or_init(|| std::env::var("VICTORY_AMBIENT_AIR_SOFT").is_ok_and(|v| v.trim() == "1"))
+    *SET.get_or_init(|| parse_air_soft(&std::env::var("VICTORY_AMBIENT_AIR_SOFT").unwrap_or_default()))
+}
+
+fn parse_air_soft(set: &str) -> bool {
+    set.trim() == "1"
 }
 
 /// `VICTORY_AMBIENT_EDGE=<pixels>` (1-16): where the stencil plane's marking
@@ -473,6 +648,9 @@ fn air_soft() -> bool {
 /// wall (a door's frame, a strip the title does not mark) that is a hard
 /// step the constant alone (the same light both sides) never had.
 fn edge() -> f32 {
+    if let Some(v) = tuned().and_then(|t| t.edge) {
+        return v;
+    }
     static SET: OnceLock<f32> = OnceLock::new();
     *SET.get_or_init(|| parse_edge(&std::env::var("VICTORY_AMBIENT_EDGE").unwrap_or_default()))
 }
@@ -497,11 +675,15 @@ fn soft_bound(has: f32, cap: f32) -> f32 {
 /// key raises the room: none at a gain of 1, all from 2) to that of the light
 /// around. Its own switch word, since it changes colours, not levels.
 fn key_tint() -> bool {
+    if let Some(v) = tuned().and_then(|t| t.key_tint) {
+        return v;
+    }
     static SET: OnceLock<bool> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default();
-        set.split(':').skip(2).any(|w| w.trim() == "tint")
-    })
+    *SET.get_or_init(|| parse_key_tint(&std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default()))
+}
+
+fn parse_key_tint(set: &str) -> bool {
+    set.split(':').skip(2).any(|w| w.trim() == "tint")
 }
 
 fn key_geo() -> bool {
@@ -522,17 +704,21 @@ fn key_room() -> bool {
 
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
+    if let Some(v) = tuned().and_then(|t| t.shade) {
+        return v;
+    }
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let mut shade = [1.0, 0.6];
-        let set = std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default();
-        for (to, v) in shade.iter_mut().zip(set.split(',')) {
-            if let Ok(v) = v.trim().parse() {
-                *to = v;
-            }
+    *SET.get_or_init(|| parse_shade(&std::env::var("VICTORY_AMBIENT_SHADE").unwrap_or_default()))
+}
+
+fn parse_shade(set: &str) -> [f32; 2] {
+    let mut shade = [1.0, 0.6];
+    for (to, v) in shade.iter_mut().zip(set.split(',')) {
+        if let Ok(v) = v.trim().parse() {
+            *to = v;
         }
-        shade
-    })
+    }
+    shade
 }
 
 const SOURCE: &str = r#"
@@ -1548,6 +1734,59 @@ mod tests {
         let slope = (soft_bound(0.1001, cap) - soft_bound(0.1, cap)) / 0.0001;
         assert!((slope - 1.0).abs() < 0.01, "{slope}");
         assert_eq!(soft_bound(1.0, 0.0), 0.0);
+    }
+
+    /// A file of `VICTORY_AMBIENT_FILE`: each line read as its switch's
+    /// environment value would be; switches it leaves out stay `None`
+    /// (their environment value), unknown names are named.
+    #[test]
+    fn tuned_file_settings() {
+        let text = "# the prison\n\
+                    VICTORY_AMBIENT=constant:0.1:0.5\n\
+                    VICTORY_AMBIENT_AIR = 0.8\n\
+                    VICTORY_AMBIENT_KEY=0.2:4:room:tint\n\
+                    VICTORY_AMBIENT_OUTSIDE=0.6:0.02\n\
+                    VICTORY_AMBIENT_DAY=0.5:2\n\
+                    VICTORY_AMBIENT_CONTRAST=3\n\
+                    VICTORY_AMBIENT_CUT=3\n\
+                    VICTORY_AMBIENT_AIR_SOFT=1\n\
+                    VICTORY_AMBIENT_EDGE=4\n\
+                    \n\
+                    VICTORY_AMBIENT_FOG=2\n";
+        let (t, unknown) = parse_tuned(text);
+        assert_eq!(t.set, Some(Set::Constant(0.1, 0.5)));
+        assert_eq!(t.air, Some(0.8));
+        assert_eq!(t.key, Some([0.2, 4.0]));
+        assert_eq!(t.key_words, Some(KeyWords { inside: true, air: false, geo: false, room: true }));
+        assert_eq!(t.key_tint, Some(true));
+        assert_eq!(t.outside, Some([0.6, 0.02]));
+        assert_eq!(t.day, Some([0.5, 2.0]));
+        assert_eq!(t.contrast, Some([3.0, 8.0]));
+        assert_eq!(t.cut, Some(parse_cut("3")));
+        assert_eq!(t.air_soft, Some(true));
+        assert_eq!(t.edge, Some(4.0));
+        // Not in the file: the environment's.
+        assert_eq!((t.shade, t.cells, t.lamps), (None, None, None));
+        assert_eq!(unknown, ["VICTORY_AMBIENT_FOG"]);
+        // A line with nothing after `=` sets the switch unset; a line
+        // without `=` is VICTORY_AMBIENT's (the fork's one-line file).
+        let (t, _) = parse_tuned("VICTORY_AMBIENT_AIR=\nVICTORY_AMBIENT_CELLS=full\nVICTORY_AMBIENT_SHADE=0.5,1\n");
+        assert_eq!((t.air, t.cells, t.shade, t.set), (Some(0.0), Some(true), Some([0.5, 1.0]), None));
+        assert_eq!(parse_tuned("  off \n").0.set, Some(Set::Off));
+        assert_eq!(parse_tuned("1.5").0.set, Some(Set::Estimate(1.5, 0.0)));
+        assert_eq!(parse_tuned("VICTORY_AMBIENT_LAMPS=40").0.lamps, Some(40.0));
+        assert_eq!(parse_tuned(""), (Tuned::default(), Vec::<String>::new()));
+        // Every switch it lists is one it reads.
+        for name in TUNED {
+            let (t, unknown) = parse_tuned(&format!("{name}=1"));
+            assert!(unknown.is_empty() && t != Tuned::default(), "{name}");
+        }
+        // The values unset give are those of an empty environment.
+        assert_eq!(parse_air(""), 0.0);
+        assert_eq!(parse_lamps(""), 20.0);
+        assert_eq!(parse_key(""), [0.0, 1.0]);
+        assert_eq!(parse_shade(""), [1.0, 0.6]);
+        assert!(!parse_cells("") && !parse_air_soft("") && !parse_key_tint(""));
     }
 
     #[test]
