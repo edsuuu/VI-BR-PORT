@@ -70,8 +70,22 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
 /// With the world streamed in, the title's own memory can fill [4 GiB,
 /// 2^37) so that no hole of 64 MiB is left (a claim of the fork this is
 /// ported from: two runs of three, the twentieth arena).
-pub(crate) fn reserve_out_of_reach(len: usize) -> Option<usize> {
-    reserve(len).or_else(|| reserve_between(len, 1 << 37, 1 << 40))
+///
+/// `high`: above 2^37 first, and where shaders reach only if that fails: the
+/// window shaders reach is also where every list's upload memory must lie,
+/// and an arena (64 MiB) taken from it is room the title's uploads lack once
+/// its own memory fills the window (the same fork saw upload memory run out
+/// with the directory and an arena in that window, the title's builder then
+/// ending the run on a null answer).
+pub(crate) fn reserve_out_of_reach(len: usize, high: bool) -> Option<usize> {
+    let [first, second] = out_of_reach_order(high);
+    reserve_between(len, first.0, first.1).or_else(|| reserve_between(len, second.0, second.1))
+}
+
+/// The two windows [`reserve_out_of_reach`] tries, in order.
+fn out_of_reach_order(high: bool) -> [(usize, usize); 2] {
+    let (near, far) = ((1 << 32, 1 << 37), (1 << 37, 1 << 40));
+    if high { [far, near] } else { [near, far] }
 }
 
 /// The last error of this thread, for a log line after a failed call.
@@ -200,6 +214,12 @@ mod tests {
         // SAFETY: the bytes were handed out.
         unsafe { d.start().add(ARENA).write(1) };
         drop(b);
+    }
+
+    #[test]
+    fn memory_out_of_reach_tries_above_it_first_only_when_asked() {
+        assert_eq!(out_of_reach_order(false), [(1 << 32, 1 << 37), (1 << 37, 1 << 40)]);
+        assert_eq!(out_of_reach_order(true), [(1 << 37, 1 << 40), (1 << 32, 1 << 37)]);
     }
 
     #[test]

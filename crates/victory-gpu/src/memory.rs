@@ -141,13 +141,37 @@ fn times() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_TIMES").is_some_and(|v| v == "1"))
 }
 
+/// Where arenas go ([`arenas_fallback`]).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Fallback {
+    /// Where shaders reach, asked for again at every dispatch after a
+    /// failure (as before).
+    Off,
+    /// Where shaders reach, else above it; a failure backs off.
+    On,
+    /// Above where shaders reach first (the directory too), else in it; a
+    /// failure backs off.
+    High,
+}
+
 /// `VICTORY_ARENAS_FALLBACK=1` (off by default): an arena that cannot be had
 /// where shaders reach ([4 GiB, 2^37)) is made above it, and one that cannot
-/// be had at all is not asked for again for [`ARENA_AGAIN`] frames. Off, a
-/// failed arena is asked for again at the next dispatch, as before.
-fn arenas_fallback() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ARENAS_FALLBACK").is_some_and(|v| v == "1"))
+/// be had at all is not asked for again for [`ARENA_AGAIN`] frames. `high`:
+/// arenas and the directory go above that range first, so that the room in
+/// it stays the title's and its lists' upload memory's (no shader finds
+/// either by a title address). Off, a failed arena is asked for again at the
+/// next dispatch, as before.
+fn arenas_fallback() -> Fallback {
+    static ON: std::sync::OnceLock<Fallback> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| fallback_asked(std::env::var("VICTORY_ARENAS_FALLBACK").ok().as_deref()))
+}
+
+fn fallback_asked(value: Option<&str>) -> Fallback {
+    match value.map(str::trim) {
+        Some("1") => Fallback::On,
+        Some("high") => Fallback::High,
+        _ => Fallback::Off,
+    }
 }
 
 /// What a draw or dispatch does with title memory by address.
@@ -314,7 +338,14 @@ impl Memory {
         let host = host()?;
         let bytes = u64::from(MEMORY_PAGES) * 8;
         // Zeroed, and watched for writes as the title's memory is.
-        let entries = crate::upload::reserve(bytes as usize)?;
+        // (Read by the CPU and through its copy on the card, never at a
+        // title address: with `VICTORY_ARENAS_FALLBACK=high` it leaves the
+        // shaders' range to the title.)
+        let entries = if arenas_fallback() == Fallback::High {
+            crate::upload::reserve_out_of_reach(bytes as usize, true)?
+        } else {
+            crate::upload::reserve(bytes as usize)?
+        };
         let directory = crate::shadow::by_address(entries as u64, bytes)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
         // With the budget, twice the notes a shader knows of: the programs
@@ -599,7 +630,7 @@ impl Memory {
 
     /// Another arena's pages.
     fn another(&mut self) -> bool {
-        if arenas_fallback() {
+        if arenas_fallback() != Fallback::Off {
             return self.another_or_wait();
         }
         let Some(at) = crate::upload::reserve(ARENA as usize) else {
@@ -641,16 +672,18 @@ impl Memory {
             false
         };
         // (Where shaders do not look for it: they get its copy's number.)
-        let Some(at) = crate::upload::reserve_out_of_reach(ARENA as usize) else {
+        let high = arenas_fallback() == Fallback::High;
+        let Some(at) = crate::upload::reserve_out_of_reach(ARENA as usize, high) else {
             return failed(self, "no address space for it", crate::upload::last_error());
         };
-        if at >= 1 << 37 {
+        if (at >= 1 << 37) != high {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 tracing::info!(
                     at = format_args!("{at:#x}"),
                     arenas = self.arenas.len(),
-                    "title memory by address: the shaders' address range is full; arenas are made above it"
+                    above = !high,
+                    "title memory by address: an arena is not where VICTORY_ARENAS_FALLBACK tries first (above: the shaders' range is full)"
                 )
             });
         }
@@ -1853,6 +1886,15 @@ mod tests {
         title[41] = 8;
         assert_eq!(merge(&title, &mut ours, false), 1);
         assert_eq!(ours, title);
+    }
+
+    #[test]
+    fn arenas_go_where_the_switch_says() {
+        assert_eq!(fallback_asked(None), Fallback::Off);
+        assert_eq!(fallback_asked(Some("0")), Fallback::Off);
+        assert_eq!(fallback_asked(Some("1")), Fallback::On);
+        assert_eq!(fallback_asked(Some("high")), Fallback::High);
+        assert_eq!(fallback_asked(Some("yes")), Fallback::Off);
     }
 
     #[test]
