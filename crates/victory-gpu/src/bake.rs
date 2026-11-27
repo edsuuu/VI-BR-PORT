@@ -36,6 +36,41 @@ pub(crate) fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_SOURCES").is_none_or(|v| v != "0"))
 }
 
+/// Whether a dword that names a texture object (not a texture placed in
+/// memory) is taken as a source too (`VICTORY_BAKE_SOURCES_OBJECTS=1`; off:
+/// the ones found were small flags and counts naming the heap's first
+/// slots, never a decal).
+pub(crate) fn objects() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_SOURCES_OBJECTS").is_some_and(|v| v == "1"))
+}
+
+/// Bake draws so far into each target (its memory's address), for the log:
+/// whether the title bakes the same target again later.
+pub(crate) static TARGETS: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+
+/// Counts a bake draw into the target at `at`; returns how many there were
+/// so far, this one included (0 for no target).
+pub(crate) fn into_target(at: u64) -> u32 {
+    if at == 0 {
+        return 0;
+    }
+    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    match targets.iter_mut().find(|(t, _)| *t == at) {
+        Some((_, n)) => {
+            *n += 1;
+            *n
+        }
+        None => {
+            if targets.len() >= 4096 {
+                targets.remove(0);
+            }
+            targets.push((at, 1));
+            1
+        }
+    }
+}
+
 /// The most sources one draw takes: the bake's records are a few dozen;
 /// past this the dwords are not indices.
 pub(crate) const MOST: usize = 256;
@@ -125,6 +160,15 @@ pub(crate) static COUNTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bakes_are_counted_by_target() {
+        assert_eq!(into_target(0), 0);
+        let at = 0xdead_0000_0000;
+        assert_eq!(into_target(at), 1);
+        assert_eq!(into_target(at + 0x1000), 1);
+        assert_eq!(into_target(at), 2);
+    }
 
     #[test]
     fn indices_are_the_dwords_that_name_texture_views() {

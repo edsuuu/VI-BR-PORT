@@ -79,6 +79,9 @@ thread_local! {
     /// the budget, and whether the pass serves them alone (the frame's
     /// bakes have used their time, or nothing is new since the last pass).
     static BAKE_SOURCES: std::cell::RefCell<Option<(Vec<u32>, bool)>> = const { std::cell::RefCell::new(None) };
+    /// The memory of the first render target of the bake draw whose pass
+    /// runs (0: none), for the log.
+    static BAKE_TARGET: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -2296,6 +2299,8 @@ impl State {
         crate::texture::BAKING.set(bake && bake_exact());
         if !sources.is_empty() {
             BAKE_SOURCES.set(Some((sources, alone)));
+            let target = self.targets.first().and_then(|&t| crate::resource::texture_memory(t as This));
+            BAKE_TARGET.set(target.map_or(0, |(at, _)| at as u64));
         }
         self.heap_textures(list, heap, host);
         BAKE_SOURCES.set(None);
@@ -2319,10 +2324,17 @@ impl State {
         let count = host.count();
         let mut out = Vec::new();
         let mut words: Vec<u32> = Vec::new();
+        // Placed textures only: the bake's decals and bases are textures the
+        // title placed in memory it fills. Small dwords (flags, counts: 0,
+        // 1, 2, 4) named texture objects at the heap's first slots, whose
+        // host slots the pass then made from the title's record (runs
+        // intro-s-bs3..bs6); `crate::bake::objects` takes them as before.
+        let objects = crate::bake::objects();
         let is_texture = |index: u32| {
-            heap.handle(index)
-                .and_then(crate::descriptor::view)
-                .is_some_and(|view| crate::descriptor::host::is_texture_view(&view))
+            heap.handle(index).and_then(crate::descriptor::view).is_some_and(|view| match view {
+                View::Placed(false, resource, _) => resource[0] != 1,
+                _ => objects && crate::descriptor::host::is_texture_view(&view),
+            })
         };
         for stage in p.stages.iter().filter(|s| bake_shader(&s.shader)) {
             for u in &stage.translated().used {
@@ -2385,10 +2397,13 @@ impl State {
                 Some(_) => 2,
             }] += 1;
         }
+        let target = BAKE_TARGET.get();
         let mut watch = Vec::new();
         for ((&(index, _, before), o), &made) in sources.iter().zip(outcome).zip(made) {
             let memory = slot_memory(heap, index);
-            if let Some((at, len)) = memory {
+            // (Not the bake's own target, read as its base: what the bake
+            // writes there is not a change of a source.)
+            if let Some((at, len)) = memory.filter(|&(at, len)| !(at..at + len).contains(&target)) {
                 let print = crate::texture::fingerprint(at, len);
                 watch.push(crate::bake::Watched { slot: index, at, len, print, frame });
             }
@@ -2435,10 +2450,28 @@ impl State {
                 watched.add(w);
             }
         }
+        // Into which target, and how many bakes it has had so far (does the
+        // title bake it again later?).
+        let into_it = crate::bake::into_target(target);
         let n = COUNTS[0].load(Ordering::Relaxed);
-        if n <= 64 || n.is_power_of_two() {
+        if n <= 64 || n.is_power_of_two() || (1..=3).contains(&into_it) {
+            // Each source as slot:bytes and what the pass did (u uploaded,
+            // s the same, t left to tables, a not mapped, - none of them).
+            let list: Vec<String> = sources
+                .iter()
+                .zip(outcome)
+                .take(32)
+                .map(|(&(index, _, _), o)| {
+                    let bytes = slot_memory(heap, index).map_or(0, |m| m.1);
+                    let did = ["u", "s", "t", "a"].into_iter().zip(o).find(|&(_, &b)| b).map_or("-", |(c, _)| c);
+                    format!("{index}:{bytes}:{did}")
+                })
+                .collect();
             tracing::info!(
                 frame,
+                target = format_args!("{target:#x}"),
+                bakes_into_this_target = into_it,
+                list = list.join(" "),
                 sources = sources.len(),
                 slots_made_from_another_view = made.iter().filter(|&&m| !m).count(),
                 out_of_the_queue = known[0],
