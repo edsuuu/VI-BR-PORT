@@ -491,3 +491,5 @@ pub(crate) mod build {
     }
 }
 
+#[cfg(test)]
+mod tests;
