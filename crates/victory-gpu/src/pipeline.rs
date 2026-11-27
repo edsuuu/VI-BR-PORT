@@ -636,6 +636,14 @@ fn ray_programs_are_known_by_name() {
 /// (`VICTORY_RT_MISS=1`) and the structure builder is off. Each kind runs
 /// anyway with its switch: `VICTORY_RT_SKIN=1`, `VICTORY_RT_RESOLVE=1`, `VICTORY_RT_TRACE=1`,
 /// `VICTORY_ACTIVATE_RAYS=1`.
+///
+/// The same four kinds (not the hair's geometry, the shadow masks or the
+/// water's light) are left out with ray tracing asked for
+/// (`VICTORY_BVH_BUILDER=1`, rays not all misses) while the builder is off
+/// at its last look ([`builder_known_off`]): they would trace structures that
+/// were never built. Read at every dispatch, so they run again once the
+/// builder does, and before its first look they run. Their switches run
+/// them anyway, and `VICTORY_RT_FOLLOW_BUILDER=0` runs them all as before.
 #[cfg(windows)]
 pub(crate) fn skips_rt_skin(this: This) -> bool {
     fn off(switch: &str) -> bool {
@@ -643,6 +651,15 @@ pub(crate) fn skips_rt_skin(this: This) -> bool {
             && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
             && std::env::var_os(switch).is_none_or(|v| v != "1")
     }
+    /// Whether the kind of `switch` follows the builder.
+    fn follows(switch: &str) -> bool {
+        builder_asked()
+            && !victory_shader::emit::rt_miss()
+            && std::env::var_os("VICTORY_RT_FOLLOW_BUILDER").is_none_or(|v| v != "0")
+            && std::env::var_os(switch).is_none_or(|v| v != "1")
+    }
+    static FOLLOWS: [OnceLock<bool>; 4] = [const { OnceLock::new() }; 4];
+    let follow = |i: usize, switch: &str| *FOLLOWS[i].get_or_init(|| follows(switch)) && builder_known_off();
     static SKIN: OnceLock<bool> = OnceLock::new();
     static HAIR_VB: OnceLock<bool> = OnceLock::new();
     static RESOLVE: OnceLock<bool> = OnceLock::new();
@@ -655,15 +672,15 @@ pub(crate) fn skips_rt_skin(this: This) -> bool {
     }
     match pipeline(this).rt_only {
         RayOnly::No => false,
-        RayOnly::Skin => *SKIN.get_or_init(|| off("VICTORY_RT_SKIN")),
+        RayOnly::Skin => *SKIN.get_or_init(|| off("VICTORY_RT_SKIN")) || follow(0, "VICTORY_RT_SKIN"),
         // The hair's geometry is also what the sun's shadow mask reads for the tiles with hair
         // (`CS_GenerateShadowMasks_HairOnly`): left out, those tiles kept stale, lit values over
         // the hair (blocky orange hair in the prison window, run prisao-raios; right with it, run
         // prisao-pele). It runs unless `VICTORY_RT_HAIR_VB=0`.
         RayOnly::HairVb => *HAIR_VB.get_or_init(|| std::env::var_os("VICTORY_RT_HAIR_VB").is_some_and(|v| v == "0")),
-        RayOnly::Resolve => *RESOLVE.get_or_init(|| off("VICTORY_RT_RESOLVE")),
-        RayOnly::Activate => *ACTIVATE.get_or_init(|| off("VICTORY_ACTIVATE_RAYS")),
-        RayOnly::Trace => *TRACE.get_or_init(|| off("VICTORY_RT_TRACE")),
+        RayOnly::Resolve => *RESOLVE.get_or_init(|| off("VICTORY_RT_RESOLVE")) || follow(1, "VICTORY_RT_RESOLVE"),
+        RayOnly::Activate => *ACTIVATE.get_or_init(|| off("VICTORY_ACTIVATE_RAYS")) || follow(2, "VICTORY_ACTIVATE_RAYS"),
+        RayOnly::Trace => *TRACE.get_or_init(|| off("VICTORY_RT_TRACE")) || follow(3, "VICTORY_RT_TRACE"),
         // (opt-in while it is tried: `VICTORY_SKIP_RT_SHADOW=1`)
         RayOnly::ShadowMask => *SHADOW.get_or_init(|| {
             std::env::var_os("VICTORY_SKIP_RT_SHADOW").is_some_and(|v| v == "1") && off("VICTORY_RT_SHADOW")
@@ -753,11 +770,20 @@ pub(crate) fn builder_runs() -> bool {
 #[cfg(windows)]
 fn publish(b: &Builder) {
     let was = BUILDER_STATE.swap(b.state, std::sync::atomic::Ordering::Relaxed);
-    if was != b.state && was != UNDECIDED {
+    if was != b.state {
+        let name = |s| match s {
+            RUNS => "runs",
+            OFF => "off",
+            _ => "not looked at",
+        };
+        // (What `skips_rt_skin` does with it, for the four kinds that follow.)
+        let follow = !victory_shader::emit::rt_miss()
+            && std::env::var_os("VICTORY_RT_FOLLOW_BUILDER").is_none_or(|v| v != "0");
         tracing::info!(
-            was = if was == RUNS { "runs" } else { "off" },
-            now = if b.state == RUNS { "runs" } else { "off" },
-            "the ray-tracing structure builder's decision changed"
+            was = name(was),
+            now = name(b.state),
+            ray_passes = if !follow { "run (VICTORY_RT_FOLLOW_BUILDER=0 or VICTORY_RT_MISS=1)" } else if b.state == OFF { "left out" } else { "run" },
+            "the ray-tracing structure builder's decision changed (skinning, traces, resolves and ray activation for the structures follow it)"
         );
     }
 }

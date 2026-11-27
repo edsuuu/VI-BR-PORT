@@ -2755,7 +2755,7 @@ impl State {
             return;
         }
         if crate::pipeline::skips_rt_skin(self.pipeline as This) {
-            once!("passes that only serve rays are left out (VICTORY_RT_MISS=1, builder off; VICTORY_RT_SKIN, VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS =1 run them)");
+            once!("passes that only serve rays are left out (VICTORY_RT_MISS=1, builder off; or ray tracing asked for while the structure builder is off, VICTORY_RT_FOLLOW_BUILDER=0 runs those; VICTORY_RT_SKIN, VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS =1 run them)");
             return;
         }
         // The ray-tracing structure builder's stages run all or none.
