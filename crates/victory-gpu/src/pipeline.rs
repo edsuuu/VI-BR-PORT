@@ -868,6 +868,8 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    #[cfg(windows)]
+    host::adjust_light_volume(&shaders, &mut graphics);
     hand_out(
         shaders,
         #[cfg(windows)]

@@ -35,6 +35,101 @@ pub(crate) struct GraphicsState {
     pub(super) samples: DXGI_SAMPLE_DESC,
 }
 
+/// The vertex programs of the title's deferred light volumes: instanced
+/// closed proxies (spot 144 indices, point/capsule/quad 216) drawn additively
+/// into the lighting target with only their front faces (cull back) and the
+/// depth test "greater or equal" (the depth is reversed). The vertex program
+/// does not move a proxy that holds the camera, so such a lamp lights
+/// nothing; the title's separate conservative proxies
+/// (`vs_*_light_proxy_conservative`, cull front, no target) only mark screen
+/// tiles. Hashes in the prison build: VSSpotLight 5d3a25d932263bb7,
+/// VSPointLight 531722868851e35a, VSCapsuleLight ea44aeafa5b7e1aa,
+/// VSQuadLight 39936c25c221af47 (the volumetric `VSSpotLight_13aa26a1` is
+/// not one of them).
+const LIGHT_VOLUMES: [&[u8]; 4] = [
+    b"VSSpotLight_cc280b19",
+    b"VSPointLight_cc280b19",
+    b"VSCapsuleLight_cc280b19",
+    b"VSQuadLight_cc280b19",
+];
+
+/// `VICTORY_LIGHT_VOLUMES`, an experiment on the light volumes
+/// ([`LIGHT_VOLUMES`]); unset (the default) leaves the title's state:
+/// - `inside`: their back faces with the depth test "less or equal" (cull
+///   front), the usual way to draw a volume that may hold the camera: every
+///   surface in front of a proxy's far side is shaded, the lamp's own falloff
+///   bounds it.
+/// - `none`: no culling and no depth test (each covered pixel shaded once
+///   per face: brighter than the title, but nothing a proxy covers is left
+///   out).
+/// - `off`: they write nothing (colour mask 0), to see what they light.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LightVolumes {
+    Inside,
+    Both,
+    Off,
+}
+
+fn light_volumes() -> Option<LightVolumes> {
+    static SET: std::sync::OnceLock<Option<LightVolumes>> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| match std::env::var("VICTORY_LIGHT_VOLUMES").unwrap_or_default().trim() {
+        "inside" => Some(LightVolumes::Inside),
+        "none" => Some(LightVolumes::Both),
+        "off" => Some(LightVolumes::Off),
+        _ => None,
+    })
+}
+
+/// Changes the state of a light volume's pipeline as `VICTORY_LIGHT_VOLUMES`
+/// asks, before the pipeline is made (and named in the library).
+pub(crate) fn adjust_light_volume(shaders: &[Arc<Shader>], g: &mut GraphicsState) {
+    let Some(set) = light_volumes() else { return };
+    let is_volume = shaders.iter().any(|s| {
+        s.stage == "vertex"
+            && LIGHT_VOLUMES
+                .iter()
+                .any(|name| s.container.windows(name.len()).any(|w| w == *name))
+    });
+    if !is_volume {
+        return;
+    }
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+        tracing::info!(
+            ?shaders,
+            ?set,
+            cull = g.rasterizer.CullMode.0,
+            depth_func = g.depth.DepthFunc.0,
+            depth_clip = g.rasterizer.DepthClipEnable.as_bool(),
+            conservative = g.rasterizer.ConservativeRaster.0,
+            "a light volume's state changed (VICTORY_LIGHT_VOLUMES)"
+        );
+    }
+    match set {
+        LightVolumes::Inside => {
+            g.rasterizer.CullMode = D3D12_CULL_MODE_FRONT;
+            // The title's test turned around: "greater" (nearer, reversed
+            // depth) becomes "less", and the other way.
+            g.depth.DepthFunc = match g.depth.DepthFunc {
+                D3D12_COMPARISON_FUNC_GREATER_EQUAL => D3D12_COMPARISON_FUNC_LESS_EQUAL,
+                D3D12_COMPARISON_FUNC_GREATER => D3D12_COMPARISON_FUNC_LESS,
+                D3D12_COMPARISON_FUNC_LESS_EQUAL => D3D12_COMPARISON_FUNC_GREATER_EQUAL,
+                D3D12_COMPARISON_FUNC_LESS => D3D12_COMPARISON_FUNC_GREATER,
+                other => other,
+            };
+        }
+        LightVolumes::Both => {
+            g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+            g.depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        }
+        LightVolumes::Off => {
+            for target in &mut g.blend.RenderTarget {
+                target.RenderTargetWriteMask = 0;
+            }
+        }
+    }
+}
+
 impl Default for GraphicsState {
     fn default() -> Self {
         let target = D3D12_RENDER_TARGET_BLEND_DESC {
