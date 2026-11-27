@@ -83,6 +83,14 @@ pub fn named(top: bool, dest: u64) -> Option<bool> {
     Some(set.insert(dest))
 }
 
+/// The title buffer (start, bytes) that holds all of `[address, address +
+/// len)`, if one does: data a host build could read from that buffer's
+/// copy where it is ([`crate::shadow`]); outside buffers it lies in pages
+/// of the by-address memory, which are not one run on the card.
+pub fn in_title_buffer(address: u64, len: u64) -> Option<(u64, u64)> {
+    crate::shadow::in_buffer(address, len.max(1))
+}
+
 /// A frame was presented.
 pub(crate) fn frame() {
     if trace() != Trace::Off {
