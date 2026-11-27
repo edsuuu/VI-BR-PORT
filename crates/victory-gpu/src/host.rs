@@ -876,6 +876,10 @@ fn create() -> windows::core::Result<Host> {
                 tracing::warn!("crash tracing asked for and not there: no device-removed data settings");
             }
         }
+        // NVIDIA Streamline (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`,
+        // `VICTORY_REFLEX`; all off by default): loaded before the device,
+        // and nothing at all without one of the switches.
+        crate::streamline::init();
         let mut device: Option<ID3D12Device> = None;
         // Diagnostics: the software adapter, on which a shader's wild access
         // is an access violation in this process (a crash report with the
@@ -928,10 +932,16 @@ fn create() -> windows::core::Result<Host> {
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
-            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
-            ..Default::default()
-        })?;
+        // Streamline is given the device; with frame generation the direct
+        // queue is made through its device proxy, and the native queue
+        // behind it runs everything (None: made as before).
+        let queue: ID3D12CommandQueue = match crate::streamline::device_made(&device) {
+            Some(queue) => queue,
+            None => device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                ..Default::default()
+            })?,
+        };
         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
         let event = CreateEventW(None, false, false, None)?;
         let rtvs: ID3D12DescriptorHeap =
