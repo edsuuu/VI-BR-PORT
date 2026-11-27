@@ -305,8 +305,9 @@ fn whole_gain(gain: f32, share: f32) -> f32 {
 /// (that share of it, never under the constant `<least>`, what the title's
 /// program left kept up to four times it) instead of the constant, and the
 /// bound on what the air scatters (`VICTORY_AMBIENT_AIR`) acts as much as the
-/// screen is inside. Unset or 0: the constant and the air's bound everywhere,
-/// as before.
+/// screen is inside. The constant's share of the light around
+/// (`constant:<level>:<share>`) stays a floor outside too. Unset or 0: the
+/// constant and the air's bound everywhere, as before.
 ///
 /// Why: the constant is written over what the title's program left, so at
 /// night outdoors it takes away the sky's light the probes hold (the
@@ -732,6 +733,13 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = lerp(found, cells[CELLS].rgb, 0.2) * share_of_estimate * open;
     // Never under the least light asked for (estimate:<share>:<least>).
     float3 floor_light = float3(1.0, 0.98, 0.94) * least_light * open * gain_at(cells[CELLS], p);
+    // (VICTORY_AMBIENT_OUTSIDE) Outside rooms the constant's share of the
+    // light around (`constant:<level>:<share>`) is a floor too: by day what
+    // the sun does not reach on the boat keeps what the constant gave it.
+    if (outdoors && around > 0.0 && cells[CELLS].a > 0.0) {
+        float3 part = around * cells[CELLS].rgb * open;
+        if (dot(part, LUMA) > dot(floor_light, LUMA)) floor_light = part;
+    }
     if (dot(found, LUMA) < dot(floor_light, LUMA)) found = floor_light;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
