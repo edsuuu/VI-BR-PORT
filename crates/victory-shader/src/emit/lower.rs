@@ -1245,6 +1245,41 @@ fn sdwa_sext_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SDWA_SEXT").is_none_or(|v| v != "0"))
 }
 
+/// `VICTORY_CODE_TABLE_TRIM=1`: a program's constant table ([`Lower::code_dword`]) starts
+/// where its instructions end ([`code_table_start`]) instead of at the lowest offset any
+/// load names, which is the code's start for a load at a computed offset: the table was
+/// then the whole program. Off by default: untried in a game run.
+fn code_table_trim_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CODE_TABLE_TRIM").is_some_and(|v| v == "1"))
+}
+
+/// Where a program's constant table starts in its code: where its instructions end,
+/// unless a load at a fixed offset reads below that (then at `lowest`, the lowest offset
+/// any load or descriptor names). The program's constants follow its instructions, and a
+/// load at a computed offset reads them, not instruction bytes.
+fn code_table_start(
+    p: &crate::ir::Program,
+    addresses: &[&crate::resource::Address],
+    lowest: u32,
+) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses
+        .iter()
+        .any(|a| a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below {
+        lowest
+    } else {
+        lowest.max(code_end & !3)
+    }
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -1903,22 +1938,30 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
+                    .collect();
+                let lowest = addresses
+                    .iter()
                     .map(|a| a.offset & !3)
                     .min()
                     .ok_or("a code table")?;
+                let first = if code_table_trim_on() {
+                    code_table_start(self.x.p, &addresses, lowest)
+                } else {
+                    lowest
+                };
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -13118,13 +13161,37 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
+    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower};
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// The constant table starts after the instructions, unless a load at a
+    /// fixed offset reads inside them.
+    #[test]
+    fn the_code_table_starts_after_the_instructions() {
+        // s_nop 0 and s_endpgm (8 bytes), then 1,000 dwords of constants.
+        let mut words = vec![0xBF80_0000, S_ENDPGM];
+        words.extend(0..1000u32);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let at = |offset: u32, dynamic: bool| resource::Address {
+            param: resource::CODE,
+            offset,
+            dynamic: dynamic.then_some(ir::Value(0)),
+        };
+        let (computed, past, inside) = (at(0, true), at(12, false), at(4, false));
+        // A computed offset from the code's start: the constants only.
+        assert_eq!(code_table_start(&p, &[&computed], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &past], 0), 8);
+        // A fixed offset inside the instructions keeps the lowest offset.
+        assert_eq!(code_table_start(&p, &[&computed, &inside], 0), 0);
+        // Fixed offsets past the instructions only: the lowest of them.
+        assert_eq!(code_table_start(&p, &[&past], 12), 12);
+    }
 
     #[test]
     fn packed_pixel_inputs_find_their_second_row() {
