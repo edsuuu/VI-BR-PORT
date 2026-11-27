@@ -1425,7 +1425,8 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
 /// by default). Otherwise a host wave's console threads are its first flat thread index rounded
 /// down to the wave size plus the lane, which assumes the host gives each wave a wave-aligned
 /// run of flat indices: if a host fills a 2-D group's waves otherwise, two waves take the same
-/// threads and other threads none. Part of the translation (shader cache key).
+/// threads and other threads none. (`halves` programs, whose host waves are always full, keep
+/// their own count.) Part of the translation (shader cache key).
 fn group_counter() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_GROUP_COUNTER.get() {
@@ -4443,7 +4444,7 @@ impl<'a> Lower<'a> {
             self.s.m.store(e, ptr, zero);
         }
         self.group_sync(e);
-        if group_counter() {
+        if self.ticket.is_some() {
             // Each wave counts its active lanes and ranks them. A full wave takes the next
             // run of wave-size threads from the low half of the counter; a wave with fewer
             // lanes (the group's last, when the group is not a multiple of the wave size)
