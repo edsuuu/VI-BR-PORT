@@ -1810,6 +1810,20 @@ fn by_address_fits(budget: u64, used: u64, len: u64, to_come: u64) -> bool {
     used + len + to_come < budget / 100 * 97
 }
 
+/// What [`room`] and [`block_room`] weigh now, in MB, for the line "texture
+/// blocks" (`crate::host`): the card's use, what is kept for card copies of
+/// title buffers and for render targets, the queue's line, what the queue
+/// weighs ([`weighed`]), and whether a new block has room (1 or 0). `None`
+/// without the system's numbers.
+#[cfg(windows)]
+pub(crate) fn block_terms(memory: Option<[u64; 4]>) -> Option<[u64; 6]> {
+    let [budget, used, ..] = memory?;
+    let mut terms =
+        [used, crate::shadow::card_room_kept(), targets_room_kept(), room_line(budget), weighed(budget, used), 0].map(|b| b >> 20);
+    terms[5] = u64::from(block_room(memory));
+    Some(terms)
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet ([`targets_rule`]).

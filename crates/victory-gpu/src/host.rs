@@ -10401,6 +10401,40 @@ impl Meter {
                     crate::resource::SWEPT_US[2].load(Ordering::Relaxed) as f64 / 1e3
                 );
             }
+            // The gate on new blocks of textures (`crate::pool::gate`) and
+            // how full the blocks are: with VICTORY_POOL_GATE=1, or
+            // VICTORY_POOL_REPORT=1 to see them with the gate off.
+            if crate::pool::report()
+                && let Some([used, buffers, targets, line, weighed, block_room]) =
+                    crate::resource::block_terms(host().and_then(|h| h.video_memory()))
+            {
+                let [n, free, q0, h0, q1, h1, q2, h2, q3, h3, given] = crate::pool::fill();
+                let [made, not_made, past] = crate::pool::BLOCKS.each_ref().map(|b| b.load(Ordering::Relaxed));
+                let no_place = crate::draw::HEAP_TEXTURES_NO_PLACE[0].load(Ordering::Relaxed);
+                let no_place_now = crate::draw::HEAP_TEXTURES_NO_PLACE[1].swap(0, Ordering::Relaxed);
+                let [card_n, card_b, pc_n, pc_b] = crate::shadow::by_address_counts();
+                tracing::info!(
+                    "texture blocks{}: {n} blocks ({} MB), {} MB of them free; by how full: {q0} under a quarter (they hold {} MB), \
+                     {q1} up to a half ({} MB), {q2} up to three quarters ({} MB), {q3} fuller ({} MB); a new block: {used} MB in \
+                     use + 64 MB + {buffers} MB kept for card copies of title buffers + {targets} MB kept for render targets = {} \
+                     MB against the line of {line} MB: {}; the queue weighs {weighed} MB; since the start {made} blocks made, \
+                     {not_made} blocks not made for want of room, {past} made without room for textures that could not wait, \
+                     {given} given back; textures waiting for a place: {no_place_now} looks since the last line, {no_place} since \
+                     the start; title memory by address made since the start: {card_n} pieces ({} MB) in the card's own memory, \
+                     {pc_n} ({} MB) in the PC's",
+                    if crate::pool::gate() { "" } else { " (VICTORY_POOL_GATE unset: a block is made whenever none has room)" },
+                    n * 64,
+                    free >> 20,
+                    h0 >> 20,
+                    h1 >> 20,
+                    h2 >> 20,
+                    h3 >> 20,
+                    used + 64 + buffers + targets,
+                    if block_room != 0 { "one may be made" } else { "none is made, textures take the free pieces" },
+                    card_b >> 20,
+                    pc_b >> 20,
+                );
+            }
             {
                 let mode = crate::watch::page_writes();
                 let [writes, bytes, guarded, plain] = [0, 1, 2, 3].map(|i| crate::watch::WRITTEN[i].load(Ordering::Relaxed));

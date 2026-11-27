@@ -5319,6 +5319,16 @@ pub(crate) fn small_buffer_in(address: u64, len: u64, most: u64) -> bool {
         .any(|(key, entry)| entry.end > address && entry.end - key.0 <= most)
 }
 
+/// Title memory by address made since the start ([`by_address`]): with its
+/// shaders' side in the card's own memory, how many and their bytes; then
+/// in the PC's memory, where every access of a shader crosses the bus.
+static BY_ADDRESS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// See [`BY_ADDRESS`].
+pub(crate) fn by_address_counts() -> [u64; 4] {
+    BY_ADDRESS.each_ref().map(|n| n.load(Ordering::Relaxed))
+}
+
 /// A copy of the memory `[start, start + len)` (an arena of
 /// [`crate::memory`]'s, its directory, title memory around a small buffer)
 /// for the programs that find memory by address, on the card: the structures
@@ -5350,6 +5360,10 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     } else {
         None
     };
+    // Counted by where it lies, for the line "texture blocks" (`crate::host`).
+    let place = usize::from(on_card.is_none());
+    BY_ADDRESS[2 * place].fetch_add(1, Ordering::Relaxed);
+    BY_ADDRESS[2 * place + 1].fetch_add(len, Ordering::Relaxed);
     let buffer = match on_card {
         Some(buffer) => buffer,
         None => host.shared_buffer(len)?.0,

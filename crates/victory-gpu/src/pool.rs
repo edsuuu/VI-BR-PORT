@@ -93,6 +93,13 @@ pub(crate) fn gate() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_GATE").is_some_and(|v| v == "1"))
 }
 
+/// Whether the line "texture blocks: ..." is written: with [`gate`] on, or
+/// with `VICTORY_POOL_REPORT=1` (off by default).
+pub(crate) fn report() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| gate() || std::env::var_os("VICTORY_POOL_REPORT").is_some_and(|v| v == "1"))
+}
+
 /// Whether a piece is cut from the fullest block that has room for it
 /// (`VICTORY_POOL_FULLEST=1`; off by default: from the first, as before).
 ///
@@ -194,6 +201,15 @@ pub(crate) fn waiting<T>(make: impl FnOnce() -> T) -> (T, bool) {
 /// for ([`texture`]) was not made for want of a place. (False outside it.)
 pub(crate) fn waits() -> bool {
     WAITED.get()
+}
+
+/// For the log: the blocks of textures and the bytes of them free now; by
+/// how full each is, the blocks that hold under a quarter of a block, a
+/// quarter to a half, a half to three quarters, and more, each with the
+/// bytes those blocks hold; and the blocks given back to the card since the
+/// start. (A piece given back counts as held until it has rested.)
+pub(crate) fn fill() -> [u64; 11] {
+    lock(&TEXTURES).fill()
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
@@ -339,11 +355,13 @@ struct Pool<B> {
     /// fits none either, and one that may wait ([`Grow::No`]) is not looked
     /// for again (a texture that waits asks again and again).
     no_fit: Option<(u64, u64)>,
+    /// Blocks given back since the start.
+    given: u64,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, no_fit: None }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most, no_fit: None, given: 0 }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -492,6 +510,7 @@ impl<B: Clone> Pool<B> {
                     spare += 1;
                     if spare > most {
                         *block = None;
+                        self.given += 1;
                     }
                 }
             }
@@ -500,6 +519,21 @@ impl<B: Clone> Pool<B> {
 
     fn blocks(&self) -> usize {
         self.blocks.iter().flatten().count()
+    }
+
+    /// See [`fill`].
+    fn fill(&self) -> [u64; 11] {
+        let mut f = [0u64; 11];
+        for block in self.blocks.iter().flatten() {
+            let holds = BLOCK.saturating_sub(block.room);
+            f[0] += 1;
+            f[1] += block.room;
+            let quarter = (holds * 4 / BLOCK).min(3) as usize;
+            f[2 + 2 * quarter] += 1;
+            f[3 + 2 * quarter] += holds;
+        }
+        f[10] = self.given;
+        f
     }
 }
 
@@ -926,6 +960,8 @@ mod tests {
         // A half block fits none now; the next one makes a block anyway.
         let p = pool.take_ripe(half, 65536, 0, Ripe::ALL, make).unwrap();
         assert_eq!((p.1, made.get()), (4, 4));
+        assert_eq!(pool.fill()[0], 4);
+        assert_eq!(pool.fill()[1], half);
     }
 
     /// The pool's side of the gate's way out of a wait: a texture that
@@ -1011,6 +1047,12 @@ mod tests {
         assert_eq!(rooms(&pool), [3, 1, 0]);
         assert_eq!(pool.take(piece, 65536, 2 * REST, make).unwrap().0.block, 0);
         assert_eq!(pool.take_ripe(piece, 65536, 2 * REST, ripe, make).unwrap().0.block, 1);
+        // A block whose last texture went is given back and counted.
+        let mut other: Pool<u64> = Pool::new(0);
+        let only = other.take_ripe(piece, 65536, 0, ripe, make).unwrap().0;
+        other.give(only, 0);
+        other.rested(REST);
+        assert_eq!((other.blocks(), other.given), (0, 1));
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not
