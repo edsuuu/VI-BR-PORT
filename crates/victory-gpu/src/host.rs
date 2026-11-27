@@ -134,31 +134,93 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     ok.then_some(m.ullAvailPhys)
 }
 
+/// How long a host copy of a texture the title fills is kept while the card
+/// has room ([`vram_keep`], [`bytes_keep`]), how long it must be idle to go
+/// once it has none, and once the card is nearly full.
+const TEXTURE_KEPT_MS: u64 = 600_000;
+const TEXTURE_IDLE_MS: u64 = 5_000;
+const TEXTURE_SHORT_MS: u64 = 1_500;
+
+/// Where the sweep starts by default, how far under its start it lets go
+/// down to, and the share from which idle copies go after
+/// [`TEXTURE_SHORT_MS`] ([`vram_keep`]).
+const SWEEP_START: u64 = 88;
+const SWEEP_BELOW: u64 = 3;
+const SWEEP_SHORT_FROM: u64 = 95;
+
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
 /// of the card (`used`, as `crate::resource::card_use` counts it for the
-/// texture queue too) is under 88 % of its budget, else enough to come
-/// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
-/// all that are idle; `=1`: that rule with its two longer times.
+/// texture queue too) is under `from` % of its budget ([`sweep_from`]: 88
+/// with the queue's default share), else enough to come down to 3 points
+/// under `from` (85 %). `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older
+/// rule, all that are idle; `=1`: that rule with its two longer times.
 ///
 /// (By those times everything idle for 2.5 s went from 75 % of the budget
 /// on: 61,000 of them in the first 300 s of session play-1125-0203, at 78 to
 /// 80 %, of which 13,000 were made and uploaded again.)
-pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
-    const KEPT_MS: u64 = 600_000;
-    const IDLE_MS: u64 = 5_000;
-    const SHORT_MS: u64 = 1_500;
+pub(crate) fn vram_keep(budget: u64, used: u64, from: u64) -> (u64, u64) {
     if budget == 0 {
-        return (IDLE_MS, u64::MAX);
+        return (TEXTURE_IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if crate::resource::under_share(budget, used, 88) {
-        (KEPT_MS, u64::MAX)
-    } else if used < share(95) {
-        (IDLE_MS, used - share(85))
+    let down_to = share(from.saturating_sub(SWEEP_BELOW));
+    if crate::resource::under_share(budget, used, from) {
+        (TEXTURE_KEPT_MS, u64::MAX)
+    } else if used < share(SWEEP_SHORT_FROM) {
+        (TEXTURE_IDLE_MS, used - down_to)
     } else {
-        (SHORT_MS, used - share(85))
+        (TEXTURE_SHORT_MS, used - down_to)
+    }
+}
+
+/// The share of the card's budget, in percent, from which the sweep lets
+/// idle host copies of textures go ([`vram_keep`]) when the texture queue
+/// stops making them at `room_percent` (`crate::resource::room`,
+/// `VICTORY_TEXTURE_ROOM_PERCENT`, 90 unless set): 88, or the queue's share
+/// when that is lower. With a share under 88 the queue was refused from
+/// there on while the sweep kept every idle copy for ten minutes up to 88 %
+/// (the gap another fork found with its 8 GB preset's 85).
+/// `VICTORY_SWEEP_FROM_ROOM=0`: 88 whatever the share, as before (on by
+/// default; with the default share nothing changes either way).
+pub(crate) fn sweep_from(room_percent: u64) -> u64 {
+    sweep_from_for(room_percent, sweep_from_room())
+}
+
+/// Whether the sweep follows the texture queue's line ([`sweep_from`],
+/// [`bytes_keep`]): `VICTORY_SWEEP_FROM_ROOM`, on unless `0`.
+pub(crate) fn sweep_from_room() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SWEEP_FROM_ROOM").is_none_or(|v| v != "0"))
+}
+
+pub(crate) fn sweep_from_for(room_percent: u64, on: bool) -> u64 {
+    if on { room_percent.min(SWEEP_START) } else { SWEEP_START }
+}
+
+/// [`vram_keep`]'s answer for a limit on the bytes of host copies the
+/// title fills (`VICTORY_TEXTURE_BUDGET_MB`), where the texture queue stops
+/// at `limit` bytes of them (`filled`) whatever the card's share: kept for
+/// ten minutes under it, else those idle for five seconds, enough to come
+/// down to 3 % under it. Before, the sweep looked at the card's share alone
+/// and kept them for ten minutes while the queue was refused (only with
+/// `VICTORY_SWEEP_FROM_ROOM` on).
+pub(crate) fn bytes_keep(filled: u64, limit: u64) -> (u64, u64) {
+    if filled < limit {
+        (TEXTURE_KEPT_MS, u64::MAX)
+    } else {
+        (TEXTURE_IDLE_MS, filled - limit / 100 * (100 - SWEEP_BELOW))
+    }
+}
+
+/// Of two answers of [`vram_keep`] / [`bytes_keep`]: the other where one
+/// keeps copies for ten minutes, else the shorter time and the more bytes.
+pub(crate) fn stricter(a: (u64, u64), b: (u64, u64)) -> (u64, u64) {
+    match (a.0 == TEXTURE_KEPT_MS, b.0 == TEXTURE_KEPT_MS) {
+        (true, _) => b,
+        (_, true) => a,
+        _ => (a.0.min(b.0), a.1.max(b.1)),
     }
 }
 
@@ -12199,14 +12261,62 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
     #[test]
     fn textures_are_kept_while_the_card_has_room() {
-        use super::vram_keep;
+        use super::{sweep_from_for, vram_keep};
         let gib = 1 << 30;
-        assert_eq!(vram_keep(100 * gib, 87 * gib).0, 600_000);
-        // Past it: the longest idle ones, enough to come down to 85 %.
-        let (ms, bytes) = vram_keep(100 * gib, 90 * gib);
-        assert_eq!((ms, bytes), (5_000, 5 * gib));
-        assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
-        assert_eq!(vram_keep(0, 7).0, 5_000);
+        // The queue's default share (90) and any from 88 up, with the
+        // switch on or off: from 88 down to 85, as before.
+        for room in [88, 90, 94, 97] {
+            for on in [true, false] {
+                let from = sweep_from_for(room, on);
+                assert_eq!(from, 88);
+                assert_eq!(vram_keep(100 * gib, 87 * gib, from).0, 600_000);
+                // Past it: the longest idle ones, enough to come down to 85 %.
+                let (ms, bytes) = vram_keep(100 * gib, 90 * gib, from);
+                assert_eq!((ms, bytes), (5_000, 5 * gib));
+                assert_eq!(vram_keep(100 * gib, 120 * gib, from), (1_500, 35 * gib));
+                assert_eq!(vram_keep(0, 7, from).0, 5_000);
+            }
+        }
+    }
+
+    /// Under 88 the sweep starts at the texture queue's share and comes
+    /// down to 3 points under it; 95 % stays the line for the short time.
+    /// With `VICTORY_SWEEP_FROM_ROOM=0`, 88 whatever the share.
+    #[test]
+    fn textures_go_from_where_the_queue_is_refused() {
+        use super::{sweep_from_for, vram_keep};
+        let gib = 1 << 30;
+        assert_eq!(sweep_from_for(85, true), 85);
+        assert_eq!(sweep_from_for(85, false), 88);
+        assert_eq!(sweep_from_for(50, true), 50);
+        assert_eq!(vram_keep(100 * gib, 84 * gib, 85).0, 600_000);
+        assert_eq!(vram_keep(100 * gib, 85 * gib, 85), (5_000, 3 * gib));
+        assert_eq!(vram_keep(100 * gib, 87 * gib, 85), (5_000, 5 * gib));
+        assert_eq!(vram_keep(100 * gib, 94 * gib, 85), (5_000, 12 * gib));
+        assert_eq!(vram_keep(100 * gib, 95 * gib, 85), (1_500, 13 * gib));
+        // The lowest share the queue takes (50).
+        assert_eq!(vram_keep(100 * gib, 49 * gib, 50).0, 600_000);
+        assert_eq!(vram_keep(100 * gib, 50 * gib, 50), (5_000, 3 * gib));
+        // The switch off: the gap of 85 to 88 % is back (kept for minutes).
+        assert_eq!(vram_keep(100 * gib, 86 * gib, sweep_from_for(85, false)).0, 600_000);
+    }
+
+    /// With a limit on the bytes of host copies the queue stops at the
+    /// limit, and idle copies go from there down to 3 % under it, whatever
+    /// the card's share; the stricter of the two answers is taken.
+    #[test]
+    fn textures_go_from_the_limit_on_their_bytes() {
+        use super::{bytes_keep, stricter, vram_keep};
+        let mib = 1u64 << 20;
+        let limit = 2000 * mib;
+        assert_eq!(bytes_keep(limit - 1, limit), (600_000, u64::MAX));
+        assert_eq!(bytes_keep(limit, limit), (5_000, 60 * mib));
+        assert_eq!(bytes_keep(limit + 100 * mib, limit), (5_000, 160 * mib));
+        let room = vram_keep(100 * mib * 100, 50 * mib * 100, 88);
+        assert_eq!(stricter(room, bytes_keep(limit, limit)), (5_000, 60 * mib));
+        assert_eq!(stricter(bytes_keep(limit, limit), room), (5_000, 60 * mib));
+        assert_eq!(stricter(room, bytes_keep(0, limit)), room);
+        assert_eq!(stricter((1_500, 10), (5_000, 30)), (1_500, 30));
     }
 
     #[test]
