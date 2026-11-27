@@ -2181,8 +2181,9 @@ fn rehash_runs() -> bool {
 /// card's memory: hash passes after ranges were sent up, the pieces they
 /// hashed, and compare passes after the lists; then the dispatches the card
 /// was given for the hash passes and for the compares (one or more a pass,
-/// or a list's passes in one with [`table`]).
-static CARD_PASSES: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// or a list's passes in one with [`table`]), and the dispatches scattering
+/// the sends' words ([`send`]).
+static CARD_PASSES: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
 
 /// Whether our lists for copies in the card's memory are timed on the card
 /// (`VICTORY_CARD_PASS_TIME=0` leaves it out; on by default): two
@@ -10215,8 +10216,8 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         split_line(frames);
         {
-            let [passes, pieces, compares, hash_dispatches, compare_dispatches] =
-                [0, 1, 2, 3, 4].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            let [passes, pieces, compares, hash_dispatches, compare_dispatches, scatters] =
+                [0, 1, 2, 3, 4, 5].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
             let [sync_ticks, check_ticks, syncs, checks] = [0, 1, 2, 3].map(|i| CARD_TICKS[i].swap(0, Ordering::Relaxed));
             let rate = CARD_TICK_RATE.load(Ordering::Relaxed).max(1) as f64;
             let timed = if syncs + checks > 0 {
@@ -10248,7 +10249,8 @@ impl Meter {
                     "our passes over copies in the card's memory per frame: {passes:.0} hash passes over {pieces:.0} pieces after \
                      ranges were sent up (VICTORY_CARD_REHASH_RUNS=1 joins them: now {}), {compares:.0} compare passes, \
                      in {hash_dispatches:.0} and {compare_dispatches:.0} dispatches (VICTORY_CARD_HASH_TABLE=1, \
-                     VICTORY_CARD_COMPARE_TABLE=1: one a list){timed}",
+                     VICTORY_CARD_COMPARE_TABLE=1: one a list), and {scatters:.0} dispatches scattering the sends' words \
+                     (one a copy){timed}",
                     if rehash_runs() { "on" } else { "off" }
                 );
             }
