@@ -4428,7 +4428,21 @@ impl<'a> Lower<'a> {
             let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
             return Ok(self.s.op(c, name, Attr::NoUnwind, i1t, code, &[mine]));
         }
-        if self.local || !self.exchange.as_ref().is_some_and(|e| !e.1) {
+        if self.local {
+            // Each host wave is a wave of its own ([`with_local_waves`]): it takes the branch
+            // by its own lanes, as a console of 32-lane waves would. Only the program's
+            // early-outs come here (`super::emit`): a host wave none of whose lanes is left
+            // leaves the program instead of walking its body with EXEC clear, where the
+            // scalars it reads from its first lane are whatever that lane last held and a loop
+            // counted by one runs to the iteration limit.
+            let c = self.cur;
+            let mine = self.boolean(when, c)?;
+            let i1t = self.s.t.i1;
+            self.s.flags |= flags::WAVE_OPS;
+            let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
+            return Ok(self.s.op(c, name, Attr::NoUnwind, i1t, code, &[mine]));
+        }
+        if !self.exchange.as_ref().is_some_and(|e| !e.1) {
             return Err(WHY);
         }
         if !self.all_lanes(b) {

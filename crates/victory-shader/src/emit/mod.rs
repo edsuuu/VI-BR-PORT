@@ -541,6 +541,25 @@ pub fn emit(
             ("without early-outs", form(ir::without_early_outs(p))),
             ("without skips", form(ir::without_skips(p, false))),
         ];
+        // The program as it is, its early-outs taken by a host wave together as the console
+        // takes them by the wave ([`structure::structure_wide`]): for the forms in which each
+        // host wave is a wave of its own, tried there before the forms without early-outs. In
+        // those a host wave with no lane left walks the whole body with EXEC clear; the
+        // scalars it reads from its first lane are then whatever that lane last held, and a
+        // loop counted by one runs to the iteration limit (the title's
+        // `InstanceCullingCS_Tree_BatchCull`: a dispatch of a few groups took the card
+        // milliseconds). `VICTORY_WAVE_EARLY_OUTS=0`: not tried.
+        let early = std::env::var_os("VICTORY_WAVE_EARLY_OUTS").is_none_or(|v| v != "0").then(|| {
+            let outs: std::collections::HashSet<usize> = ir::early_outs(p).into_iter().collect();
+            if outs.is_empty() {
+                return None;
+            }
+            let st = structure::structure_wide(p, &outs).ok()?;
+            let io = io::raise(p, native).ok()?;
+            let res = resource::track(p, &native.layout, native.stage, Some(&st)).ok()?;
+            Some((st, io, res))
+        });
+        let early = early.flatten();
         for (name, f) in &forms {
             if let Some((p, st, io, res)) = f {
                 let again = emit_program(c, native, p, st, io, res);
@@ -596,6 +615,15 @@ pub fn emit(
             if !local_on || exact_only {
                 continue;
             }
+            if let Some((st, io, res)) = &early
+                && idiom(p, st) == exact
+            {
+                let local = lower::with_local_waves(|| emit_program(c, native, p, st, io, res));
+                report(&format!("local waves ({}), early-outs by the wave", if exact { "idiom" } else { "APPROXIMATE" }), &local);
+                if done(&local) {
+                    return local.map(|(shader, _)| shader);
+                }
+            }
             for (name, f) in &forms {
                 if let Some((p, st, io, res)) = f
                     && idiom(p, st) == exact
@@ -618,6 +646,13 @@ pub fn emit(
         if local_on && !exact_only {
             // Last: every mask and lane read per host wave.
             if !strict {
+                if let Some((st, io, res)) = &early {
+                    let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));
+                    report("local waves (APPROXIMATE, any mask), early-outs by the wave", &local);
+                    if done(&local) {
+                        return local.map(|(shader, _)| shader);
+                    }
+                }
                 for (name, f) in &forms {
                     if let Some((p, st, io, res)) = f {
                         let local = lower::with_local_waves_any(|| emit_program(c, native, p, st, io, res));

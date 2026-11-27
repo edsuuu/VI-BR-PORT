@@ -753,6 +753,12 @@ pub(crate) fn without_early_outs(p: &Program) -> Option<Program> {
     Some(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// The blocks that end in an early-out ([`without_early_outs`] leaves those branches out; a
+/// form that keeps them takes them wave-wide).
+pub(crate) fn early_outs(p: &Program) -> Vec<usize> {
+    (0..p.blocks.len()).filter(|&b| early_out_continuation(p, b).is_some()).collect()
+}
+
 /// Whether block `b` only ends the program.
 fn ends_program(p: &Program, b: usize) -> bool {
     p.blocks[b].exit == Exit::End
