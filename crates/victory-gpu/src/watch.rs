@@ -1107,6 +1107,64 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)))
 }
 
+/// Whether [`writes_with`] gives the journal's notes in a list each thread
+/// keeps for it (`VICTORY_NOTES_KEPT=0`: a list made for each call, as
+/// [`writes`] makes it; on by default). The same notes either way.
+///
+/// Every refresh of a copy asks this (`Shadow::update`), thousands a frame,
+/// and the list of a range of many pages grew by doubling at each: with the
+/// heap's own the submitting thread spent 3.1% of its time growing lists and
+/// as much in the heap's functions (profile intro-s-pfabre), of which this is
+/// what is asked most.
+fn notes_kept() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_NOTES_KEPT").is_none_or(|v| v != "0"))
+}
+
+thread_local! {
+    /// The list [`writes_with`] fills, between its calls.
+    static NOTES: std::cell::RefCell<Vec<(usize, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// [`writes`], and `f` with what it says (the asking's number, the notes),
+/// or `None` as `writes` gives it. Where the submission's asking holds the
+/// range the notes are put in a list this thread keeps ([`notes_kept`]),
+/// read as `writes` reads them, the journal let go before `f`.
+pub(crate) fn writes_with<R>(start: usize, end: usize, guarded: bool, f: impl FnOnce(u64, &[(usize, u64)]) -> R) -> Option<R> {
+    if !notes_kept() {
+        let (now, written) = writes(start, end, guarded)?;
+        return Some(f(now, &written));
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    // (Taken out while used: a call from inside `f` makes a list of its own.)
+    let mut kept = NOTES.with_borrow_mut(std::mem::take);
+    let now = {
+        let j = journal();
+        j.ahead.holds(first, last).then(|| {
+            kept.clear();
+            j.notes.each(first, last, |page, write| {
+                kept.push((page, write));
+                true
+            });
+            j.ahead_asked
+        })
+    };
+    let answer = match now {
+        Some(now) => Some(f(now, &kept)),
+        None => writes(start, end, guarded).map(|(now, written)| f(now, &written)),
+    };
+    // Kept unless it grew very large (a megabyte).
+    if kept.capacity() <= 1 << 16 {
+        kept.clear();
+        NOTES.with_borrow_mut(|notes| {
+            if notes.capacity() < kept.capacity() {
+                *notes = kept;
+            }
+        });
+    }
+    answer
+}
+
 /// [`asked`] without the list made: the notes of `[start, end)` given to
 /// `each` in page order, each page once, with the journal held (a caller
 /// that holds a copy's `copied` takes the two in that order, as
@@ -4161,6 +4219,53 @@ mod tests {
                 VirtualFree((p + block * BLOCK) as *mut _, 0, MEM_RELEASE);
             }
         }
+    }
+
+    /// [`writes_with`] gives what [`writes`] gives: from the journal while the
+    /// submission's asking holds the range (and from inside its own call),
+    /// from the kernel when not. The standing asking is the journal's one, so
+    /// other tests' askings meanwhile would be answered from it: a process of
+    /// its own.
+    #[test]
+    #[ignore = "sets the journal's standing asking: cargo test -p victory-gpu --lib writes_with -- --ignored --test-threads=1"]
+    fn writes_with_says_what_writes_says() {
+        // SAFETY: a fresh write-watched allocation, freed at the end.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), 4 * PAGE, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        let (start, end) = (p, p + 4 * PAGE);
+        let (none, _) = writes(start, end, false).expect("watched");
+        // SAFETY: committed pages of ours.
+        unsafe {
+            ((p + PAGE) as *mut u8).write_volatile(1);
+            ((p + 3 * PAGE + 9) as *mut u8).write_volatile(1);
+        }
+        let new = |w: &[(usize, u64)]| w.iter().copied().filter(|w| w.1 > none).collect::<Vec<_>>();
+        // The submission's asking holds the range: both answer from the
+        // journal, the same, and again from inside the call.
+        ask_once(&[(start, end)]);
+        let plain = writes(start, end, false).expect("watched");
+        let (now, notes, inner) = writes_with(start, end, false, |now, written| {
+            let inner = writes_with(p + PAGE, p + 2 * PAGE, false, |n, w| (n, w.to_vec())).expect("watched");
+            (now, written.to_vec(), inner)
+        })
+        .expect("watched");
+        assert_eq!((now, notes.clone()), plain);
+        assert_eq!(new(&notes).iter().map(|n| n.0).collect::<Vec<_>>(), [p / PAGE + 1, p / PAGE + 3]);
+        assert_eq!(inner, writes(p + PAGE, p + 2 * PAGE, false).expect("watched"));
+        ask_once_end();
+        // Not held: `writes` is asked, and says what it says.
+        // SAFETY: as above.
+        unsafe { ((p + 2 * PAGE) as *mut u8).write_volatile(1) };
+        let (later, notes) = writes_with(start, end, false, |now, written| (now, written.to_vec())).expect("watched");
+        assert!(later > now);
+        assert!(notes.contains(&(p / PAGE + 2, later)), "{notes:?}");
+        let mut plain = vec![0u8; PAGE];
+        let at = plain.as_mut_ptr() as usize;
+        assert!(writes_with(at, at + PAGE, true, |_, _| ()).is_none());
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
     }
 
     /// A write between another thread's asking about a range and the second
