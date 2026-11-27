@@ -216,9 +216,49 @@ fn wait_resident() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
 }
 
+/// Whether plain buffers wait too (unset: yes, as before).
+/// `VICTORY_WAIT_RESIDENT=textures`: only texture blocks and textures (made
+/// with [`not_resident`]) wait; plain buffers (upload, CPU-mapped and
+/// unordered-access buffers: host copies of title memory, scratch chunks)
+/// are made resident and not waited for. The bet is that they are named only
+/// by lists recorded after they exist. Not so everywhere: the heap pass
+/// (`draw::heap_buffer_pass`) and the constant views of tables write slots
+/// of the title's heaps, which lists still in the air read by index, with
+/// views of copies just made; such a list reads a page not mapped yet.
+fn wait_resident_buffers() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| wait_resident() && buffers_wait(std::env::var("VICTORY_WAIT_RESIDENT").ok().as_deref()))
+}
+
+/// Whether a `VICTORY_WAIT_RESIDENT` setting leaves plain buffers waiting.
+fn buffers_wait(setting: Option<&str>) -> bool {
+    setting.is_none_or(|v| v.trim() != "textures")
+}
+
 /// The flag memory is made with that [`resident`] waits for.
 pub(crate) fn not_resident() -> D3D12_HEAP_FLAGS {
     if wait_resident() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
+}
+
+/// [`not_resident`] for plain buffers ([`wait_resident_buffers`]).
+fn not_resident_buffer() -> D3D12_HEAP_FLAGS {
+    if wait_resident_buffers() { D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT } else { D3D12_HEAP_FLAG_NONE }
+}
+
+/// [`resident`] for plain buffers ([`wait_resident_buffers`]).
+fn resident_buffer(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
+    if !wait_resident_buffers() {
+        return Ok(());
+    }
+    resident(device, object)
+}
+
+/// [`mapped`] for plain buffers ([`wait_resident_buffers`]).
+fn mapped_buffer(device: &ID3D12Device) -> windows::core::Result<()> {
+    if !wait_resident_buffers() {
+        return Ok(());
+    }
+    mapped(device)
 }
 
 /// A queue of its own that new memory is waited for with ([`mapped`]).
@@ -9762,7 +9802,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    not_resident_buffer(),
                     &desc,
                     D3D12_RESOURCE_STATE_GENERIC_READ,
                     None,
@@ -9770,7 +9810,7 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
+                    resident_buffer(&self.device, b)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -11042,7 +11082,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    not_resident_buffer(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -11050,8 +11090,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    resident_buffer(&self.device, b)?;
+                    mapped_buffer(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -11131,7 +11171,7 @@ impl Host {
             self.device
                 .CreateCommittedResource(
                     &heap,
-                    not_resident(),
+                    not_resident_buffer(),
                     &desc,
                     D3D12_RESOURCE_STATE_COMMON,
                     None,
@@ -11139,8 +11179,8 @@ impl Host {
                 )
                 .and_then(|()| {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
-                    resident(&self.device, b)?;
-                    mapped(&self.device)?;
+                    resident_buffer(&self.device, b)?;
+                    mapped_buffer(&self.device)?;
                     b.Map(0, None, Some(&mut data))
                 })
         };
@@ -11181,7 +11221,7 @@ impl Host {
         let made = unsafe {
             self.device.CreateCommittedResource(
                 &heap,
-                not_resident(),
+                not_resident_buffer(),
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
                 None,
@@ -11192,7 +11232,7 @@ impl Host {
         if let Some(b) = &buffer {
             crate::book::made(b, || "an unordered access buffer".into());
         }
-        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident(&self.device, b))).and_then(|()| mapped(&self.device));
+        let made = made.and_then(|()| buffer.as_ref().map_or(Ok(()), |b| resident_buffer(&self.device, b))).and_then(|()| mapped_buffer(&self.device));
         match made {
             Ok(()) => buffer,
             Err(e) => {
@@ -12176,6 +12216,17 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             SIZE >> 20,
             before.as_secs_f64() / after.as_secs_f64()
         );
+    }
+
+    /// `VICTORY_WAIT_RESIDENT=textures` alone lets plain buffers go
+    /// without the wait; unset or anything else, they wait as before.
+    #[test]
+    fn buffers_wait_unless_only_textures_do() {
+        assert!(super::buffers_wait(None));
+        assert!(super::buffers_wait(Some("1")));
+        assert!(super::buffers_wait(Some("")));
+        assert!(!super::buffers_wait(Some("textures")));
+        assert!(!super::buffers_wait(Some(" textures ")));
     }
 
     #[test]
