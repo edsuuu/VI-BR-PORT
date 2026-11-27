@@ -577,6 +577,20 @@ pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<us
     Some(out)
 }
 
+/// The per-lane branches (by block) whose regions hold a block of `needs` ([`take_needs`]),
+/// whatever their wave-wide meaning: the skips to leave out so that every lane runs those
+/// blocks (`super::emit`). None with an indirect exit.
+pub(super) fn lane_branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<usize>> {
+    let regions = lane_regions(st)?;
+    Some(
+        regions
+            .into_iter()
+            .filter(|(_, region)| needs.iter().any(|&b| region.get(b).copied().unwrap_or(false)))
+            .map(|(d, _)| d)
+            .collect(),
+    )
+}
+
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
 /// waves meeting there), which the other forms of the program may give it.
 pub(super) fn needs_every_lane(what: &str) -> bool {

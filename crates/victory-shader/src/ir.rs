@@ -814,6 +814,53 @@ fn early_out_continuation(p: &Program, b: usize) -> Option<usize> {
 /// That leaves out most of the skips of the title's large lighting programs, whose bodies
 /// are then code every lane runs.
 pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
+    without_branches(p, &removable_branches(p, deep))
+}
+
+/// The pure skips [`without_skips`] leaves out (by block), the early-outs not among them.
+pub(crate) fn pure_skips(p: &Program, deep: bool) -> Vec<usize> {
+    removable_branches(p, deep).into_iter().filter(|r| !r.2).map(|r| r.0).collect()
+}
+
+/// As [`without_skips`], but of the pure skips ([`pure_skips`]) only those of the blocks in
+/// `skips`, and of the early-outs only those not in `kept` (a form that takes those by the
+/// wave, [`crate::structure::structure_wide`]). Each branch left out is one [`without_skips`]
+/// leaves out too, and its conditions are those of the branch alone in the program as it is:
+/// what a skip that stays sees is what it saw before. `None` if nothing changes.
+pub(crate) fn without_some_skips(
+    p: &Program,
+    deep: bool,
+    skips: &std::collections::HashSet<usize>,
+    kept: &std::collections::HashSet<usize>,
+) -> Option<Program> {
+    let chosen: Vec<(usize, usize, bool)> = removable_branches(p, deep)
+        .into_iter()
+        .filter(|&(b, _, out)| if out { !kept.contains(&b) } else { skips.contains(&b) })
+        .collect();
+    without_branches(p, &chosen)
+}
+
+/// `p` with the branches `chosen` (block, where its code goes on) left out.
+fn without_branches(p: &Program, chosen: &[(usize, usize, bool)]) -> Option<Program> {
+    if chosen.is_empty() {
+        return None;
+    }
+    let mut blocks = p.blocks.clone();
+    for &(b, next, _) in chosen {
+        blocks[b].insts.pop();
+        blocks[b].exit = Exit::Jump(next);
+    }
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks).ok()?;
+    Some(rename(blocks, p.wave64, p.vgprs))
+}
+
+/// The branches [`without_skips`] leaves out: (block, where its code goes on, whether it is an
+/// early-out rather than a pure skip), each judged in `p` as it is.
+fn removable_branches(p: &Program, deep: bool) -> Vec<(usize, usize, bool)> {
     let n = p.blocks.len();
     // Scalars moved from register to register (a scalar the compiler parked in a VGPR lane
     // comes back by such a move, `unspill`) are the value they copy.
@@ -917,31 +964,21 @@ pub(crate) fn without_skips(p: &Program, deep: bool) -> Option<Program> {
         }
         Some(inside)
     };
-    let mut blocks = p.blocks.clone();
-    let mut any = false;
+    let mut out = Vec::new();
     for b in 0..n {
         let Exit::Branch { taken, not_taken } = p.blocks[b].exit else {
             continue;
         };
-        let next = early_out_continuation(p, b).or_else(|| {
-            let skip = p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz");
-            (skip && skipped(b, taken, not_taken).is_some()).then_some(not_taken)
-        });
-        if let Some(next) = next {
-            blocks[b].insts.pop();
-            blocks[b].exit = Exit::Jump(next);
-            any = true;
+        if let Some(next) = early_out_continuation(p, b) {
+            out.push((b, next, true));
+            continue;
+        }
+        let skip = p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz");
+        if skip && skipped(b, taken, not_taken).is_some() {
+            out.push((b, not_taken, false));
         }
     }
-    if !any {
-        return None;
-    }
-    for block in &mut blocks {
-        block.phis.clear();
-    }
-    link(&mut blocks);
-    split_irreducible(&mut blocks).ok()?;
-    Some(rename(blocks, p.wave64, p.vgprs))
+    out
 }
 
 /// The value `v` is a copy of, followed to the end of `copy`'s chains.
@@ -1833,6 +1870,33 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    #[test]
+    fn some_skips_are_left_out_and_the_others_stay() {
+        // two skips one after the other, each over a vector move
+        let two = skip(
+            &[0x7E02_0206], // v_mov_b32 v1, s6
+            &[
+                0x7D88_0000,  // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A,  // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0001,  // s_cbranch_execz past the body
+                0x7E04_0206,  // v_mov_b32 v2, s6
+                0xBEFE_040C,  // s_mov_b64 exec, s[12:13]
+            ],
+        );
+        assert_eq!(skips(&two), 2);
+        let pure = pure_skips(&two, false);
+        assert_eq!(pure.len(), 2);
+        let none = std::collections::HashSet::new();
+        let first: std::collections::HashSet<usize> = [pure[0]].into();
+        let one = without_some_skips(&two, false, &first, &none).expect("left out");
+        assert_eq!(skips(&one), 1);
+        // the one that stays is the other, at the same block
+        assert!(one.blocks[pure[1]].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz"));
+        assert!(without_some_skips(&two, false, &none, &none).is_none());
+        let all: std::collections::HashSet<usize> = pure.iter().copied().collect();
+        assert_eq!(skips(&without_some_skips(&two, false, &all, &none).expect("left out")), 0);
     }
 
     #[test]

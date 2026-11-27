@@ -489,6 +489,8 @@ pub fn emit(
     // on its own)
     let exact_only = matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_ELSEWHERE);
     if stuck && native.stage == HwStage::Cs && native.wave64 && lower::host_max_wave() == 32 {
+        // (the blocks the program as it is wanted every lane in)
+        let mut base_needs = lower::take_needs();
         let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
         let report = |what: &str, r: &Result<(HostShader, Option<u32>), ShaderError>| {
             if why {
@@ -560,9 +562,61 @@ pub fn emit(
             Some((st, io, res))
         });
         let early = early.flatten();
-        for (name, f) in &forms {
+        // Only the skips around the code that needs every lane left out, before every pure skip
+        // of the program is ([`ir::without_some_skips`]): the program without its early-outs
+        // names the blocks it wanted every lane in (`lower::take_needs`), the pure skips whose
+        // regions hold them are left out, and so on until it translates for waves of 32 or no
+        // such skip is left. Without skips every lane walks every skipped region with EXEC
+        // clear, where most of the title's large lighting and culling programs only need it in
+        // a few. As exact as the form without skips: a skip left out is one that form leaves
+        // out too, judged in the program as it is (the code after it sees no scalar the region
+        // changed), and a skip that stays is taken lane by lane as before, around code with no
+        // meeting of the host waves in it. `VICTORY_WAVE_SELECTIVE_SKIPS=0`: not tried (on by
+        // default).
+        let selective_on = std::env::var_os("VICTORY_WAVE_SELECTIVE_SKIPS").is_none_or(|v| v != "0");
+        let selective = |deep: bool, base: &structure::Structured, needs: &[usize]| {
+            let name = if deep { "without skips where needed, scalars followed" } else { "without skips where needed" };
+            let skips: std::collections::HashSet<usize> = ir::pure_skips(p, deep).into_iter().collect();
+            let kept = std::collections::HashSet::new();
+            let mut chosen = std::collections::HashSet::new();
+            let mut around = lower::lane_branches_around(base, needs)?;
+            loop {
+                let before = chosen.len();
+                chosen.extend(around.into_iter().filter(|d| skips.contains(d)));
+                // (all of them: that is the form without skips, which comes next)
+                if chosen.len() == before || chosen.len() == skips.len() {
+                    if why {
+                        eprintln!("WAVE64-RETRY {name}: stopped with {} of {} skips left out", before, skips.len());
+                    }
+                    return None;
+                }
+                let (q, st, io, res) = form(ir::without_some_skips(p, deep, &chosen, &kept))?;
+                lower::take_needs();
+                let again = emit_program(c, native, &q, &st, &io, &res);
+                let needs = lower::take_needs();
+                report(name, &again);
+                if done(&again) {
+                    return Some(again);
+                }
+                if needs.is_empty() {
+                    return None;
+                }
+                around = lower::lane_branches_around(&st, &needs)?;
+            }
+        };
+        for (i, (name, f)) in forms.iter().enumerate() {
+            if i == 1 && selective_on {
+                let base = forms[0].1.as_ref().map_or(st, |f| &f.1);
+                if let Some(again) = selective(false, base, &base_needs) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
             if let Some((p, st, io, res)) = f {
+                lower::take_needs();
                 let again = emit_program(c, native, p, st, io, res);
+                if i == 0 {
+                    base_needs = lower::take_needs();
+                }
                 report(name, &again);
                 if done(&again) {
                     return again.map(|(shader, _)| shader);
@@ -591,6 +645,13 @@ pub fn emit(
                 // lane runs, where the two host waves can exchange.
                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+                // (first only those around the code that needs every lane, as above)
+                if deep_on && selective_on {
+                    let base = forms[0].1.as_ref().map_or(st, |f| &f.1);
+                    if let Some(again) = selective(true, base, &base_needs) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
