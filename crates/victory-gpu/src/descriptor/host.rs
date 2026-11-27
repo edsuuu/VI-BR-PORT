@@ -1010,6 +1010,19 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+/// What the queue of textures picked by index knew of a slot a bake draw
+/// reads ([`TextureQueue::now`]): when it was due, the frame it was
+/// written (or made due by a note of its memory), the frame of its last
+/// whole upload if it was waiting for a look after it, and the looks so
+/// far.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Known {
+    pub(crate) due: u64,
+    pub(crate) written: u64,
+    pub(crate) uploaded: Option<u64>,
+    pub(crate) looks: u8,
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -1163,6 +1176,22 @@ impl TextureQueue {
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
+    }
+
+    /// Slot `index` is read by a draw of the title's decoration bake now
+    /// (`crate::bake`): due at `frame` as one written now, whatever was
+    /// known of it. Returns the write it is handed out as, and what the
+    /// queue knew of it before (`None`: it was out of the queue, up to
+    /// date as far as anything told).
+    fn now(&mut self, index: u32, frame: u64) -> (u64, Option<Known>) {
+        let before = self.slots.get(&index).map(|w| Known {
+            due: w.due,
+            written: w.written,
+            uploaded: (w.checked.2 != 0).then_some(w.checked.4),
+            looks: if w.checked.2 != 0 { w.checked.3 } else { w.looks },
+        });
+        self.changed(index, frame, frame);
+        (self.writes, before)
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -1896,6 +1925,20 @@ impl HostHeap {
     ) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         textures.recheck(index, write, due, at, print, looks, uploaded);
+    }
+
+    /// Title slots a draw of the title's decoration bake reads
+    /// (`crate::bake`) are due now ([`TextureQueue::now`]): each with the
+    /// write the pass hands back, and what the queue knew of it before.
+    pub(crate) fn texture_slots_now(&self, slots: &[u32], frame: u64) -> Vec<(u32, u64, Option<Known>)> {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        slots
+            .iter()
+            .map(|&index| {
+                let (write, before) = textures.now(index, frame);
+                (index, write, before)
+            })
+            .collect()
     }
 
     /// See [`TextureQueue::checked`].
@@ -5813,6 +5856,27 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     /// slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
+    #[test]
+    fn a_slot_a_bake_reads_is_due_at_once_whatever_was_known() {
+        let mut q = TextureQueue::default();
+        // Slot 7: uploaded whole in frame 10, its next look due in 14.
+        q.written(7, 9, 10, false);
+        let w = q.due(10, 10)[0].1;
+        q.recheck(7, w, 14, (0x1000, 64), 99, 0, 10);
+        assert!(q.due(12, 10).is_empty());
+        // A bake in frame 12 reads it: due now, and what was known is said.
+        let (write, before) = q.now(7, 12);
+        assert_eq!(before, Some(Known { due: 14, written: 9, uploaded: Some(10), looks: 0 }));
+        assert_eq!(q.due(12, 10), [(7, write)]);
+        // The look after the upload starts again from what the pass does.
+        assert_eq!(q.checked(7), None);
+        // A slot out of the queue (up to date as far as anything told).
+        q.done(7, write);
+        let (write, before) = q.now(7, 13);
+        assert_eq!(before, None);
+        assert_eq!(q.due(13, 10), [(7, write)]);
+    }
+
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();
