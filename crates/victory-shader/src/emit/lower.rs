@@ -706,8 +706,14 @@ fn uniform_proof() -> bool {
 /// `VICTORY_UNIFORM_PROOF=1` ([`lane_uniform`]).
 /// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
 /// run (no lane branch can have split the arriving lanes); loop-carried values never do.
+/// With `VICTORY_UNIFORM_OPERANDS=1` ([`uniform_operands`]) it reads operands as the proof
+/// does: only the explicit words of each operand (not a preserved destination), never the
+/// inline constants 251-254 (which depend on execution) or an attribute, the implicit VGPR
+/// inputs of a swap or an accumulation too, a `v_cndmask`'s mask only where its condition is
+/// alike, and no relative move or `v_div_fmas` (which reads VCC).
 fn lane_uniform_first(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let exact = uniform_operands();
     let mut same: HashSet<Value> = HashSet::new();
     for b in crate::ir::reverse_postorder(&p.blocks) {
         let block = &p.blocks[b];
@@ -734,25 +740,88 @@ fn lane_uniform_first(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Val
             if st.guards[b][i].is_some() {
                 continue; // lanes outside EXEC keep another value
             }
-            let alike = ops.iter().all(|op| match *op {
-                Operand::Vector { reg, .. } => {
-                    // every dword of the operand the instruction reads from that register on
-                    let read: Vec<Value> =
-                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
-                    !read.is_empty() && read.iter().all(|x| same.contains(x))
-                }
-                // a scalar is one value; a lane mask is not, unless a compare of such values made it
-                Operand::Scalar { code, .. } if code != NULL => {
-                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
-                }
-                _ => true,
-            });
+            let alike = if exact {
+                operands_alike(st, inst, &ops, &same)
+            } else {
+                ops.iter().all(|op| match *op {
+                    Operand::Vector { reg, .. } => {
+                        // every dword of the operand the instruction reads from that register on
+                        let read: Vec<Value> =
+                            inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                        !read.is_empty() && read.iter().all(|x| same.contains(x))
+                    }
+                    // a scalar is one value; a lane mask is not, unless a compare of such values made it
+                    Operand::Scalar { code, .. } if code != NULL => {
+                        inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
+                    }
+                    _ => true,
+                })
+            };
             if alike {
                 same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
             }
         }
     }
     same
+}
+
+/// Whether [`lane_uniform_first`] reads operands exactly (`VICTORY_UNIFORM_OPERANDS=1`; off by
+/// default, which keeps its reading of before). Part of the shader cache's key.
+fn uniform_operands() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_UNIFORM_OPERANDS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNIFORM_OPERANDS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stands for `VICTORY_UNIFORM_OPERANDS` in a test, for its thread only.
+    static TEST_UNIFORM_OPERANDS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether every input of the vector instruction `inst` (its operands `ops`) is the same in
+/// every lane, by `same` (the exact reading of [`lane_uniform_first`]): the explicit words of
+/// each register operand, a lane mask only where a compare of such values made it, no inline
+/// constant 251-254 (they depend on execution) or attribute; for a swap or an accumulation its
+/// implicit VGPR inputs too; for `v_cndmask_b32` a mask whose condition is alike. Relative
+/// moves and `v_div_fmas` (which reads VCC) never are.
+fn operands_alike(st: &Structured, inst: &Inst, ops: &[Operand], same: &HashSet<Value>) -> bool {
+    let name = inst.name();
+    if name.starts_with("v_movrel") || name.starts_with("v_swaprel") || name.starts_with("v_div_fmas") {
+        return false;
+    }
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let implicit_alike = !(name == "v_swap_b32" || name.contains("mac_"))
+        || inst.reads.iter().all(|(reg, value)| !matches!(reg, Reg::V(_)) || same.contains(value));
+    let alike_bool = |b: Bool| {
+        st.bools.support(b).iter().all(|a| match *a {
+            Atom::Uniform(_) => true,
+            Atom::Lane(v) => same.contains(&v),
+            _ => false,
+        })
+    };
+    let mask_alike = name != "v_cndmask_b32"
+        || matches!(ops.get(2), Some(Operand::Scalar { code, .. })
+            if inst.read(Reg::S(*code)).and_then(|v| st.masks.get(&v)).is_some_and(|&b| alike_bool(b)));
+    implicit_alike
+        && mask_alike
+        && ops.iter().all(|op| match *op {
+            Operand::Vector { reg, dwords } => (0..dwords).all(|i| {
+                reg.checked_add(i)
+                    .and_then(|r| inst.read(Reg::V(r)))
+                    .is_some_and(|v| same.contains(&v))
+            }),
+            Operand::Scalar { code, dwords } if code != NULL => (0..dwords).all(|i| {
+                code.checked_add(i)
+                    .and_then(|r| inst.read(Reg::S(r)))
+                    .is_some_and(|v| !is_mask(v) || same.contains(&v))
+            }),
+            Operand::Const(251..=254) | Operand::Attr { .. } => false,
+            _ => true,
+        })
 }
 
 /// VGPR values that are the same in every lane of a console wave holding them (`all` is
@@ -13769,6 +13838,37 @@ mod tests {
         let new_v1 = swap.write(Reg::V(1)).unwrap();
         let uniform = super::lane_uniform(&p, &st, &[true], Some(old_v0));
         assert!(!uniform.contains(&new_v1));
+    }
+
+    /// The single pass of before takes a swap from an alike operand, and `src_execz`, for alike
+    /// values; with `VICTORY_UNIFORM_OPERANDS=1` it does not: the swap's other side is the
+    /// thread id, and EXEC differs between the two host waves of a console wave.
+    #[test]
+    fn the_single_pass_reads_operands_exactly_when_asked_to() {
+        use crate::ir::Reg;
+        let words = [
+            0x7E02_0280, // v_mov_b32 v1, 0
+            0x7E00_CB01, // v_swap_b32 v0, v1
+            0x7E04_02FC, // v_mov_b32 v2, src_execz
+            0x7E06_0281, // v_mov_b32 v3, 1
+            S_ENDPGM,
+        ];
+        let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let p = ir::build(&code, true, 8).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let insts = &p.blocks[0].insts;
+        assert_eq!(insts[1].name(), "v_swap_b32");
+        let swapped = insts[1].write(Reg::V(1)).unwrap();
+        let execz = insts[2].write(Reg::V(2)).unwrap();
+        let one = insts[3].write(Reg::V(3)).unwrap();
+        for exact in [false, true] {
+            let was = super::TEST_UNIFORM_OPERANDS.replace(Some(exact));
+            let uniform = super::lane_uniform_first(&p, &st, &[true]);
+            super::TEST_UNIFORM_OPERANDS.set(was);
+            assert_eq!(uniform.contains(&swapped), !exact, "the swap, exact {exact}");
+            assert_eq!(uniform.contains(&execz), !exact, "src_execz, exact {exact}");
+            assert!(uniform.contains(&one), "a constant, exact {exact}");
+        }
     }
 
     #[test]
