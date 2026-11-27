@@ -909,9 +909,14 @@ pub fn emit(
 /// branches around its cross-lane code taken wave-wide ([`structure::structure_wide`]): the
 /// lowering names the blocks where the two host waves must meet and could not
 /// (`lower::take_needs`), the branches whose regions hold them are widened, and so on until
-/// it translates or a branch cannot be widened. Only where a thread group is one console
-/// wave: with several, the waves of a group would decide differently and a barrier inside
-/// such a branch would wait for threads that never come.
+/// it translates or a branch cannot be widened. Where a thread group is several console
+/// waves, those decide differently and a group barrier inside such a branch would wait for
+/// threads that never come: with `VICTORY_WAVE_PAIRS=1` the host waves of each console wave
+/// meet on their own there instead ([`lower::with_pair_meetings`]; groups of whole console
+/// waves), else such a group is refused as before (the default while its cost in a game run
+/// is not known). The title's heap defragmentation of its clipped triangles and decal trails
+/// (`vfx_triangleClip:CS_DefragHeap_ComputeRelocations`, groups of 128, and the decal trails'
+/// programs of 512) are dropped every frame on NVIDIA without it.
 fn widen(
     c: &Container,
     native: &NativeProgram,
@@ -926,6 +931,7 @@ fn widen(
         // (a program whose waves are the host's meets no one: no barrier, any group)
         crate::native::StageIo::Cs(_) if !(native.wave64 && lower::host_max_wave() == 32) => {}
         crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64 => {}
+        crate::native::StageIo::Cs(cs) if pair_meetings() && cs.threads.iter().product::<u32>() % 64 == 0 => {}
         crate::native::StageIo::Cs(cs) => {
             if why {
                 eprintln!("WAVE64-WIDE not tried: thread groups of {:?}", cs.threads);
@@ -958,7 +964,12 @@ fn widen_from(
         let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
         lower::take_needs();
         lower::take_meets();
-        let r = lower::with_agreed(&agreed, || emit_program(c, native, p, &st, &io, &res));
+        // (several console waves to a group, each two host waves)
+        let pairs = native.wave64
+            && lower::host_max_wave() == 32
+            && matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() > 64);
+        let lowered = || lower::with_agreed(&agreed, || emit_program(c, native, p, &st, &io, &res));
+        let r = if pairs { lower::with_pair_meetings(lowered) } else { lowered() };
         let needs = lower::take_needs();
         let meets = lower::take_meets();
         // (or translated for 64-lane waves still: shared memory read and written where not
@@ -1000,6 +1011,14 @@ fn widen_from(
         }
         wide.extend(more);
     }
+}
+
+/// Whether console wave64 programs whose thread group holds several console waves are taken
+/// wave-wide on a host of 32-lane waves, their host waves meeting per console wave ([`widen`];
+/// `VICTORY_WAVE_PAIRS=1`, off by default).
+fn pair_meetings() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_PAIRS").is_some_and(|v| v == "1"))
 }
 
 /// The translated program, and the wave size it requires of the host.
