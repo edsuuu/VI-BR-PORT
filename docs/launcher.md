@@ -28,8 +28,11 @@ bottom of the options panel; the version beside it is `v<workspace version> (<sh
 
 What was done is kept in `prepared.json`, next to the saved settings, one entry per build
 (the SHA-256 of `victory.exe`, the hash of the translation switches, and when the shaders,
-the warm-up and the last run happened). Each step's output goes to `logs\<step>.log` in the
-same folder.
+the warm-up and the last run happened). Each step's output and errors go to `logs\<step>.log`
+in the same folder. A step is started directly (no `cmd.exe` between), with its arguments
+quoted as programs read them back, so a path such as `G:\` or one holding `%NAME%` or a
+typographic apostrophe arrives as it is written; the line `-PrintEnv` and `launcher_env` show
+is the line that runs.
 
 ## The options
 
@@ -80,8 +83,12 @@ server share the file: the window reads it again when it changes on disk.
 ```
 
 An option not in the file has its default; a value this version does not know is left in
-the file and the default is used. Keys the launcher does not know are kept. A file that does
-not read is set aside as `launcher.json.bad` and the defaults are used. `language` is `en` or
+the file and the default is used. Keys the launcher does not know are kept. A file that is not
+a JSON object is set aside as `launcher.json.bad` and the defaults are used (a read that fails
+for a moment, while another process saves, is tried again and never sets the file aside). The
+window, the MCP server and the command line hold a lock (a named mutex per file) around each
+read and each read-change-write, so a change one of them saves is never lost to another's
+save. `language` is `en` or
 `pt-BR` (`null`: Portuguese on a Portuguese Windows, English on any other).
 
 ## Command-line modes
@@ -235,10 +242,12 @@ Run the first two under both `powershell` and `pwsh`.
 | `scripts/launcher/lang/en.json`, `pt-BR.json` | every visible text |
 | `scripts/launcher/Launcher.ps1` | loads the parts below |
 | `scripts/launcher/Json.ps1` | JSON read and written the same on both PowerShells |
+| `scripts/launcher/Lock.ps1` | the lock around reading and saving a shared file |
 | `scripts/launcher/Config.ps1` | the saved settings |
 | `scripts/launcher/Options.ps1` | options.json, setting an option, resolving a run |
 | `scripts/launcher/PlayScript.ps1` | what `scripts/play.ps1` sets, read from its syntax tree |
 | `scripts/launcher/Game.ps1` | the steps of Play and its dry run |
+| `scripts/launcher/StepProcess.ps1` | a step run as a process, its output copied into its log |
 | `scripts/launcher/Text.ps1`, `Version.ps1` | texts and the version |
 | `scripts/launcher/Theme.ps1` | the window's brushes, fonts, icons and control templates, made from `tokens.json` |
 | `scripts/launcher/Views.ps1` | the XAML of the scene and of the Play, Preparing and More options views |
