@@ -747,8 +747,11 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed; and made not resident
+        // (0x800), which the host follows with `MakeResident` and a replay does not: the card
+        // faults on the first copy into such a heap and the device is lost (the boat capture
+        // of 27 Nov, whose textures and title buffers were made that way).
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
