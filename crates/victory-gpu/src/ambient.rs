@@ -381,22 +381,27 @@ void keep(uint3 at : SV_DispatchThreadID) {
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
 void mean() {
+    // One read of each cell for the three means (the mean, and the
+    // log-averages of the luminance and of each colour).
     float3 sum = 0;
-    for (uint i = 0; i < CELLS; i++) sum += cells[i].rgb;
+    float logs = 0;
+    float3 logs_rgb = 0;
+    for (uint i = 0; i < CELLS; i++) {
+        float3 c = cells[i].rgb;
+        sum += c;
+        logs += log(dot(c, LUMA) + 1e-3);
+        logs_rgb += log(c + 1e-3);
+    }
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
     cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
     // The log-average (geometric mean) of the cells' luminance: it follows
     // the bulk of the picture, not a few windows and tubes (as the title's
     // own meter, a histogram, does), followed slowly in the log.
-    float logs = 0;
-    for (uint k = 0; k < CELLS; k++) logs += log(dot(cells[k].rgb, LUMA) + 1e-3);
     float4 geo_was = cells[GEO];
     float geo_now = logs / CELLS;
     float geo_log = geo_was.a > 0.0 ? lerp(geo_was.y, geo_now, follow) : geo_now;
     cells[GEO] = float4(max(exp(geo_log) - 1e-3, 0.0), geo_log, 0.0, 1.0);
-    float3 logs_rgb = 0;
-    for (uint j = 0; j < CELLS; j++) logs_rgb += log(cells[j].rgb + 1e-3);
     float4 rgb_was = cells[GEO_RGB];
     float3 rgb_now = logs_rgb / CELLS;
     cells[GEO_RGB] = float4(rgb_was.a > 0.0 ? lerp(rgb_was.rgb, rgb_now, follow) : rgb_now, 1.0);
