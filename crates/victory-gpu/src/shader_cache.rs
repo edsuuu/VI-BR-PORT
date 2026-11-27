@@ -76,6 +76,7 @@ fn build() -> [u8; 32] {
             "VICTORY_F16_NEAREST",
             "VICTORY_SDWA_SEXT",
             "VICTORY_CODE_TABLE_TRIM",
+            "VICTORY_WAVE_ENTRY_SKIPS",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_FIRST_HALF",

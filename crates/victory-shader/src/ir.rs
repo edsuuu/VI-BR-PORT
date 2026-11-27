@@ -858,6 +858,26 @@ fn without_branches(p: &Program, chosen: &[(usize, usize, bool)]) -> Option<Prog
     Some(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// `VICTORY_WAVE_ENTRY_SKIPS=1`: the deep form of [`removable_branches`] leaves out a skip
+/// on EXEC on entry (`s_and_saveexec_b64 <saved>, <EXEC on entry>`) whose region changes
+/// scalars the join sees, when only the join block's image and buffer instructions read
+/// them, after its first instruction restores EXEC from the saved mask and before EXEC
+/// changes again. Off by default: untried in a game run.
+fn entry_skips_on() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ENTRY_SKIPS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ENTRY_SKIPS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`entry_skips_on`] as given (unset: the switch).
+    static TEST_ENTRY_SKIPS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// The branches [`without_skips`] leaves out: (block, where its code goes on, whether it is an
 /// early-out rather than a pure skip), each judged in `p` as it is.
 fn removable_branches(p: &Program, deep: bool) -> Vec<(usize, usize, bool)> {
@@ -914,6 +934,67 @@ fn removable_branches(p: &Program, deep: bool) -> Vec<(usize, usize, bool)> {
         copy_through_phis(p, &mut copy);
     }
     let root = |v: Value| if deep { follow(&copy, v) } else { v };
+    // EXEC on entry, which EXEC never holds a lane beyond (in a compute program).
+    let is_exec = |r: &Reg| matches!(r, Reg::S(EXEC | 127));
+    let entry: Vec<Value> = p.inputs.iter().filter(|x| is_exec(&x.0)).map(|x| x.1).collect();
+    // [`entry_skips_on`], deep form: what `s_and_saveexec_b64 <saved>, <EXEC on entry>` saves
+    // where it closes block `b` before its skip. That skip is taken only with no lane left,
+    // and the restore of the saved mask at the join leaves none either.
+    let entry_skip = |b: usize| -> Option<Vec<Value>> {
+        if !(deep && entry_skips_on() && entry.len() == 2) {
+            return None;
+        }
+        let i = p.blocks[b].insts.iter().rev().nth(1)?;
+        let mask: Vec<Value> =
+            i.reads.iter().filter(|r| !is_exec(&r.0)).map(|r| root(r.1)).collect();
+        (i.name() == "s_and_saveexec_b64"
+            && mask.len() == 2
+            && mask.iter().all(|m| entry.contains(m)))
+        .then(|| {
+            let saved = i.writes.iter().filter(|w| matches!(w.0, Reg::S(_)) && !is_exec(&w.0));
+            saved.map(|w| w.1).collect()
+        })
+    };
+    // Whether `v` (a scalar of join `join`) is read only by image and buffer instructions of
+    // the join block, after its first instruction restores EXEC from both words of `saved`
+    // and before EXEC changes again: lane work that, after a skip [`entry_skip`] finds, has
+    // no lane to do it.
+    let read_without_lanes = |join: usize, v: Value, saved: &[Value]| -> bool {
+        let elsewhere = p.blocks.iter().enumerate().any(|(x, blk)| {
+            blk.phis.iter().any(|f| f.args.contains(&v))
+                || x != join && blk.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == v))
+        });
+        if elsewhere || saved.len() != 2 {
+            return false;
+        }
+        let insts = &p.blocks[join].insts;
+        let Some(first) = insts.first() else {
+            return false;
+        };
+        // (both words: `s_mov_b64 exec, -1` reads no register and would pass the rest)
+        if !(first.name() == "s_mov_b64"
+            && first.writes.iter().all(|w| is_exec(&w.0))
+            && first.reads.len() == 2
+            && first.reads.iter().all(|r| saved.contains(&r.1)))
+        {
+            return false;
+        }
+        let mut open = true;
+        for i in &insts[1..] {
+            if i.reads.iter().any(|r| r.1 == v) {
+                let n = i.name();
+                let memory =
+                    n.starts_with("image_") || n.starts_with("buffer_") || n.starts_with("tbuffer_");
+                if !(open && memory) {
+                    return false;
+                }
+            }
+            if i.writes.iter().any(|w| is_exec(&w.0)) {
+                open = false;
+            }
+        }
+        true
+    };
     // The region a skip of `b` to `target` leaves out, if it is a pure skip.
     let skipped = |b: usize, target: usize, first: usize| -> Option<Vec<bool>> {
         let mut inside = vec![false; n];
@@ -952,7 +1033,9 @@ fn removable_branches(p: &Program, deep: bool) -> Vec<(usize, usize, bool)> {
             let before: Vec<Value> =
                 join.preds.iter().zip(&phi.args).filter(|(q, _)| **q == b).map(|(_, a)| root(*a)).collect();
             let within = join.preds.iter().zip(&phi.args).filter(|(q, _)| inside[**q]).map(|(_, a)| root(*a));
-            if within.into_iter().any(|a| !before.contains(&a)) {
+            if within.into_iter().any(|a| !before.contains(&a))
+                && !entry_skip(b).is_some_and(|saved| read_without_lanes(target, phi.value, &saved))
+            {
                 return None;
             }
         }
@@ -2279,5 +2362,57 @@ mod tests {
         assert_eq!(header.insts[0].read(Reg::S(2)), Some(lp_s2));
         assert_eq!(exit.insts[0].read(Reg::S(1)), Some(next_s1));
         assert_eq!(exit.insts[0].read(Reg::S(2)), Some(lp_s2));
+    }
+
+    /// A compute program saves EXEC on entry (`s_mov_b64 s[40:41], exec`) and later skips a
+    /// region with `s_and_saveexec_b64 s[20:21], s[40:41]`: that skip is taken only with no
+    /// lane left (EXEC never holds a lane EXEC on entry did not), and the restore of EXEC at
+    /// the join leaves none either. Scalars the region sets (a descriptor: the console compiler
+    /// moves a sampler's constants into such a region) that only image or buffer instructions
+    /// read after that restore, before EXEC changes again, cannot tell a lane of the skip.
+    #[test]
+    fn a_skip_on_exec_on_entry_is_left_out_when_only_the_join_s_memory_reads_its_scalars() {
+        const SET: u32 = 0xBE86_0385; // s_mov_b32 s6, 5
+        const RESTORE: u32 = 0xBEFE_0414; // s_mov_b64 exec, s[20:21]
+        // buffer_load_dword v2, off, s[4:7], 0: s[4:7] is its descriptor
+        const LOAD: [u32; 2] = [0xE030_0000, 0x8001_0200];
+        const ENTRY: u32 = 0xBE94_2428; // s_and_saveexec_b64 s[20:21], s[40:41]
+        const VCC: u32 = 0xBE94_246A; // s_and_saveexec_b64 s[20:21], vcc
+        let program = |mask: u32, join: u32, after: &[u32]| {
+            let mut w = vec![
+                0xBEA8_047E, // s_mov_b64 s[40:41], exec
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE80_246A, // s_and_saveexec_b64 s[0:1], vcc (an outer branch: s0, s1 change)
+                mask,        // s_and_saveexec_b64 s[20:21], <mask>
+                0xBF88_0002, // s_cbranch_execz past the body
+                SET,
+                0xBE87_0380, // s_mov_b32 s7, 0
+                join,        // the join's first instruction
+            ];
+            w.extend_from_slice(after);
+            w.push(S_ENDPGM);
+            build_words(&w, true)
+        };
+        let with = |on: bool, p: &Program, deep: bool| {
+            let was = TEST_ENTRY_SKIPS.replace(Some(on));
+            let q = without_skips(p, deep);
+            TEST_ENTRY_SKIPS.set(was);
+            q
+        };
+        // read by a buffer instruction right after the restore: left out (deep form, switch on)
+        let read = program(ENTRY, RESTORE, &LOAD);
+        assert_eq!(skips(&read), 1);
+        assert!(with(true, &read, false).is_none());
+        assert_eq!(skips(&with(true, &read, true).expect("left out")), 0);
+        assert!(with(false, &read, true).is_none(), "switch off: kept as before");
+        // a skip on another mask may be taken with lanes left: kept
+        assert!(with(true, &program(VCC, RESTORE, &LOAD), true).is_none());
+        // read by a vector move: kept
+        assert!(with(true, &program(ENTRY, RESTORE, &[0x7E04_0206]), true).is_none());
+        // read after EXEC changed again (s_mov_b64 exec, s[40:41]): kept
+        let again = [0xBEFE_0428, LOAD[0], LOAD[1]];
+        assert!(with(true, &program(ENTRY, RESTORE, &again), true).is_none());
+        // the join sets EXEC from no register (s_mov_b64 exec, -1), not the saved mask: kept
+        assert!(with(true, &program(ENTRY, 0xBEFE_04C1, &LOAD), true).is_none());
     }
 }
