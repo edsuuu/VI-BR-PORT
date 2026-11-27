@@ -130,6 +130,17 @@ const SWEEP: usize = 128;
 /// ([`arenas_fallback`]).
 const ARENA_AGAIN: u64 = 30;
 
+/// `VICTORY_MEMORY_TIMES=1` (off by default): the recording threads' time
+/// in this module is measured in sections, and a line beside the ten-second
+/// report says where it went (the first step of making memory by address
+/// cheaper with rays on: the only run with the builder working spent 33 ms
+/// of an 83 ms frame preparing and 18 ms copying back, and nothing says how
+/// much of that is here). Off, nothing is measured.
+fn times() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MEMORY_TIMES").is_some_and(|v| v == "1"))
+}
+
 /// `VICTORY_ARENAS_FALLBACK=1` (off by default): an arena that cannot be had
 /// where shaders reach ([4 GiB, 2^37)) is made above it, and one that cannot
 /// be had at all is not asked for again for [`ARENA_AGAIN`] frames. Off, a
@@ -257,6 +268,18 @@ struct Stats {
     sized: [u64; 2],
     /// Times an arena could not be had ([`arenas_fallback`]).
     no_arena: u64,
+    /// With `VICTORY_MEMORY_TIMES=1` ([`times`]): where the recording
+    /// threads' time goes around the one mutex, in microseconds over all
+    /// threads: waiting for it at a dispatch; holding it for the frame's
+    /// first look (faults, the sweep), for new arenas, for what the
+    /// constants and the root views name, for the views and the bringing
+    /// up; and at a submission, waiting for it and landing.
+    waited: u64,
+    held: [u64; 5],
+    landing: [u64; 2],
+    /// Times every copy was asked to be brought up to date by a list for a
+    /// packed structure's root view.
+    brought_up: u64,
     /// With the budget ([`budget`]), of the pages shaders found empty: made;
     /// left over the frame's limit, without room, not the title's, without a
     /// place; below 4 GiB; left by the builder.
@@ -1210,6 +1233,24 @@ impl Memory {
                 );
             }
         }
+        if times() {
+            let ms = |micros: u64| micros as f64 / 1000.0 / frames;
+            tracing::info!(
+                "title memory by address, time per frame over all threads: {:.1} ms waiting for the mutex at dispatches; under it {:.1} ms \
+                 the frame's first look, {:.1} ms new arenas, {:.1} ms constants, {:.1} ms root views, {:.1} ms views and bringing up \
+                 ({:.1} times every copy was brought up for a packed structure); at submissions {:.1} ms waiting for it and {:.1} ms landing \
+                 (VICTORY_MEMORY_TIMES)",
+                ms(s.waited),
+                ms(s.held[0]),
+                ms(s.held[1]),
+                ms(s.held[2]),
+                ms(s.held[3]),
+                ms(s.held[4]),
+                s.brought_up as f64 / frames,
+                ms(s.landing[0]),
+                ms(s.landing[1]),
+            );
+        }
         if s.no_arena > 0 {
             tracing::warn!(
                 times = s.no_arena,
@@ -1390,11 +1431,26 @@ pub(crate) fn ready(
     use_: Use,
     threads: Option<[u32; 3]>,
 ) -> Option<Ready> {
+    // (Timed in sections with `VICTORY_MEMORY_TIMES=1`: see `Stats::held`.)
+    let asked = times().then(std::time::Instant::now);
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
         *guard = Memory::new();
     }
     let m = guard.as_mut()?;
+    let mut mark = asked.map(|asked| {
+        let now = std::time::Instant::now();
+        m.stats.waited += now.duration_since(asked).as_micros() as u64;
+        now
+    });
+    // The time since the last mark goes to section `i`.
+    let mut section = |m: &mut Memory, i: usize| {
+        if let Some(mark) = mark.as_mut() {
+            let now = std::time::Instant::now();
+            m.stats.held[i] += now.duration_since(*mark).as_micros() as u64;
+            *mark = now;
+        }
+    };
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
@@ -1406,6 +1462,7 @@ pub(crate) fn ready(
         #[cfg(feature = "diagnostics")]
         m.trace.look(frame);
     }
+    section(m, 0);
     #[cfg(feature = "diagnostics")]
     if use_ != Use::Reads {
         m.trace.dispatch(frame, list, addresses, written, constants, threads);
@@ -1415,6 +1472,7 @@ pub(crate) fn ready(
         list.first_use(SIZES);
     }
     while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
+    section(m, 1);
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -1444,6 +1502,7 @@ pub(crate) fn ready(
         }
     }
     let mut came = [held(m) - before, 0, 0, 0];
+    section(m, 2);
     for &at in addresses.iter().filter(|&&a| a >= 1 << 32) {
         // (Several structures to a page.)
         let mut packed = false;
@@ -1468,11 +1527,18 @@ pub(crate) fn ready(
                 m.bring(at / PAGE, (at + len - 1) / PAGE + 1);
             }
             list.defer_host(move || {
+                let asked = times().then(std::time::Instant::now);
                 if let Some(m) = MEMORY.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                    let got = asked.map(|asked| (asked, std::time::Instant::now()));
                     m.land(at);
+                    if let Some((asked, got)) = got {
+                        m.stats.landing[0] += got.duration_since(asked).as_micros() as u64;
+                        m.stats.landing[1] += got.elapsed().as_micros() as u64;
+                    }
                 }
             });
             m.bring_up(list);
+            m.stats.brought_up += 1;
         }
         if builds && written.contains(&at) && list.first_use(usize::MAX - (4 << 33) - (at >> 2 & 0x7FFF_FFFF) as usize) {
             if let Some((start, len)) = crate::shadow::in_buffer(at, 1)
@@ -1520,6 +1586,7 @@ pub(crate) fn ready(
     for (sum, n) in m.stats.came.iter_mut().zip(came) {
         *sum += n;
     }
+    section(m, 3);
     let key = std::ptr::from_ref(heap) as usize;
     let (base, made) = match m.heaps.get(&key) {
         Some(&run) => run,
@@ -1557,6 +1624,7 @@ pub(crate) fn ready(
     if use_ == Use::Reads {
         m.dump.walked(addresses);
     }
+    section(m, 4);
     let directory = &m.directory.1;
     Some(Ready {
         directory: directory.gpu(directory.span().0),
