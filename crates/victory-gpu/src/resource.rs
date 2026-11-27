@@ -1792,6 +1792,22 @@ fn targets_known() -> bool {
     world != u64::MAX && crate::frame::current().saturating_sub(world) >= TARGETS_SETTLE_FRAMES
 }
 
+/// Frames presented since the world's first frame, once there was one.
+/// The title's scenes run on frames, not on seconds (a cutscene shows the
+/// same shot some 600 frames in at 12 fps as at 28), and so does what it
+/// streams for them: lines that say how far a scene has come say it in
+/// these.
+#[cfg(windows)]
+pub(crate) fn frames_into_world() -> Option<u64> {
+    frames_after(WORLD_AT.load(std::sync::atomic::Ordering::Relaxed), crate::frame::current())
+}
+
+/// Frames from `world` (`u64::MAX`: none yet) to `now`.
+#[cfg(any(windows, test))]
+fn frames_after(world: u64, now: u64) -> Option<u64> {
+    (world != u64::MAX).then(|| now.saturating_sub(world))
+}
+
 /// Which rule set the room kept for targets ([`targets_rule`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TargetsBy {
@@ -3450,6 +3466,15 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    #[test]
+    fn frames_into_the_world_count_from_its_first_frame() {
+        assert_eq!(frames_after(u64::MAX, 900), None);
+        assert_eq!(frames_after(1036, 1036), Some(0));
+        assert_eq!(frames_after(1036, 1636), Some(600));
+        // A counter read before the first frame was noted does not wrap.
+        assert_eq!(frames_after(1036, 1000), Some(0));
+    }
 
     #[test]
     fn the_room_for_targets_follows_what_they_take_once_known() {

@@ -10343,7 +10343,7 @@ impl Meter {
                     "textures picked by index, by the first level their view shows (VICTORY_LEVEL_CENSUS), looks since the \
                      last line: with memory there from level 0 {}, 1 {}, 2 {}, 3 or more {}; with none there from level 0 {}, \
                      1 {}, 2 {}, 3 or more {}; of those there from a level past the first, {} with the larger levels' memory \
-                     mapped too, {} with none of it",
+                     mapped too, {} with none of it; {}",
                     c[0],
                     c[1],
                     c[2],
@@ -10353,7 +10353,9 @@ impl Meter {
                     c[6],
                     c[7],
                     c[8],
-                    c[9]
+                    c[9],
+                    crate::resource::frames_into_world()
+                        .map_or_else(|| "before the world's first frame".to_string(), |n| format!("{n} frames after the world's first"))
                 );
             }
             if crate::resource::held_only() {
