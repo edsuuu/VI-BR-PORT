@@ -72,6 +72,7 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_EARLY_OUTS",
             "VICTORY_WAVE_SELECTIVE_SKIPS",
             "VICTORY_WAVE_EARLY_OUTS_EXCHANGE",
+            "VICTORY_WAVE_ATOMICS",
             "VICTORY_F16_NEAREST",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",

@@ -12131,6 +12131,45 @@ impl<'a> Lower<'a> {
                 return Err("buffer atomic data");
             };
             let returns = matches!(inst.fields, Fields::Buffer { cache, .. } if cache.glc);
+            // An add nothing reads back, by every lane of the host wave to the same word:
+            // one lane adds their sum (`super::wave_atomics`). Whether the lanes that run
+            // it name the same word is asked of the wave each time, so lanes that count in
+            // words of their own add as before.
+            if op == 0 && !returns && self.x.native.stage == HwStage::Cs && super::wave_atomics() {
+                let named = if index.is_some() && !used.is_some_and(|u| u.stride == 1) { 2 } else { 1 };
+                let at = self.begin_guarded(guard);
+                let c = self.cur;
+                let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+                let mut same: Option<V> = None;
+                for &coord in &coords[..named] {
+                    let first = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[coord]);
+                    let equal = self.s.m.cmp(c, pred::EQ, coord, first);
+                    let all = self.s.op(c, "waveAllTrue", Attr::NoUnwind, i1t, 114, &[equal]);
+                    same = Some(match same {
+                        Some(so_far) => self.s.m.bin(c, Bin::And, so_far, all),
+                        None => all,
+                    });
+                }
+                let same = same.ok_or("a buffer atomic's address")?;
+                let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(1));
+                let total = self.s.op(c, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[vals[0], sum, unsigned]);
+                let lane = self.s.op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
+                let lowest = self.s.op(c, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[lane]);
+                let leads = self.s.m.cmp(c, pred::EQ, lane, lowest);
+                let value = self.s.m.select(c, same, total, vals[0]);
+                let yes = self.s.m.bool(true);
+                let apart = self.s.m.bin(c, Bin::Xor, same, yes);
+                let adds = self.s.m.bin(c, Bin::Or, apart, leads);
+                let inner = self.begin_guarded(Some(adds));
+                let mut args = vec![h, self.s.m.i32(0)];
+                args.extend(coords);
+                args.push(value);
+                self.s.op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args);
+                self.end_guarded(inner, &[]);
+                self.end_guarded(at, &[]);
+                self.s.flags |= flags::WAVE_OPS;
+                return Ok(());
+            }
             let old = match inst.read(Reg::V(reg)) {
                 Some(v) if returns => self.i32_of(v)?,
                 _ => self.s.m.i32(0),

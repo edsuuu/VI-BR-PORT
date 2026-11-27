@@ -184,6 +184,20 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether a compute program's atomic adds whose result nothing reads are summed over the
+/// host wave where every lane that runs one names the same word, and added by one lane
+/// (`VICTORY_WAVE_ATOMICS=1`; off by default). The title's culling programs count with them
+/// in their innermost loops, every lane of a wave to one counter (`InstanceCulling
+/// CS_Tree_BatchCull`: some 50 such instructions): a wave of 32 lanes then makes 32 atomic
+/// operations on one word, one after the other, and where that word is in memory shared
+/// with the PC (title memory used in place) each crosses the bus. The sum is the same;
+/// lanes that name different words add their own as before. Part of the translation: the
+/// shader cache keys on it.
+pub fn wave_atomics() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_ATOMICS").is_some_and(|v| v == "1"))
+}
+
 /// Whether buffer atomics of the ray-tracing structure builder stand between
 /// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
 /// translation: the shader cache keys on it.
