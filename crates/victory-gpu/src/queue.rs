@@ -703,6 +703,15 @@ fn shown(planes: u32, plane_parameters: *const Plane) -> Vec<(This, Option<[u32;
     std::iter::once((first, part)).chain(over.map(|(resource, _, part)| (resource, part))).collect()
 }
 
+/// Whether a present of several planes goes into the line of the thread of
+/// ours that prepares submissions (`VICTORY_ASYNC_PLANES=0`: it waits for the
+/// line and is composed by the title's thread, as before).
+#[cfg(windows)]
+fn planes_in_line() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_PLANES").is_none_or(|v| v != "0"))
+}
+
 /// The host state the lists recorded so far leave a title texture in
 /// (looked at, not changed).
 #[cfg(windows)]
@@ -986,7 +995,36 @@ extern "system" fn present(
         }
     }
     // A present of several planes (Series S: the world and the interface)
-    // runs the way below, which composes them.
+    // goes into the line too, and is composed when its turn comes
+    // (`VICTORY_ASYNC_PLANES=0`: it runs the way below, which first waits for
+    // everything in the line, on this thread: every frame of that profile
+    // then waited for all its submissions to be prepared, 9.8 ms a frame
+    // walking in the prison, and the thread of ours and the title's worked
+    // one after the other).
+    #[cfg(windows)]
+    if behind::on() && !this.is_null() && planes > 1 && planes_in_line() {
+        let shown = shown(planes, plane_parameters);
+        // Nothing without the first, as below; a plane after it that has no
+        // host texture is left out.
+        let first = shown.first().is_some_and(|&(resource, _)| crate::resource::host_copy(resource).is_some());
+        let textures: Vec<behind::Plane> = shown
+            .iter()
+            .filter(|_| first)
+            .filter_map(|&(resource, part)| {
+                let copy = crate::resource::host_copy(resource)?;
+                // (Lists not translated yet leave it in no state yet: the
+                // one it is in when its turn in the line comes.)
+                let state = if crate::list::thin::wanted() { u32::MAX } else { state_of(resource) };
+                Some((copy, state, part))
+            })
+            .collect();
+        let resource = shown.first().map_or(0, |plane| plane.0 as usize);
+        behind::present(this, textures, Shown { frame, resource });
+        called.end();
+        #[cfg(feature = "diagnostics")]
+        frame_ends();
+        return S_OK;
+    }
     #[cfg(windows)]
     if behind::on() && !this.is_null() && planes <= 1 {
         const COPY_SOURCE: u32 = 0x800;
@@ -1012,7 +1050,7 @@ extern "system" fn present(
             None
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        behind::present(this, texture.map(|(_, copy, state)| (copy, state, None)).into_iter().collect(), Shown { frame, resource });
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();

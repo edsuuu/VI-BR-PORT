@@ -391,9 +391,13 @@ enum Job {
     Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
     /// A signal of the queue's.
     Signal(usize, u64),
-    /// A frame is shown: the texture and the state its lists leave it in.
-    Present(Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>, super::Shown),
+    /// A frame is shown: its planes, bottom first (none: nothing to show).
+    Present(Vec<Plane>, super::Shown),
 }
+
+/// A plane of a present in the line: the texture, the state its lists leave
+/// it in, and the part of it that is shown (`None`: all of it).
+pub(super) type Plane = (std::sync::Arc<crate::resource::HostTexture>, u32, Option<[u32; 4]>);
 
 // SAFETY: D3D12 objects are free-threaded; a job is touched by whoever put it
 // in the line and then, once it is taken out, by our thread alone (the flights
@@ -569,12 +573,22 @@ impl Work for Job {
                     crate::fence::set(fence as This, value);
                 }
             }
-            Job::Present(texture, shown) => {
-                if let Some((texture, state)) = texture {
-                    // (Where its lists were not translated when the title
-                    // presented: the state they left it in.)
-                    let state = if state == u32::MAX { texture.state.load(Relaxed) } else { state };
-                    super::show(&texture.texture, state, shown);
+            Job::Present(planes, shown) => {
+                // (Where its lists were not translated when the title
+                // presented: the state they left it in.)
+                let state = |texture: &crate::resource::HostTexture, state: u32| {
+                    if state == u32::MAX { texture.state.load(Relaxed) } else { state }
+                };
+                match &planes[..] {
+                    [] => {}
+                    [(texture, at, _)] => super::show(&texture.texture, state(texture, *at), shown),
+                    // Several (Series S: the world and the interface):
+                    // composed, as outside the line.
+                    several => {
+                        let all: Vec<crate::host::Shown> =
+                            several.iter().map(|(texture, at, part)| (&texture.texture, state(texture, *at), *part)).collect();
+                        super::show_planes(&all, shown);
+                    }
                 }
                 QUEUED.fetch_sub(1, Relaxed);
             }
@@ -809,12 +823,12 @@ pub(super) fn wait(this: This, fence: This, value: u64) {
     LANE.push_behind(this as usize, always, Job::Wait(fence as usize, value), || {});
 }
 
-/// A present on queue `this` of `texture`, in the state the lists recorded so
-/// far leave it in.
-pub(super) fn present(this: This, texture: Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>, shown: super::Shown) {
+/// A present on queue `this` of `planes`, each in the state the lists
+/// recorded so far leave it in.
+pub(super) fn present(this: This, planes: Vec<Plane>, shown: super::Shown) {
     QUEUED.fetch_add(1, Relaxed);
     STATS[PRESENTS].fetch_add(1, Relaxed);
-    LANE.push(this as usize, [Job::Present(texture, shown)]);
+    LANE.push(this as usize, [Job::Present(planes, shown)]);
     let began = Instant::now();
     let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());
