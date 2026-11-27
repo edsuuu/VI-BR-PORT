@@ -2791,7 +2791,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LAMP_TABLE, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, LAMP_TABLE, LIGHT, RADIANCE, Role, STENCIL, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -2827,7 +2827,7 @@ impl State {
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
-            Role::Resolve => entry(ResourceType::Srv, DEPTH),
+            Role::Resolve => entry(ResourceType::Srv, crate::ambient::depth_at()),
             Role::Radiance | Role::Air | Role::LampShadows => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
@@ -2842,9 +2842,15 @@ impl State {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
+        // The stencil plane, for raising only what is inside a room.
+        let stencil = match role {
+            Role::Resolve => entry(ResourceType::Srv, STENCIL).map(|(_, handle)| handle),
+            _ => None,
+        };
         crate::ambient::after(list, role, &Views {
             image,
             depth,
+            stencil,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
         })

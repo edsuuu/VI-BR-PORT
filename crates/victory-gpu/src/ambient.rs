@@ -84,6 +84,26 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
 /// visible surfaces: root parameter and place in its table, in dwords.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 pub(crate) const DEPTH: (u8, u32) = (0, 464);
+/// What sits at [`DEPTH`] in the resolve the prison runs
+/// (`CS_ScreenProbes_TemporalResolve_ReflectiveCaustics`, 34fb51b8a0312e82) is
+/// the title's view of the stencil plane (it reads its second channel; its
+/// depth is the view at 688, which it tests against 0 for the sky), so the
+/// passes read no depth from it: every point is taken as 1,000 m away, the
+/// creases are never shaded and the estimate weighs every cell alike.
+pub(crate) const STENCIL: (u8, u32) = (0, 464);
+pub(crate) const TRUE_DEPTH: (u8, u32) = (0, 688);
+
+/// The resolve's view the passes read depth from: [`TRUE_DEPTH`] with
+/// `VICTORY_AMBIENT_TRUE_DEPTH=1`, else [`DEPTH`] as before (a fix, off
+/// while it is tried: with it the creases' shade starts to act).
+pub(crate) fn depth_at() -> (u8, u32) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_TRUE_DEPTH").is_some_and(|v| v == "1")) {
+        TRUE_DEPTH
+    } else {
+        DEPTH
+    }
+}
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
@@ -213,12 +233,34 @@ fn key() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default();
-        let mut parts = set.split(':').map(|v| v.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0));
+        let mut parts = set.split(':').take(2).map(|v| v.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0));
         match (parts.next().flatten(), parts.next().flatten()) {
             (Some(key), most) => [key, most.unwrap_or(8.0)],
             _ => [0.0, 1.0],
         }
     })
+}
+
+/// Words after the key's two numbers: `inside` raises only texels the stencil
+/// plane marks inside a room (an exterior night, and what a window shows,
+/// keep their light); `air` keeps the bound on what the air scatters where
+/// it was without the key (the slow mean it follows includes the added
+/// light), so the fog of a hall does not rise with its walls.
+fn key_flags() -> (bool, bool) {
+    static SET: OnceLock<(bool, bool)> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default();
+        let words: Vec<&str> = set.split(':').skip(2).map(str::trim).collect();
+        (words.contains(&"inside"), words.contains(&"air"))
+    })
+}
+
+fn key_inside() -> bool {
+    key_flags().0
+}
+
+fn key_air_hold() -> bool {
+    key_flags().1
 }
 
 /// Strength and radius of the creases' shade.
@@ -237,7 +279,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=19, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -248,9 +290,12 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float around;
     float lamps; float full; float least; float key;
-    float most_gain;
+    float most_gain; float inside_only; float air_hold;
 };
 Texture2D<float> depth : register(t0);
+// The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
+// room" in its second channel.
+Texture2D<uint2> stencil : register(t1);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
 // CELLS + 1 on where they are.
 RWStructuredBuffer<float4> cells : register(u1);
@@ -266,6 +311,15 @@ float gain_to_key(float4 mean_now) {
     if (key <= 0.0 || mean_now.a <= 0.0) return 1.0;
     return clamp(key / max(dot(mean_now.rgb, LUMA), 1e-4), 1.0, max(most_gain, 1.0));
 }
+
+// The same at a texel of the screen: with inside_only, 1 where the stencil
+// plane does not mark the texel inside a room (an exterior night keeps its
+// light; what a window shows of the outside too).
+float gain_at(float4 mean_now, int2 p) {
+    if (inside_only > 0.0 && (stencil.Load(int3(p, 0)).y & 8u) == 0u) return 1.0;
+    return gain_to_key(mean_now);
+}
+
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
@@ -364,6 +418,10 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
+    // The light the key adds to surfaces does not raise what the air may
+    // scatter: the bound stays where it was before (the slow mean includes
+    // the added light, so it is taken back out by the gain).
+    if (air_hold > 0.0) cap /= gain_to_key(cells[CELLS]);
     float3 c = scattered[at];
     float has = dot(c, LUMA);
     if (has > cap) scattered[at] = c * (cap / has);
@@ -433,7 +491,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
         float4 mean_now = cells[CELLS];
         float3 part = around * mean_now.rgb;
         if (around > 0.0 && mean_now.a > 0.0 && dot(part, LUMA) > dot(found, LUMA)) found = part;
-        found *= open * gain_to_key(mean_now);
+        found *= open * gain_at(mean_now, p);
         light[p] = pack(found);
         return;
     }
@@ -460,7 +518,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     // Never under the least light asked for (estimate:<share>:<least>).
-    float3 floor_light = float3(1.0, 0.98, 0.94) * least * open * gain_to_key(cells[CELLS]);
+    float3 floor_light = float3(1.0, 0.98, 0.94) * least * open * gain_at(cells[CELLS], p);
     if (dot(found, LUMA) < dot(floor_light, LUMA)) found = floor_light;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
@@ -489,6 +547,8 @@ struct Pass {
     unshadow: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
+    /// Where the slow mean is copied for the log line ([`report_mean`]).
+    readback: ID3D12Resource,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
@@ -520,7 +580,34 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let air = pipeline("AIR", s!("clear_air"))?;
     let unshadow = pipeline("UNSHADOW", s!("unshadow"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
+    let readback = {
+        let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a small read-back buffer.
+        unsafe {
+            device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                None,
+                &mut readback,
+            )?;
+        }
+        readback.ok_or_else(windows::core::Error::empty)?
+    };
     Ok(Pass {
+        readback,
         root: root.ok_or_else(windows::core::Error::empty)?,
         keep,
         mean,
@@ -561,6 +648,9 @@ pub(crate) struct Views {
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The scene's depth, for [`Role::Resolve`].
     pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// The scene's stencil plane, for [`Role::Resolve`] when the program
+    /// has one ([`STENCIL`]).
+    pub(crate) stencil: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
     /// The size of the image, and how many slices it has.
     pub(crate) size: [u32; 2],
     pub(crate) slices: u32,
@@ -604,7 +694,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 17];
+    let mut words = [0u32; 19];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -622,6 +712,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let [key, most_gain] = key();
     words[15] = key.to_bits();
     words[16] = most_gain.to_bits();
+    words[17] = if key_inside() && views.stencil.is_some() { 1.0f32 } else { 0.0 }.to_bits();
+    words[18] = if key_air_hold() { 1.0f32 } else { 0.0 }.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -629,11 +721,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 19, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetComputeRootDescriptorTable(5, views.stencil.unwrap_or(views.depth));
         let run = |pso: &ID3D12PipelineState, x, y, z| {
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
@@ -644,6 +737,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.keep, 8, 9, 1);
                 run(&pass.mean, 1, 1, 1);
                 KEPT.store(true, Ordering::Relaxed);
+                report_mean(list, pass);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             // (Recorded by `unshadow`, above.)
@@ -661,6 +755,63 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     true
 }
 
+/// Every 5 s: a log line with the slow mean of the light around (as the last
+/// copy left it, 5 s old) and the gain the key gives for it, then a new copy
+/// of the mean (recorded in `list`, after the pass that made it).
+fn report_mean(list: &HostList, pass: &Pass) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    static COPIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|t| t.elapsed().as_secs_f32() < 5.0) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    if COPIED.load(Relaxed) {
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copy was recorded 5 s ago and has run; 16 bytes mapped.
+        unsafe {
+            if pass.readback.Map(0, None, Some(&mut data)).is_ok() {
+                let m = std::slice::from_raw_parts(data.cast::<f32>(), 4).to_vec();
+                pass.readback.Unmap(0, None);
+                let luma = 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
+                let [key, most] = key();
+                let gain = if key > 0.0 && m[3] > 0.0 { (key / luma.max(1e-4)).clamp(1.0, most.max(1.0)) } else { 1.0 };
+                tracing::info!(
+                    mean = ?[m[0], m[1], m[2]],
+                    luma,
+                    key,
+                    gain,
+                    inside_only = key_inside(),
+                    air_hold = key_air_hold(),
+                    "the indirect light's stand-in: slow mean of the light around and the key's gain"
+                );
+            }
+        }
+    }
+    list.keep(&pass.readback);
+    let l = &list.list;
+    // SAFETY: an open list; the mean pass just wrote the cells (promoted to
+    // unordered access in this list), the read-back buffer stays a copy
+    // destination.
+    unsafe {
+        l.ResourceBarrier(&[crate::host::transition(
+            &pass.cells,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        )]);
+        l.CopyBufferRegion(&pass.readback, 0, &pass.cells, CELLS * 16, 16);
+        l.ResourceBarrier(&[crate::host::transition(
+            &pass.cells,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        )]);
+    }
+    COPIED.store(true, Relaxed);
+}
+
 /// [`Role::LampShadows`]: every block of the lamps' shadow-mask table that
 /// a lamp has set to [`lamp_shadows_off`]'s word.
 fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
@@ -673,7 +824,7 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
-    let mut words = [0u32; 17];
+    let mut words = [0u32; 19];
     words[0] = word;
     words[6] = views.size[0];
     words[7] = views.size[1];
@@ -685,11 +836,12 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 19, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetComputeRootDescriptorTable(5, views.stencil.unwrap_or(views.depth));
         l.SetPipelineState(&pass.unshadow);
         l.Dispatch(views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
         uav_barrier(l);
