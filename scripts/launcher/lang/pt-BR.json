@@ -138,9 +138,18 @@
   "mcp.tool.set_option": "Põe uma opção num valor e salva na hora. Opções ligadas entre si mudam juntas (quadros gerados exige DLSS, capturar quadros exige a build de diagnóstico).",
   "mcp.tool.enable_option": "Liga uma opção de ligar/desligar e salva.",
   "mcp.tool.disable_option": "Desliga uma opção de ligar/desligar e salva.",
-  "mcp.tool.reset": "Volta todas as opções ao padrão e salva. O executável do jogo e o idioma ficam.",
+  "mcp.tool.reset": "Volta uma opção (id) ou todas ao padrão e salva. O executável do jogo e o idioma ficam.",
   "mcp.tool.env": "Devolve com o que o Jogar rodaria com as configurações salvas, sem rodar nada: os argumentos do play.ps1, as chaves e as linhas de comando dos passos de preparo.",
   "mcp.tool.version": "Devolve a versão e o commit do launcher.",
   "mcp.param.id": "O id da opção, por exemplo ray_tracing.",
-  "mcp.param.value": "O novo valor: on/off (ou true/false) para uma opção de ligar/desligar, um dos valores listados para uma escolha."
+  "mcp.param.value": "O novo valor: on/off (ou true/false) para uma opção de ligar/desligar, um dos valores listados para uma escolha.",
+  "mcp.param.reset_id": "A opção que volta ao padrão; sem ele, todas voltam.",
+  "mcp.param.language": "O idioma dos nomes e das dicas: en ou pt-BR. Sem ele, o idioma salvo.",
+
+  "error.not_toggle": "'{0}' não é uma opção de ligar/desligar. Mude-a com launcher_set_option para um destes: {1}.",
+  "error.unavailable_because": "'{0}' ainda não está nesta versão: {1}.",
+  "error.missing_argument": "{0} precisa do argumento '{1}'.",
+  "error.unknown_argument": "'{1}' não é argumento de {0}.",
+  "error.bad_argument": "O argumento '{1}' de {0} precisa ser {2}.",
+  "error.unknown_tool": "Não há ferramenta '{0}'."
 }

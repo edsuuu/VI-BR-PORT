@@ -138,9 +138,18 @@
   "mcp.tool.set_option": "Sets one option to a value and saves it at once. Options tied together change together (generated frames needs DLSS, frame capture needs the diagnostics build).",
   "mcp.tool.enable_option": "Turns an on/off option on and saves it.",
   "mcp.tool.disable_option": "Turns an on/off option off and saves it.",
-  "mcp.tool.reset": "Puts every option back to its default and saves. The game's executable and the language stay.",
+  "mcp.tool.reset": "Puts one option (id) or every option back to its default and saves. The game's executable and the language stay.",
   "mcp.tool.env": "Returns what Play would run with the saved settings, without running anything: the play.ps1 arguments, the switches, and the command lines of the preparing steps.",
   "mcp.tool.version": "Returns the launcher's version and commit.",
   "mcp.param.id": "The option's id, for example ray_tracing.",
-  "mcp.param.value": "The new value: on/off (or true/false) for an on/off option, one of the listed values for a choice."
+  "mcp.param.value": "The new value: on/off (or true/false) for an on/off option, one of the listed values for a choice.",
+  "mcp.param.reset_id": "The option to put back to its default; leave it out to put every option back.",
+  "mcp.param.language": "The language of the labels and hints: en or pt-BR. Leave it out for the saved one.",
+
+  "error.not_toggle": "'{0}' is not an on/off option. Set it with launcher_set_option to one of: {1}.",
+  "error.unavailable_because": "'{0}' is not on this version yet: {1}.",
+  "error.missing_argument": "{0} needs the argument '{1}'.",
+  "error.unknown_argument": "'{1}' is not an argument of {0}.",
+  "error.bad_argument": "The argument '{1}' of {0} must be {2}.",
+  "error.unknown_tool": "There is no tool '{0}'."
 }
