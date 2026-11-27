@@ -433,4 +433,36 @@ mod tests {
             back.Unmap(0, None);
         }
     }
+
+    /// A bake waits for the uploads on their way when it asks
+    /// ([`settle`]): one not sent yet makes it run out of its time; once it
+    /// is sent, the wait ends when it has run, and the texture is there.
+    #[test]
+    fn a_bake_waits_for_the_uploads_on_their_way() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        if crate::host::host().is_none() {
+            return;
+        }
+        // 128x128 BC7, eight levels.
+        let desc = [3u32, 0, 0, 0, 128, 0, 128, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
+        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
+        // SAFETY: memory of our own that stays.
+        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+        // SAFETY: as above.
+        unsafe { (0..whole).for_each(|i| at.add(i).write((i * 7) as u8)) };
+        let texture = crate::resource::texture_at(at as u64, &desc).unwrap();
+        crate::resource::want_level(texture, 0);
+        let copy = crate::resource::host_copy(texture).unwrap();
+        if !crate::pool::fresh(&copy.texture) {
+            return;
+        }
+        let Some(Taken::New(job)) = claim(texture, 0, u64::MAX) else { panic!("not taken") };
+        // Not sent: on its way, and never there in the time given.
+        let (waited, all) = settle(std::time::Duration::from_millis(40));
+        assert!(waited >= 1 && !all && !there(texture));
+        send(&job);
+        let (waited, all) = settle(std::time::Duration::from_secs(20));
+        assert!(waited >= 1 && all);
+        assert!(there(texture));
+    }
 }
