@@ -635,6 +635,9 @@ pub fn emit(
                 format!("{name}, early-outs by the console wave")
             };
             report(&name, &again);
+            if why && done(&again) {
+                eprintln!("WAVE64-OUTS {name}: {} of {} early-outs taken by the console wave", outs.len(), all_outs.len());
+            }
             done(&again).then_some(again)
         };
         let selective = |deep: bool, base: &structure::Structured, needs: &[usize]| {
@@ -662,6 +665,20 @@ pub fn emit(
                 let needs = lower::take_needs();
                 report(name, &again);
                 if done(&again) {
+                    if why {
+                        // what the skips that stay save: the instructions a host wave with no
+                        // lane for them leaves out, here and in the form without skips
+                        let all = form(ir::without_skips(p, deep));
+                        let under = lower::under_lane_branches(&q, &st);
+                        let before = all.as_ref().and_then(|f| lower::under_lane_branches(&f.0, &f.1));
+                        eprintln!(
+                            "WAVE64-SELECTIVE {name}: {} of {} skips left out; instructions under per-lane branches {:?} (without skips {:?})",
+                            chosen.len(),
+                            skips.len(),
+                            under,
+                            before
+                        );
+                    }
                     return Some(again);
                 }
                 if needs.is_empty() {
