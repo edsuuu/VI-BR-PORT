@@ -7,7 +7,9 @@
 //! (the prison walk 24.6 fps with them, 28.8 without; the opening 24.0 against
 //! 26.4). Left out, the sea near the boat is black. `auto` runs them only while
 //! the frame draws water ([`seen`]), with a hold of [`HOLD`] frames after the
-//! water leaves; otherwise they are left out as `0` leaves them out.
+//! water leaves; otherwise they are left out as `0` leaves them out. Each time
+//! they start again the water's temporal pass takes some frames to catch up
+//! ([`HOLD`]).
 //!
 //! What counts as drawing water is a pipeline whose programs carry one of the
 //! names in [`signs`] (`VICTORY_WATER_LIGHT_SIGN`, default the water surface's
@@ -38,12 +40,28 @@ pub(crate) fn mode_of(value: Option<&std::ffi::OsStr>) -> Mode {
 }
 
 /// Frames the programs go on running after the last frame that drew water:
-/// a second at the title's 30 fps. A shore, a bridge or a turn of the camera
-/// takes the water off screen for a few frames at a time; without a hold the
-/// light would stop and start again with it, and the first frame of each
-/// start shows what the programs wrote when they last ran (the decision of
-/// a frame can be taken before its water is recorded, [`Gate::runs`]).
+/// a second at the title's 30 fps (`VICTORY_WATER_LIGHT_HOLD=<frames>` sets
+/// another). A shore, a bridge or a turn of the camera takes the water off
+/// screen for a few frames at a time; without a hold the light would stop and
+/// start again with it.
+///
+/// Each start costs more than one frame. `CS_TransmissionVolumetrics_Temporal_Tiled`
+/// (`c7fd991b910dc7fe`) is not left out: in the boat capture it runs right
+/// after the two, on a history the frame before copied out of its own output,
+/// and it blends their output into that history. While they are left out it
+/// blends what they wrote when they last ran, or nothing at all if they never
+/// ran in the session (the state of `0`, where the sea is black). When they
+/// start again the history has to converge on their new output, so the sea
+/// can fade in from dark or from an old light over as many frames as the
+/// title's blend takes, not change in one. Leaving the temporal pass out with
+/// them would not help: its history would be just as old. Each start is
+/// counted ([`Gate::returned`]) so a run can tell how often this happens.
 pub(crate) const HOLD: u64 = 30;
+
+/// The hold, `VICTORY_WATER_LIGHT_HOLD` if it is a number, else [`HOLD`].
+fn hold_of(value: Option<&str>) -> u64 {
+    value.and_then(|v| v.trim().parse().ok()).unwrap_or(HOLD)
+}
 
 /// The default names of the programs whose pipelines count as water drawn.
 const SIGNS: &str = "PS_ResolveWaterSurface";
@@ -61,7 +79,7 @@ fn carries(container: &[u8], signs: &[Vec<u8>]) -> bool {
 }
 
 /// The decision for one frame, from the frames the water was seen in.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub(crate) struct Gate {
     /// The latest frame a water sign was recorded in.
     seen: Option<u64>,
@@ -83,6 +101,18 @@ pub(crate) struct Gate {
     /// screen; it can only happen in the first frame of water after more than
     /// [`HOLD`] frames without it, and this count says whether it does.
     pub(crate) late: u64,
+    /// Frames in which the programs ran after a frame they were left out of,
+    /// or for the first time: each can fade in through the temporal history
+    /// ([`HOLD`]).
+    pub(crate) returned: u64,
+    /// The hold in frames ([`hold_of`]).
+    hold: u64,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Gate { seen: None, decided: None, ran: 0, left: 0, signed: 0, late: 0, returned: 0, hold: HOLD }
+    }
 }
 
 impl Gate {
@@ -105,7 +135,10 @@ impl Gate {
         {
             return runs;
         }
-        let runs = self.seen.is_some_and(|s| s.saturating_add(HOLD) >= frame);
+        let runs = self.seen.is_some_and(|s| s.saturating_add(self.hold) >= frame);
+        if runs && self.decided.is_none_or(|(_, before)| !before) {
+            self.returned += 1;
+        }
         self.decided = Some((frame, runs));
         if runs {
             self.ran += 1;
@@ -124,6 +157,8 @@ static GATE: Mutex<Gate> = Mutex::new(Gate {
     left: 0,
     signed: 0,
     late: 0,
+    returned: 0,
+    hold: HOLD,
 });
 
 #[cfg(windows)]
@@ -186,7 +221,13 @@ pub(crate) fn leaves_out() -> bool {
     match mode() {
         Mode::Run => false,
         Mode::Off => true,
-        Mode::Auto => !gate().runs(crate::frame::current()),
+        Mode::Auto => {
+            static HOLD_ASKED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let hold = *HOLD_ASKED.get_or_init(|| hold_of(std::env::var("VICTORY_WATER_LIGHT_HOLD").ok().as_deref()));
+            let mut g = gate();
+            g.hold = hold;
+            !g.runs(crate::frame::current())
+        }
     }
 }
 
@@ -196,19 +237,21 @@ pub(crate) fn report() {
     if mode() != Mode::Auto {
         return;
     }
-    let (ran, left, signed, late) = {
+    let (ran, left, signed, late, returned, hold) = {
         let mut g = gate();
         (
             std::mem::take(&mut g.ran),
             std::mem::take(&mut g.left),
             std::mem::take(&mut g.signed),
             std::mem::take(&mut g.late),
+            std::mem::take(&mut g.returned),
+            g.hold,
         )
     };
     tracing::info!(
         "the water's tiled light (VICTORY_WATER_LIGHT=auto), since the last line: run in {ran} frames, left out of {left}; \
-         water drawn in {signed} frames (it runs while water was drawn in that frame or the {HOLD} before), \
-         {late} of them drawn after the frame was decided without the light"
+         water drawn in {signed} frames (it runs while water was drawn in that frame or the {hold} before), \
+         {late} of them drawn after the frame was decided without the light; started again {returned} times"
     );
 }
 
@@ -253,6 +296,29 @@ mod tests {
         g.seen(600);
         assert!(g.runs(600));
         assert_eq!(g.signed, 2);
+        // Started at 100 and again at 600, not in the frames of the hold.
+        assert_eq!(g.returned, 2);
+    }
+
+    #[test]
+    fn steady_water_starts_once() {
+        let mut g = Gate::default();
+        for f in 1..=100 {
+            g.seen(f);
+            assert!(g.runs(f));
+        }
+        assert_eq!(g.returned, 1);
+    }
+
+    #[test]
+    fn the_hold_can_be_set() {
+        assert_eq!(hold_of(None), HOLD);
+        assert_eq!(hold_of(Some("x")), HOLD);
+        assert_eq!(hold_of(Some(" 90 ")), 90);
+        let mut g = Gate { hold: 0, ..Gate::default() };
+        g.seen(10);
+        assert!(g.runs(10));
+        assert!(!g.runs(11));
     }
 
     #[test]
