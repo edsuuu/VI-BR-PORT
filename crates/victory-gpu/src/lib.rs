@@ -67,6 +67,7 @@ pub mod replay;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+pub mod rtcalls;
 mod safecopy;
 #[cfg(windows)]
 mod sampler;
