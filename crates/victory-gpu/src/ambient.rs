@@ -55,6 +55,11 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// The last program that writes the lamps' shadow-mask table before the
+    /// tiled lighting reads it (`CS_DenoiseShadowMaskLDSPacked`): a check
+    /// that can light every lamp as if nothing stood in its way
+    /// ([`lamp_shadows_off`]).
+    LampShadows,
 }
 
 /// The program's part in this, by its name in the container.
@@ -66,6 +71,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Radiance)
     } else if has(b"CS_AccumulateLocalLightInscatteringVolume") {
         Some(Role::Air)
+    } else if has(b"CS_DenoiseShadowMaskLDSPacked") {
+        Some(Role::LampShadows)
     } else {
         None
     }
@@ -79,6 +86,40 @@ pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
+/// Where the lamps' shadow-mask table is (7680x90 R32_UINT): per 8x8 block
+/// of the screen and lamp a word, 0 a block in full shadow, up to 255 one
+/// value for the block, above that a block of the mask atlas, all ones a
+/// block no lamp has. The tiled lighting (`TL_PS_*`, 0x28b0-0x2b64) reads it
+/// at table offset 968 and scales a lamp by `1 + (value - 1) * strength`.
+pub(crate) const LAMP_TABLE: (u8, u32) = (1, 24);
+
+/// `VICTORY_LAMP_SHADOWS=off`: every block of the lamps' shadow-mask table
+/// that a lamp has is set to one word, 255, after the title made the table
+/// (`off:<word>` sets that word instead; the title divides it by 255 or, by
+/// a flag of its constants, by 15). A check, not a way to run: lamps then
+/// light through walls. It tells whether a room that stays dark is dark
+/// because its lamps are in shadow (it lights up) or because no lamp of the
+/// tiled lighting reaches it (it does not). Unset (the default): the
+/// title's table.
+pub(crate) fn lamp_shadows_off() -> Option<u32> {
+    static SET: OnceLock<Option<u32>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_LAMP_SHADOWS").unwrap_or_default();
+        let rest = set.trim().strip_prefix("off")?;
+        match rest.strip_prefix(':') {
+            Some(word) => word.trim().parse().ok().filter(|&w: &u32| w <= 255),
+            None => rest.is_empty().then_some(255),
+        }
+    })
+}
+
+/// Whether the pass that follows a program of `role` runs.
+pub(crate) fn wanted(role: Role) -> bool {
+    match role {
+        Role::LampShadows => lamp_shadows_off().is_some(),
+        Role::Resolve | Role::Radiance | Role::Air => on(),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
@@ -257,6 +298,18 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 }
 #endif
 
+#ifdef UNSHADOW
+RWTexture2D<uint> table : register(u0);
+// Every block a lamp has, lit by it as if nothing stood in its way (the
+// word comes in the first constant's bits).
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void unshadow(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    if (table[at.xy] != 0xffffffffu) table[at.xy] = asuint(level);
+}
+#endif
+
 #ifdef RAISE
 RWTexture2D<uint> light : register(u0);
 float3 unpack(uint v) {
@@ -358,6 +411,7 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    unshadow: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
 }
@@ -389,6 +443,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let unshadow = pipeline("UNSHADOW", s!("unshadow"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -398,6 +453,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        unshadow,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -443,6 +499,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
+    if role == Role::LampShadows {
+        return unshadow(list, pass, views);
+    }
     let (level, constant, around) = match set() {
         Set::Off => return false,
         Set::Estimate(level) => (level, 0.0f32, 0.0f32),
@@ -504,6 +563,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
             }
             Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            // (Recorded by `unshadow`, above.)
+            Role::LampShadows => {}
             Role::Resolve => {
                 // (With the constant, only for the air's bound.)
                 if constant == 0.0 || air() > 0.0 {
@@ -513,6 +574,42 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
         }
+    }
+    true
+}
+
+/// [`Role::LampShadows`]: every block of the lamps' shadow-mask table that
+/// a lamp has set to [`lamp_shadows_off`]'s word.
+fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
+    let Some(word) = lamp_shadows_off() else {
+        return false;
+    };
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!(size = ?views.size, word, "the lamps' shadow-mask table is lit throughout (VICTORY_LAMP_SHADOWS)");
+    }
+    list.keep(&pass.cells);
+    list.keep(&pass.points);
+    let mut words = [0u32; 12];
+    words[0] = word;
+    words[6] = views.size[0];
+    words[7] = views.size[1];
+    let l = &list.list;
+    // SAFETY: an open list with the heap of the view set; the title's
+    // program has just written the table through it, so it is in the state
+    // the view needs. The pass reads no depth: the table's own view stands
+    // in for that table, as it does for the radiance's.
+    unsafe {
+        uav_barrier(l);
+        l.SetComputeRootSignature(&pass.root);
+        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRootDescriptorTable(1, views.depth);
+        l.SetComputeRootDescriptorTable(2, views.image);
+        l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
+        l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        l.SetPipelineState(&pass.unshadow);
+        l.Dispatch(views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+        uav_barrier(l);
     }
     true
 }
@@ -538,6 +635,7 @@ mod tests {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
+        assert_eq!(role(b"..CS_DenoiseShadowMaskLDSPacked_113e2add_Wrapped.."), Some(Role::LampShadows));
         assert_eq!(role(b"CS_TemporalResolve"), None);
     }
 
