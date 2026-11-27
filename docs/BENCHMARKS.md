@@ -65,3 +65,12 @@ standing still in the cell the title holds its cap, 30.0 fps (33.3 ms).
   (among them the one that builds the light lists per cluster); the exact wave-wide form is under test.
 - The card reads about 430 MB a frame in the layer's own compare passes; reducing that is the next
   frame-rate item, with the tree instance culling program (5 ms a frame for a handful of groups).
+
+## Community playthrough on an RTX 5070 Ti Laptop GPU
+
+- **Build** [`da55992`](https://github.com/edsuuu/VI-BR-PORT/commit/da559920c3f4a11b5c30acb45c7e905370c773a3), release. The Xbox package manifest reports version `1.0.2.1`.
+- **Test system** AMD Ryzen 9 8945HX, NVIDIA GeForce RTX 5070 Ti Laptop GPU (12 GB VRAM, driver 595.79), 32 GB RAM, Windows 11 build 26200.
+- **Runtime** Xbox Series S profile, 1920×1080 display mode reported to the title, and the title's upscaler (`VICTORY_UPSCALER=6`). The log also confirms ray-miss mode, relay stage 2, and card steps stage 2.
+- **Coverage** Parts of the prologue cutscenes, then the first mission's boat section. After going ashore, the tester continued on foot to look for Donnie and ended the session there. The log records the title suspending when the window closed.
+
+The run lasted about 12 minutes and 18 seconds. Across 135 FPS readings from the runtime log, the arithmetic mean was **9.6 FPS**, the median was **7.9 FPS**, and the lowest and highest readings were **2.1 FPS** and **30.9 FPS**. These figures cover the whole session, including cutscenes and gameplay. The log has no scene timestamps for calculating a separate boat-section average.
