@@ -10075,6 +10075,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        crate::rtcalls::frame();
         mesh_dip_check();
         #[cfg(feature = "diagnostics")]
         {
@@ -10209,6 +10210,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            crate::rtcalls::line();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)

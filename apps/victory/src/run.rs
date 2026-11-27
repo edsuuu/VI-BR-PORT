@@ -149,7 +149,10 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
-    let show = |name: &str, report: BindReport| {
+    // With VICTORY_DXR_TRACE the structure builder's calls are logged on the
+    // way to the title's own (off: bound as above).
+    let with_dlls = victory_hle::modules::bvh_builder::Interpose { inner: &with_dlls };
+    let show =|name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
             report.hle,
