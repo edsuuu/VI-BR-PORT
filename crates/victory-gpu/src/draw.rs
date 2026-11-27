@@ -310,24 +310,30 @@ pub(crate) fn in_place_indirect_line(frames: f64) {
     );
 }
 
-/// `VICTORY_INDIRECT_TRUST=1` (an experiment, off): indirect executions of
-/// one record without a count buffer read the title's record as it is, with
-/// no pass of ours before them. What it measures: every clamp is a compute
-/// dispatch of ours between waits for the card, in the middle of the
-/// title's draws (158 passes a frame walking in the prison, 464 with the
-/// in-place records clamped alone). What it gives up: the guard against a
-/// record nothing wrote (`crate::indirect`), which then runs as it is.
-/// With `VICTORY_AB` naming the switch (diagnostics builds): on in its phases on.
+/// `VICTORY_INDIRECT_TRUST=<frame>` (an experiment, off): from that frame
+/// on (`1`: from the first), indirect executions of one record without a
+/// count buffer read the title's record as it is, with no pass of ours
+/// before them. What it measures: every clamp is a compute dispatch of ours
+/// between waits for the card, in the middle of the title's draws (158
+/// passes a frame walking in the prison, 464 with the in-place records
+/// clamped alone). What it gives up: the guard against a record nothing
+/// wrote (`crate::indirect`), which then runs as it is. From the first frame
+/// the card hung within a second of the world's start (run prisao-s-trust0
+/// of 27 Nov: no line after the first frames, no device removal reported):
+/// the records of a world's first frames are not all written.
+/// With `VICTORY_AB` naming the switch (diagnostics builds): on in its
+/// phases on, from that frame too.
 fn trusts_records() -> bool {
+    static FROM: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let from = *FROM.get_or_init(|| std::env::var("VICTORY_INDIRECT_TRUST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
     #[cfg(feature = "diagnostics")]
     {
         static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
         if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_INDIRECT_TRUST")) {
-            return crate::ab::on(bit);
+            return crate::ab::on(bit) && crate::frame::current() >= from.max(1);
         }
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_TRUST").is_some_and(|v| v == "1"))
+    from > 0 && crate::frame::current() >= from
 }
 
 /// Whether indirect executions of one record are clamped in batches
