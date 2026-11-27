@@ -574,6 +574,69 @@ pub fn emit(
         // meeting of the host waves in it. `VICTORY_WAVE_SELECTIVE_SKIPS=0`: not tried (on by
         // default).
         let selective_on = std::env::var_os("VICTORY_WAVE_SELECTIVE_SKIPS").is_none_or(|v| v != "0");
+        // In the forms whose host waves exchange (the ones above without early-outs) a console
+        // wave none of whose lanes is left still walks the whole body with EXEC clear, its two
+        // host waves meeting at every exchange. Where a thread group is that one console wave
+        // (64 threads) its early-outs are kept and taken by the console wave instead
+        // ([`structure::structure_wide`]): the two host waves exchange whether some lane of
+        // theirs stays (`Lower::wave_wide`) and leave together when none does, as the console
+        // wave leaves. Only early-outs in blocks every lane runs and behind no scalar branch:
+        // the exchange is itself a meeting, which both host waves must reach, and they leave
+        // only together, so no barrier after it waits for threads that left (in a group of
+        // several console waves one could leave while the others meet, so those stay as they
+        // are). The others are left out as before. Tried before each form without
+        // early-outs, which follows if it does not translate.
+        // `VICTORY_WAVE_EARLY_OUTS_EXCHANGE=0`: not tried (on by default).
+        let one_wave = matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads.iter().product::<u32>() == 64);
+        let outs_on = one_wave && std::env::var_os("VICTORY_WAVE_EARLY_OUTS_EXCHANGE").is_none_or(|v| v != "0");
+        let all_outs: std::collections::HashSet<usize> =
+            if outs_on { ir::early_outs(p).into_iter().collect() } else { Default::default() };
+        let by_wave = |name: &str, deep: bool, skips: Option<&std::collections::HashSet<usize>>| {
+            if all_outs.is_empty() {
+                return None;
+            }
+            let pure: std::collections::HashSet<usize>;
+            let skips = match skips {
+                Some(s) => s,
+                None => {
+                    pure = ir::pure_skips(p, deep).into_iter().collect();
+                    &pure
+                }
+            };
+            let mut outs = all_outs.clone();
+            let (q, st) = loop {
+                if outs.is_empty() {
+                    return None;
+                }
+                let q = ir::without_some_skips(p, deep, skips, &outs).unwrap_or_else(|| p.clone());
+                let st = structure::structure_wide(&q, &outs).ok()?;
+                let all = lower::all_lane_blocks(&st)?;
+                let mut bad = Vec::new();
+                for &b in &outs {
+                    if !all.get(b).copied().unwrap_or(false) || !lower::scalar_branches_around(&st, &[b])?.is_empty() {
+                        bad.push(b);
+                    }
+                }
+                if bad.is_empty() {
+                    break (q, st);
+                }
+                for b in bad {
+                    outs.remove(&b);
+                }
+            };
+            let io = io::raise(&q, native).ok()?;
+            let res = resource::track(&q, &native.layout, native.stage, Some(&st)).ok()?;
+            lower::take_needs();
+            let again = emit_program(c, native, &q, &st, &io, &res);
+            lower::take_needs();
+            let name = if name.is_empty() {
+                "early-outs by the console wave".to_owned()
+            } else {
+                format!("{name}, early-outs by the console wave")
+            };
+            report(&name, &again);
+            done(&again).then_some(again)
+        };
         let selective = |deep: bool, base: &structure::Structured, needs: &[usize]| {
             let name = if deep { "without skips where needed, scalars followed" } else { "without skips where needed" };
             let skips: std::collections::HashSet<usize> = ir::pure_skips(p, deep).into_iter().collect();
@@ -589,6 +652,9 @@ pub fn emit(
                         eprintln!("WAVE64-RETRY {name}: stopped with {} of {} skips left out", before, skips.len());
                     }
                     return None;
+                }
+                if let Some(again) = by_wave(name, deep, Some(&chosen)) {
+                    return Some(again);
                 }
                 let (q, st, io, res) = form(ir::without_some_skips(p, deep, &chosen, &kept))?;
                 lower::take_needs();
@@ -608,6 +674,12 @@ pub fn emit(
             if i == 1 && selective_on {
                 let base = forms[0].1.as_ref().map_or(st, |f| &f.1);
                 if let Some(again) = selective(false, base, &base_needs) {
+                    return again.map(|(shader, _)| shader);
+                }
+            }
+            if f.is_some() {
+                let none = std::collections::HashSet::new();
+                if let Some(again) = by_wave(if i == 0 { "" } else { name }, false, (i == 0).then_some(&none)) {
                     return again.map(|(shader, _)| shader);
                 }
             }
@@ -653,6 +725,11 @@ pub fn emit(
                     }
                 }
                 let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
+                if deep.is_some()
+                    && let Some(again) = by_wave("without skips, scalars followed", true, None)
+                {
+                    return again.map(|(shader, _)| shader);
+                }
                 if let Some((p, st, io, res)) = &deep {
                     let again = emit_program(c, native, p, st, io, res);
                     report("without skips, scalars followed", &again);
