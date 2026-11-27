@@ -245,14 +245,21 @@ fn key() -> [f32; 2] {
 /// plane marks inside a room (an exterior night, and what a window shows,
 /// keep their light); `air` keeps the bound on what the air scatters where
 /// it was without the key (the slow mean it follows includes the added
-/// light), so the fog of a hall does not rise with its walls.
-fn key_flags() -> (bool, bool) {
-    static SET: OnceLock<(bool, bool)> = OnceLock::new();
+/// light), so the fog of a hall does not rise with its walls; `geo` divides
+/// the key by the slow log-average of the cells' luminance instead of their
+/// mean (a few bright windows and tubes pull the mean of a dark hall above a
+/// plain corridor's: run prisao-s-amb-t10).
+fn key_flags() -> (bool, bool, bool) {
+    static SET: OnceLock<(bool, bool, bool)> = OnceLock::new();
     *SET.get_or_init(|| {
         let set = std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default();
         let words: Vec<&str> = set.split(':').skip(2).map(str::trim).collect();
-        (words.contains(&"inside"), words.contains(&"air"))
+        (words.contains(&"inside"), words.contains(&"air"), words.contains(&"geo"))
     })
+}
+
+fn key_geo() -> bool {
+    key_flags().2
 }
 
 fn key_inside() -> bool {
@@ -279,10 +286,12 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=19, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
+#define RS "RootConstants(num32BitConstants=20, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
+// After the cells' places: the slow log-average of their luminance.
+#define GEO (2 * CELLS + 1)
 #define PX 160
 #define PY 90
 cbuffer Set : register(b0) {
@@ -290,7 +299,7 @@ cbuffer Set : register(b0) {
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float around;
     float lamps; float full; float least; float key;
-    float most_gain; float inside_only; float air_hold;
+    float most_gain; float inside_only; float air_hold; float geo_key;
 };
 Texture2D<float> depth : register(t0);
 // The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
@@ -309,7 +318,14 @@ static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 // itself raises the mean, so the gain settles below the ratio it starts at.
 float gain_to_key(float4 mean_now) {
     if (key <= 0.0 || mean_now.a <= 0.0) return 1.0;
-    return clamp(key / max(dot(mean_now.rgb, LUMA), 1e-4), 1.0, max(most_gain, 1.0));
+    // (`geo`: the log-average instead of the mean.)
+    float measured = dot(mean_now.rgb, LUMA);
+    if (geo_key > 0.0) {
+        float4 geo = cells[GEO];
+        if (geo.a <= 0.0) return 1.0;
+        measured = geo.x;
+    }
+    return clamp(key / max(measured, 1e-4), 1.0, max(most_gain, 1.0));
 }
 
 // The same at a texel of the screen: with inside_only, 1 where the stencil
@@ -356,6 +372,15 @@ void mean() {
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
     cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    // The log-average (geometric mean) of the cells' luminance: it follows
+    // the bulk of the picture, not a few windows and tubes (as the title's
+    // own meter, a histogram, does), followed slowly in the log.
+    float logs = 0;
+    for (uint k = 0; k < CELLS; k++) logs += log(dot(cells[k].rgb, LUMA) + 1e-3);
+    float4 geo_was = cells[GEO];
+    float geo_now = logs / CELLS;
+    float geo_log = geo_was.a > 0.0 ? lerp(geo_was.y, geo_now, follow) : geo_now;
+    cells[GEO] = float4(max(exp(geo_log) - 1e-3, 0.0), geo_log, 0.0, 1.0);
 }
 #endif
 
@@ -533,7 +558,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
+const CELL_BYTES: u64 = (2 * CELLS + 2) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -694,7 +719,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 19];
+    let mut words = [0u32; 20];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -714,6 +739,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[16] = most_gain.to_bits();
     words[17] = if key_inside() && views.stencil.is_some() { 1.0f32 } else { 0.0 }.to_bits();
     words[18] = if key_air_hold() { 1.0f32 } else { 0.0 }.to_bits();
+    words[19] = if key_geo() { 1.0f32 } else { 0.0 }.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -721,7 +747,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 19, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 20, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -774,18 +800,22 @@ fn report_mean(list: &HostList, pass: &Pass) {
         // SAFETY: the copy was recorded 5 s ago and has run; 16 bytes mapped.
         unsafe {
             if pass.readback.Map(0, None, Some(&mut data)).is_ok() {
-                let m = std::slice::from_raw_parts(data.cast::<f32>(), 4).to_vec();
+                let m = std::slice::from_raw_parts(data.cast::<f32>(), 8).to_vec();
                 pass.readback.Unmap(0, None);
                 let luma = 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
                 let [key, most] = key();
-                let gain = if key > 0.0 && m[3] > 0.0 { (key / luma.max(1e-4)).clamp(1.0, most.max(1.0)) } else { 1.0 };
+                let geo = m[4];
+                let measured = if key_geo() { geo } else { luma };
+                let gain = if key > 0.0 && m[3] > 0.0 { (key / measured.max(1e-4)).clamp(1.0, most.max(1.0)) } else { 1.0 };
                 tracing::info!(
                     mean = ?[m[0], m[1], m[2]],
                     luma,
+                    geo,
                     key,
                     gain,
                     inside_only = key_inside(),
                     air_hold = key_air_hold(),
+                    by_geo = key_geo(),
                     "the indirect light's stand-in: slow mean of the light around and the key's gain"
                 );
             }
@@ -803,6 +833,7 @@ fn report_mean(list: &HostList, pass: &Pass) {
             D3D12_RESOURCE_STATE_COPY_SOURCE,
         )]);
         l.CopyBufferRegion(&pass.readback, 0, &pass.cells, CELLS * 16, 16);
+        l.CopyBufferRegion(&pass.readback, 16, &pass.cells, (2 * CELLS + 1) * 16, 16);
         l.ResourceBarrier(&[crate::host::transition(
             &pass.cells,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -824,7 +855,7 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
-    let mut words = [0u32; 19];
+    let mut words = [0u32; 20];
     words[0] = word;
     words[6] = views.size[0];
     words[7] = views.size[1];
@@ -836,7 +867,7 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 19, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 20, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
