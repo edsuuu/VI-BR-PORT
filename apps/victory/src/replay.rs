@@ -465,8 +465,12 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
         }
     }
     println!("{} containers not found", missing.len());
-    victory_shader::emit::set_host_max_wave(64);
-    victory_shader::emit::set_host_rdna(true);
+    // As for an AMD card of 64-lane waves, unless `VICTORY_HOST_MAX_WAVE` / `VICTORY_HOST_RDNA`
+    // say otherwise, as for `translate`: a capture made on a card of 32-lane waves (NVIDIA)
+    // runs its programs in other forms, which a replay there must be given to compare.
+    let max_wave = std::env::var("VICTORY_HOST_MAX_WAVE").ok().and_then(|v| v.parse().ok());
+    victory_shader::emit::set_host_max_wave(max_wave.unwrap_or(64));
+    victory_shader::emit::set_host_rdna(std::env::var_os("VICTORY_HOST_RDNA").is_none_or(|v| v != "0"));
     victory_shader::emit::set_view_heap_limit(view_limit);
     victory_shader::emit::set_raw_views(raw_views);
     let all: Vec<_> = wanted.iter().collect();
