@@ -88,6 +88,7 @@ fn build() -> [u8; 32] {
             "VICTORY_COUNTED_WAVE64",
             "VICTORY_COUNTED_BARRIERS",
             "VICTORY_UNIFORM_OPERANDS",
+            "VICTORY_LDS_ATOMIC_READS",
             // Whether the ray-tracing node test always misses.
             "VICTORY_RT_MISS",
         ] {

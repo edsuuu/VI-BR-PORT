@@ -1359,6 +1359,9 @@ fn meeting_mode() -> u32 {
 /// barrier as before. What that cannot order is a write and a read inside one region (blocks
 /// joined without an all-lane block between them): refused.
 /// shortcut: two writes in one region are taken not to hit the same dword from both halves.
+/// With `VICTORY_LDS_ATOMIC_READS=1` ([`lds_atomics_read`]) an LDS atomic counts as a read
+/// too, and a region whose accesses are all one commuting reduction ([`one_reduction`]) is
+/// still taken.
 fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option<Vec<(bool, bool)>> {
     let n = st.exits.len();
     let succ = |b: usize| -> Vec<usize> {
@@ -1386,6 +1389,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     // per region: LDS reads, LDS writes
+    let atomics_read = lds_atomics_read();
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
     for (b, block) in p.blocks.iter().enumerate().take(n) {
@@ -1402,6 +1406,9 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
                 reads[r] = true;
             } else {
                 writes[r] = true;
+                // (an atomic reads the dword it changes, returned or not: only plain stores
+                // write without reading)
+                reads[r] |= atomics_read && !(name.starts_with("ds_write_b") || name.starts_with("ds_write2"));
             }
         }
     }
@@ -1412,7 +1419,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_some_and(|v| v == "1");
     for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
-        if !(flags_on && lds_flag_region(p, st, &blocks)) {
+        if !(flags_on && lds_flag_region(p, st, &blocks) || atomics_read && one_reduction(p, &blocks)) {
             return None;
         }
     }
@@ -1429,6 +1436,44 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
         }
     }
     Some(meet)
+}
+
+/// Whether an LDS atomic counts as a read of its dword in [`lds_meetings`]
+/// (`VICTORY_LDS_ATOMIC_READS=1`; off by default, which counts it as a write only, as before).
+/// It reads what it changes: a minimum taken by one host wave and an add taken by the other in
+/// one region give a value that depends on which half went first, where the console's lanes
+/// ran in step. Part of the shader cache's key.
+fn lds_atomics_read() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_LDS_ATOMICS_READ.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LDS_ATOMIC_READS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Stands for `VICTORY_LDS_ATOMIC_READS` in a test, for its thread only.
+    static TEST_LDS_ATOMICS_READ: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether every LDS access of a lane-branch region (`blocks`) is one and the same commuting
+/// integer reduction that returns nothing (all `ds_add_u32`, say): whichever host wave runs
+/// first, each dword ends with the same value, and nothing in the region sees one in between.
+fn one_reduction(p: &Program, blocks: &[usize]) -> bool {
+    let mut ops = blocks.iter().flat_map(|&b| &p.blocks[b].insts).filter_map(|i| {
+        let name = i.name();
+        (matches!(i.fields, Fields::Ds { .. }) && !name.starts_with("ds_swizzle") && !name.contains("permute"))
+            .then_some(name)
+    });
+    let Some(first) = ops.next() else {
+        return false;
+    };
+    matches!(
+        first,
+        "ds_add_u32" | "ds_sub_u32" | "ds_and_b32" | "ds_or_b32" | "ds_xor_b32" | "ds_min_i32" | "ds_max_i32" | "ds_min_u32" | "ds_max_u32"
+    ) && ops.all(|op| op == first)
 }
 
 /// Whether a lane-branch region (`blocks`, see [`lds_meetings`]) that both reads and writes
@@ -13868,6 +13913,40 @@ mod tests {
             assert_eq!(uniform.contains(&swapped), !exact, "the swap, exact {exact}");
             assert_eq!(uniform.contains(&execz), !exact, "src_execz, exact {exact}");
             assert!(uniform.contains(&one), "a constant, exact {exact}");
+        }
+    }
+
+    /// Two LDS atomics on one dword inside `if (t < s0)`, which two host waves run one after
+    /// the other: a minimum then an add depends on that order, two adds do not. Before
+    /// `VICTORY_LDS_ATOMIC_READS=1` both regions were taken (atomics counted as writes only).
+    #[test]
+    fn lds_atomics_in_one_region_are_taken_only_when_they_commute() {
+        for (first, second, commute) in [(7u32, 0u32, false), (0, 0, true), (7, 7, true)] {
+            let words = [
+                0x7E12_0280, // v_mov_b32 v9, 0
+                0x7E04_0281, // v_mov_b32 v2, 1
+                0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+                0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+                0xBF88_0004, // s_cbranch_execz to the restore
+                0x36 << 26 | first << 18,
+                2 << 8 | 9, // ds_min_u32 / ds_add_u32 v9, v2
+                0x36 << 26 | second << 18,
+                2 << 8 | 9, // the same, or the other
+                0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+                S_ENDPGM,
+            ];
+            let code: Vec<u8> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            let p = ir::build(&code, true, 16).unwrap();
+            let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+            assert!(names.contains(&"ds_add_u32") || names.contains(&"ds_min_u32"), "{names:?}");
+            let st = structure::structure(&p).unwrap();
+            let all = super::all_lane_blocks(&st).unwrap();
+            for on in [false, true] {
+                let was = super::TEST_LDS_ATOMICS_READ.replace(Some(on));
+                let taken = super::lds_meetings(&p, &st, &all).is_some();
+                super::TEST_LDS_ATOMICS_READ.set(was);
+                assert_eq!(taken, !on || commute, "ops {first} then {second}, atomics read {on}");
+            }
         }
     }
 
