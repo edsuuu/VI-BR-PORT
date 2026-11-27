@@ -1814,8 +1814,10 @@ impl<'a> Lower<'a> {
                     pairs = Some(s.lds_dwords);
                     s.lds_dwords += group / 64;
                 }
-            } else if console_lanes && group > wave && group_counter() {
-                // a host wave's threads from the group counter, not its rounded first flat id
+            } else if console_lanes && wave == 32 && group > wave && s.lds_dwords < 8192 && group_counter() {
+                // a host wave's threads from the group counter, not its rounded first flat id (in
+                // waves of 32, where a card was seen to fill a 2-D group otherwise; not where its
+                // dword would take the LDS past 32 KiB)
                 ticket = Some(s.lds_dwords);
                 s.lds_dwords += 1;
             }
