@@ -118,14 +118,96 @@ MCP server or `-Set` shows in an open window within a second.
 
 ## The MCP server
 
-`scripts\launcher-mcp.ps1` serves the launcher's options to an MCP client over stdio, with
-the same saved file as the window: an option turned off through it shows as off in an open
-window. Its tools list the options, read the settings, set an option, turn an on/off option
-on or off, reset to the defaults, return what Play would run (a dry run that starts nothing)
-and return the version. To register it with Claude Code:
+`scripts\launcher-mcp.ps1` lets an MCP client (Claude Code, Claude Desktop or any other)
+read and change the launcher's options. It works on the same saved file as the window, so an
+option turned off through it shows as off in an open window. **It only changes settings.** No
+tool starts the game, builds, or runs a command. No tool takes a path, a command or a free
+environment variable. The only file it writes is the saved settings file.
+
+It speaks the Model Context Protocol over stdio: newline-delimited JSON-RPC 2.0, UTF-8 without
+BOM. Only protocol messages go to stdout; its one log line goes to stderr. It handles
+`initialize` (it answers with the client's protocol version when it supports it, else with
+the newest it supports: 2025-11-25, 2025-06-18, 2025-03-26 or 2024-11-05),
+`notifications/initialized`, `ping`, `tools/list` and `tools/call`. It also answers a batch
+(a JSON array). A method it does not know gets -32601. Bad params, an unknown tool or
+arguments outside a tool's schema get -32602. A line that is not JSON gets -32700, and the
+server keeps going.
+
+| Tool | Arguments | What it does |
+|---|---|---|
+| `launcher_list_options` | `language?` (`en`, `pt-BR`) | every option: id, label, hint, group, kind, values (with their labels and whether they are on this branch), default, current value, `available`, and why not when it is not |
+| `launcher_get_config` | none | the saved settings: every option's value, `game_exe`, `language`, the file's path |
+| `launcher_set_option` | `id`, `value` | sets one option and saves at once. `value` is true/false (or on/off) for an on/off option and one of the listed values for a choice. Rules between options apply. The answer names every option that moved, the ones a rule moved too |
+| `launcher_enable` | `id` | turns an on/off option on and saves |
+| `launcher_disable` | `id` | turns an on/off option off and saves |
+| `launcher_reset` | `id?` | puts that option, or every option, back to its default and saves. `game_exe` and `language` stay |
+| `launcher_env` | none | a dry run of Play: the `play.ps1` arguments, the `-More` switches, every `VICTORY_*` switch of the run, `--jobs`, and the steps with their command lines. Nothing is started |
+| `launcher_version` | none | the version and commit, read once when the server starts |
+
+A tool refuses, with `isError: true` and the reason as plain text, when:
+
+- the id is not in `options.json`;
+- the value is not one the option takes;
+- the option or the value is not on this branch (`available: false`). The note from
+  `options.json` says why.
+
+An example (stdin lines start with `>`, stdout lines with `<`; the result's text is shortened):
+
+```text
+> {"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"example","version":"1"}}}
+< {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"vi-br-port-launcher","version":"0.1.0"},"instructions":"Reads and changes the launcher's saved options, the same ones its window shows."}}
+> {"jsonrpc":"2.0","method":"notifications/initialized"}
+> {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"launcher_enable","arguments":{"id":"capture_frames"}}}
+< {"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"{\n  \"id\": \"capture_frames\",\n  \"value\": true,\n  \"changed\": {\n    \"build\": \"diag\",\n    \"capture_frames\": true\n  },\n  \"saved\": \"C:\\\\Users\\\\<you>\\\\AppData\\\\Roaming\\\\VI-BR-PORT\\\\launcher.json\",\n  \"options\": {...}\n}"}],"isError":false}}
+> {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"launcher_enable","arguments":{"id":"reflex"}}}
+< {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"'reflex' is not on this version yet: NVIDIA Reflex is on another branch."}],"isError":true}}
+> {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"launcher_set_option","arguments":{"id":"jobs","value":"64"}}}
+< {"jsonrpc":"2.0","id":4,"result":{"content":[{"type":"text","text":"'64' is not a value of 'jobs'. The values are: 8, 12, 20."}],"isError":true}}
+```
+
+Turning `capture_frames` on also moved `build` to `diag`, because frame capture needs the
+diagnostics build.
+
+### Registering it
+
+In a client that takes a JSON configuration (Claude Desktop's `claude_desktop_config.json`,
+a project's `.mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "vi-br-port-launcher": {
+      "command": "pwsh",
+      "args": ["-NoProfile", "-File", "<repository>\\scripts\\launcher-mcp.ps1"]
+    }
+  }
+}
+```
+
+With Windows PowerShell instead of PowerShell 7, use `"command": "powershell"` and
+`"args": ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "<repository>\\scripts\\launcher-mcp.ps1"]`.
+With Claude Code:
 
 ```powershell
-claude mcp add launcher -- powershell -NoProfile -ExecutionPolicy Bypass -File <repository>\scripts\launcher-mcp.ps1
+claude mcp add vi-br-port-launcher -- pwsh -NoProfile -File <repository>\scripts\launcher-mcp.ps1
+```
+
+`VICTORY_LAUNCHER_CONFIG=<file>` in the server's environment points it at another settings
+file.
+
+### Its self-check
+
+`scripts\launcher\Test-Mcp.ps1` starts the server as a child process with no window, on a
+temporary settings file. It talks to the server as a client does and checks every answer and
+the saved file: initialize, tools/list, a set, an enable, a disable, the rules between
+options, a refused id, a refused value, an option not on this branch, arguments outside a
+schema, a malformed line, a batch, the dry run and both resets. It also checks that stdout
+has no BOM and nothing but protocol lines, and that the server wrote no file but the settings.
+The server runs on the same PowerShell as the check:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\launcher\Test-Mcp.ps1
+pwsh -NoProfile -File scripts\launcher\Test-Mcp.ps1
 ```
 
 ## Files
@@ -151,6 +233,8 @@ claude mcp add launcher -- powershell -NoProfile -ExecutionPolicy Bypass -File <
 | `scripts/launcher/PlayRunner.ps1` | Play on a background runspace, its progress, the hidden window while the game runs |
 | `scripts/launcher/Snapshot.ps1` | `-Snapshot`: the window drawn into a PNG |
 | `scripts/launcher/Test-Launcher.ps1` | the self-check |
+| `scripts/launcher/McpTools.ps1`, `McpProtocol.ps1` | the MCP server's tools and its JSON-RPC part |
+| `scripts/launcher/Test-Mcp.ps1` | the MCP server's self-check |
 
 ## Em português
 
@@ -164,3 +248,10 @@ usa sem parâmetros (`scripts\launcher.ps1 -Check` confere). Opções cujo códi
 branch (DLSS, quadros gerados, Reflex, luz de dia e de noite) aparecem desativadas e nunca são
 enviadas. Pela linha de comando: `-Get`, `-Set ray_tracing=on`, `-Reset`, `-PrintEnv`,
 `-Version`.
+
+O servidor MCP (`scripts\launcher-mcp.ps1`) deixa um cliente MCP listar as opções, ligar e
+desligar (`launcher_enable`, `launcher_disable`), mudar um valor (`launcher_set_option`),
+voltar ao padrão (`launcher_reset`) e ver com o que o Jogar rodaria (`launcher_env`, sem rodar
+nada). Ele só muda configurações, no mesmo arquivo que a janela usa. Não abre o jogo, não
+compila e não roda comando. Para registrar, use o JSON da seção "Registering it" acima. Para
+conferir, rode `scripts\launcher\Test-Mcp.ps1`.
