@@ -938,8 +938,10 @@ fn removable_branches(p: &Program, deep: bool) -> Vec<(usize, usize, bool)> {
             }
         }
         // no loop in it that runs on for ever with every lane out
-        if keeps_lane_loops() && lane_loop(p, target, &inside) {
-            return None;
+        match skip_loops() {
+            SkipLoops::Lane if lane_loop(p, target, &inside) => return None,
+            SkipLoops::Scalar if scalar_loop(p, &inside) => return None,
+            _ => {}
         }
         // the join sees no scalar the region changed
         let join = &p.blocks[target];
@@ -985,11 +987,74 @@ fn removable_branches(p: &Program, deep: bool) -> Vec<(usize, usize, bool)> {
     out
 }
 
-/// Whether a skip whose region holds a loop [`lane_loop`] finds is kept (on by default;
-/// `VICTORY_WAVE_SKIP_LOOPS=0`: such a skip is left out as before).
-fn keeps_lane_loops() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_SKIP_LOOPS").is_none_or(|v| v != "0"))
+/// Which skips around loops are kept, not left out as pure ones (`VICTORY_WAVE_SKIP_LOOPS`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SkipLoops {
+    /// `=0`: none, as before.
+    Off,
+    /// Unset or `=1` (the default): those around a loop [`lane_loop`] finds.
+    Lane,
+    /// `=scalar`: those around a loop [`scalar_loop`] finds instead.
+    Scalar,
+}
+
+fn skip_loops() -> SkipLoops {
+    #[cfg(test)]
+    if let Some(k) = TEST_SKIP_LOOPS.get() {
+        return k;
+    }
+    static KIND: std::sync::OnceLock<SkipLoops> = std::sync::OnceLock::new();
+    *KIND.get_or_init(|| match std::env::var("VICTORY_WAVE_SKIP_LOOPS").as_deref() {
+        Ok("0") => SkipLoops::Off,
+        Ok("scalar") => SkipLoops::Scalar,
+        _ => SkipLoops::Lane,
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`skip_loops`] as given (unset: the switch).
+    static TEST_SKIP_LOOPS: std::cell::Cell<Option<SkipLoops>> = const { std::cell::Cell::new(None) };
+}
+
+/// Whether the region `inside` of a skip holds a loop that goes round on a scalar test: a
+/// `s_cbranch_scc0` / `s_cbranch_scc1` whose SCC a scalar compare (`s_cmp_*`, `s_bitcmp*`)
+/// wrote, or a join (no one instruction wrote it), and which leads back to itself inside the
+/// region. Walked with EXEC clear, the bounds of such a loop are whatever a first-lane read found
+/// in lanes that never wrote them, and it may go round to the iteration limit. The rule of
+/// another fork's translator (f299fba1a, remote fxc), which it applies to the wave-wide form only;
+/// here it stands in for [`lane_loop`] where pure skips are found, so that the two can be
+/// compared program by program.
+fn scalar_loop(p: &Program, inside: &[bool]) -> bool {
+    for (x, block) in p.blocks.iter().enumerate().filter(|&(x, _)| inside[x]) {
+        let Some(last) = block.insts.last() else { continue };
+        if !matches!(last.name(), "s_cbranch_scc0" | "s_cbranch_scc1") {
+            continue;
+        }
+        let scalar = last.read(Reg::Scc).is_none_or(|scc| {
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find(|i| i.write(Reg::Scc) == Some(scc))
+                .is_none_or(|i| i.name().starts_with("s_cmp_") || i.name().starts_with("s_bitcmp"))
+        });
+        if !scalar {
+            continue;
+        }
+        // round: back to this block inside the region
+        let mut seen = vec![false; p.blocks.len()];
+        let mut stack = block.exit.successors();
+        while let Some(y) = stack.pop() {
+            if y == x {
+                return true;
+            }
+            if y >= p.blocks.len() || !inside[y] || std::mem::replace(&mut seen[y], true) {
+                continue;
+            }
+            stack.extend(p.blocks[y].exit.successors());
+        }
+    }
+    false
 }
 
 /// Whether the region `inside` of a skip (to `target`) holds a loop that, walked with every
@@ -1949,6 +2014,32 @@ mod tests {
         let idle = skip(&[SET, USE], &[0xBEFE_0406, 0xBEFE_040C, 0x7E04_0200]);
         assert!(without_skips(&idle, false).is_none());
         assert_eq!(skips(&without_skips(&idle, true).expect("left out")), 0);
+    }
+
+    /// `if (v0 < s0) { for (s6 = 0; s6 < s1; s6++) {} }`: a loop on a scalar test inside a
+    /// skip, whose exit asks nothing of the lanes. `VICTORY_WAVE_SKIP_LOOPS=scalar` keeps the
+    /// skip; the default rule (loops that end only with a lane left) and `=0` leave it out.
+    #[test]
+    fn a_skip_around_a_loop_on_a_scalar_test_is_kept_only_by_the_scalar_rule() {
+        let p = skip(
+            &[
+                0xBE86_0380, // s_mov_b32 s6, 0
+                0x8106_8106, // loop: s_add_i32 s6, s6, 1
+                0xBF09_0106, // s_cmp_ge_u32 s6, s1
+                0xBF84_FFFD, // s_cbranch_scc0 loop
+            ],
+            &[],
+        );
+        assert_eq!(skips(&p), 1);
+        let pure = |k: SkipLoops| {
+            let was = TEST_SKIP_LOOPS.replace(Some(k));
+            let n = pure_skips(&p, true).len();
+            TEST_SKIP_LOOPS.set(was);
+            n
+        };
+        assert_eq!(pure(SkipLoops::Off), 1);
+        assert_eq!(pure(SkipLoops::Lane), 1, "the loop's exit is no lane test");
+        assert_eq!(pure(SkipLoops::Scalar), 0, "kept: the loop goes round on s6 < s1");
     }
 
     #[test]
