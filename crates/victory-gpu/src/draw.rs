@@ -66,6 +66,10 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a stage's tables are walked: whether that stage is a pixel
+    /// program of the characters' G-buffer pass (`Shader::peds`).
+    #[cfg(feature = "diagnostics")]
+    static PED_STAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
     /// milliseconds and the bytes that run may take, in place of the
     /// pass's own per frame.
@@ -1606,6 +1610,8 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            #[cfg(feature = "diagnostics")]
+            PED_STAGE.set(stage.shader.peds);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
@@ -1617,6 +1623,8 @@ impl State {
                 compute,
             );
             STORES.set(true);
+            #[cfg(feature = "diagnostics")]
+            PED_STAGE.set(false);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -4350,6 +4358,15 @@ impl RecordHash {
 
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
     const UNORDERED_ACCESS: u32 = 0x8;
+    // Where the title placed a texture it names by memory (logged with what
+    // a character's draw reads: ops lines name such views by address).
+    #[cfg(feature = "diagnostics")]
+    let placed_at = match view {
+        View::Placed(false, resource, desc) if resource[0] != 1 => {
+            Some(u64::from(desc[10]) | u64::from(desc[11]) << 32)
+        }
+        _ => None,
+    };
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
     // Buffer views read title memory: their range is copied at submission;
@@ -4409,6 +4426,12 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // every frame are never written in it) are saved too.
             #[cfg(feature = "diagnostics")]
             crate::capture::note_read_depth(*resource as This);
+            // What a character's G-buffer draw samples (the guard's arm
+            // that shows a normal map's blue).
+            #[cfg(feature = "diagnostics")]
+            if PED_STAGE.get() {
+                crate::capture::note_ped_read(*resource as This, placed_at);
+            }
             #[cfg(feature = "diagnostics")]
             if tracing::enabled!(tracing::Level::DEBUG)
                 && let Some(t) = crate::resource::host_resource(*resource as This)

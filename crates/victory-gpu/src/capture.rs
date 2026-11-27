@@ -408,6 +408,52 @@ pub(crate) fn note_read_depth(resource: crate::object::This) {
     }
 }
 
+/// With `VICTORY_DUMP_PED_TEXTURES=1` as well: the textures the title fills
+/// that a pixel program of its characters' G-buffer pass (`PS_DeferredPed*`)
+/// reads through a table, saved like targets (block-compressed ones as
+/// their level-0 blocks, `.bin`, which `scripts/bc-png.mjs` turns into
+/// pictures). Each is logged once with the title address it was placed at:
+/// a frame's ops lines name placed views by address, the files by resource.
+/// Whether the guard's arm, which shows a normal map's flat blue, samples a
+/// colour texture that holds a normal map (its bytes) or a normal map (the
+/// view), is told by these.
+pub(crate) fn note_ped_read(resource: crate::object::This, placed_at: Option<u64>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_DUMP_PED_TEXTURES"))
+        || resource.is_null()
+        || !dump_on()
+    {
+        return;
+    }
+    let frame = crate::queue::presented() + 1;
+    if !listed(frame) {
+        return;
+    }
+    let Some(copy) = crate::resource::host_copy(resource).filter(|t| t.flags() & 0x7 == 0) else {
+        return;
+    };
+    let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+    // (A frame's characters read a few hundred; more is something else.)
+    if targets.len() >= 1500 || targets.iter().any(|&(r, _)| r == resource as usize) {
+        return;
+    }
+    // SAFETY: a live resource.
+    let d = unsafe { copy.texture.GetDesc() };
+    tracing::info!(
+        frame,
+        index = targets.len(),
+        ?resource,
+        address = format_args!("{:#x}", placed_at.unwrap_or(0)),
+        width = d.Width,
+        height = d.Height,
+        format = d.Format.0,
+        levels = d.MipLevels,
+        title_level_of_level_0 = copy.base,
+        "a texture a character's G-buffer draw samples (saved with the frame's targets)"
+    );
+    targets.push((resource as usize, copy));
+}
+
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -529,6 +575,36 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
+        // Block-compressed (textures characters sample, `note_ped_read`):
+        // the blocks as they are, one row of blocks after another, for
+        // `scripts/bc-png.mjs`. (Their footprint has a row a block high: the
+        // mapping is shorter than the texel rows times the pitch.)
+        let block = match f.Format.0 {
+            70..=72 | 79..=81 => 8,
+            73..=78 | 82..=84 | 94..=99 => 16,
+            _ => 0,
+        };
+        if block > 0 {
+            let (across, down) = (f.Width.div_ceil(4) as usize * block, f.Height.div_ceil(4) as usize);
+            if down > 0
+                && let Some(folder) = folder()
+            {
+                let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * (down - 1) + across);
+                let mut raw = Vec::with_capacity(across * down);
+                for y in 0..down {
+                    raw.extend_from_slice(&rows[y * pitch..y * pitch + across]);
+                }
+                let path = folder.join(format!(
+                    "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}-s{slice}.bin",
+                    f.Width, f.Height, f.Format.0
+                ));
+                if let Err(e) = std::fs::write(&path, raw) {
+                    tracing::warn!(error = %e, path = %path.display(), "blocks not saved");
+                }
+            }
+            buffer.Unmap(0, None);
+            return;
+        }
         let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.

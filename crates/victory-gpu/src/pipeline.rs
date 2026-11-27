@@ -67,6 +67,11 @@ pub(crate) struct Shader {
     /// A pixel program of the title's decoration bake ([`bakes`]).
     #[cfg(windows)]
     pub(crate) bakes: bool,
+    /// A pixel program of the title's characters' G-buffer pass
+    /// (`PS_DeferredPed*`): what it samples a capture can save
+    /// ([`crate::capture::note_ped_read`]).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) peds: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -121,6 +126,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 bakes: bakes(bytes),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                peds: stage == "pixel" && bytes.windows(14).any(|w| w == b"PS_DeferredPed"),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
