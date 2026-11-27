@@ -94,6 +94,10 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    #[cfg(test)]
+    if let Some(counted) = TEST_COUNTED.get() {
+        return lower_counted(parts, counted);
+    }
     lower_counted(parts, counted_in_threads(parts))
 }
 
@@ -1810,6 +1814,9 @@ pub(super) fn host_max_wave() -> u32 {
 thread_local! {
     /// A test's host wave size, for its thread only ([`set_host_max_wave`] is the process's).
     pub(super) static TEST_HOST_WAVE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    /// Whether [`lower`] counts a test's program in threads, in place of [`counted_in_threads`]
+    /// (a test program reads no spilled table), for its thread only.
+    pub(super) static TEST_COUNTED: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
 pub(super) fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
@@ -3023,7 +3030,9 @@ impl<'a> Lower<'a> {
             let all = self.s.m.cmp(original, pred::EQ, limit, zero);
             let inside = self.s.m.cmp(original, pred::IULT, x, limit);
             let runs = self.s.m.bin(original, Bin::Or, all, inside);
-            if self.halves.is_some() || self.exchange.is_some() {
+            // (the paired form: a host lane carries two console lanes, of which only the
+            // lower may have been launched, and its branches are the console wave's)
+            if self.halves.is_some() || self.exchange.is_some() || PAIRED.get() {
                 // A console wave in two host waves exchanges through group
                 // barriers, which every thread must reach: the threads stay.
                 self.partial_active = Some(runs);

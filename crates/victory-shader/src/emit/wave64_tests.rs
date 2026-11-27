@@ -860,5 +860,118 @@ fn a_loop_lanes_leave_one_by_one_is_taken_wave_wide_before_host_waves_meet_in_it
     assert_eq!(lower::branches_around(&st, &[head]), Some(Vec::new()));
 }
 
+/// A program of the structure builder's kind, counted in threads (`USER_DISPATCH_THREADS_X`):
+/// every lane the console launched adds 1 to dword t (its thread in the group) and its wave's
+/// number of lanes in EXEC (`s_bcnt1` of EXEC: on the console, the lanes launched) to dword
+/// 128 + t. `barrier`: the group meets first (`s_barrier`), so no lane can leave at entry.
+fn counted_program(wave64: bool, threads: u32, barrier: bool) -> NativeProgram {
+    let mut body = vec![
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+        // s_bcnt1_i32_b64 s6, exec / s_bcnt1_i32_b32 s6, exec_lo
+        if wave64 { 0xBE86_107E } else { 0xBE86_0F7E },
+    ];
+    if barrier {
+        body.push(0xBF8A_0000); // s_barrier
+    }
+    body.extend([
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0xE0C8_1000,
+        0x8002_0201, // buffer_atomic_add v2, v1, s[8:11], 0 offen
+        0x7E06_0206, // v_mov_b32 v3, s6
+        0xE0C8_1200,
+        0x8002_0301, // buffer_atomic_add v3, v1, s[8:11], 0 offen offset:512
+    ]);
+    native_of(&body, wave64, threads)
+}
+
+/// What the console leaves in [`counted_program`]'s 256 dwords after `groups` groups of
+/// `threads` with a count of `count` threads (0: all), in waves of `wave` lanes.
+fn counted_expected(threads: u32, groups: u32, wave: u32, count: u32) -> Vec<u32> {
+    let total = threads * groups;
+    let active = if count == 0 { total } else { count.min(total) };
+    let mut out = vec![0u32; 256];
+    for g in 0..groups {
+        for t in 0..threads {
+            let x = g * threads + t;
+            if x < active {
+                out[t as usize] += 1;
+                let first = g * threads + t / wave * wave;
+                out[128 + t as usize] += (active - first).min(wave);
+            }
+        }
+    }
+    out
+}
+
+/// Runs a [`counted_program`]'s `shader` on the card for every count of a few, `groups` groups
+/// of `threads`, and checks it against the console; false without a device that takes it.
+fn counted_on_the_card(shader: &HostShader, threads: u32, groups: u32, wave: u32, what: &str) -> bool {
+    let limit = shader
+        .user_data
+        .iter()
+        .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X))
+        .expect("the count of threads");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return false;
+    };
+    let (root, pso) = match host.compute_pipeline(shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program (waves of 32?): {e}; not run");
+            return false;
+        }
+    };
+    let total = threads * groups;
+    for count in [0, 1, 7, 31, 32, 33, 63, 64, 65, 100, total - 1, total, total + 5] {
+        let mut constants = vec![0; shader.user_data_dwords().max(1) as usize];
+        constants[limit.index as usize] = count;
+        let out = host
+            .dispatch(&root, &pso, &Dispatch {
+                roots: vec![(0, Root::Constants(constants))],
+                views: &[View::RawUav(256)],
+                samplers: &[],
+                groups: [groups, 1, 1],
+            })
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        assert_eq!(out[0][..256], counted_expected(threads, groups, wave, count)[..], "{what}: count {count}");
+    }
+    eprintln!("ran on the hardware device ({what}): only the lanes below the count store and are counted");
+    true
+}
+
+/// [`counted_program`] in the paired form (`super::emit_paired`), counted in threads: the
+/// lanes past the count stay (the form has no branch per lane outside an instruction's code)
+/// and neither store nor count in EXEC's ballot, in either bank.
+fn counted_paired(native: &NativeProgram) -> HostShader {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_bcnt1_i32_b64"));
+    let st = structure::structure(&p).expect("structure");
+    let bytes = super::container::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let was = (lower::TEST_HOST_WAVE.replace(Some(32)), lower::TEST_COUNTED.replace(Some(true)));
+    let r = super::emit_paired(&c, native, &p, &st);
+    lower::TEST_HOST_WAVE.set(was.0);
+    lower::TEST_COUNTED.set(was.1);
+    let (shader, wave) = r.expect("the paired form");
+    assert_eq!(wave, Some(32));
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    shader
+}
+
+#[test]
+fn the_lanes_past_a_count_of_threads_do_not_store_or_count_in_the_paired_form() {
+    for threads in [64u32, 128] {
+        let shader = counted_paired(&counted_program(true, threads, false));
+        if !counted_on_the_card(&shader, threads, 2, 64, &format!("paired, {threads} threads")) {
+            return;
+        }
+    }
+}
+
 #[path = "paired_tests.rs"]
 mod paired;
