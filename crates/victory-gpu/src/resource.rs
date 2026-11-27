@@ -1693,16 +1693,33 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         return true;
     }
     match memory {
-        // What is kept for card copies of title buffers not made yet
-        // (`crate::shadow::card_room_kept`) and for the render targets a
-        // world makes in its first frame ([`targets_room_kept`]) counts as
-        // used.
-        Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
-                < budget / 100 * room_percent()
-        }
+        Some([budget, used, ..]) => under_share(budget, card_use(used), room_percent()),
         None => filled < WITHOUT_BUDGET,
     }
+}
+
+/// The card's memory in use as the texture queue ([`room`]) and the sweep
+/// that lets idle host copies go ([`let_go_idle`]) both count it: the
+/// system's count `used`, less what our own texture blocks have free, with
+/// what is kept for card copies of title buffers not made yet
+/// (`crate::shadow::card_room_kept`) and for the render targets a world
+/// makes in its first frames ([`targets_room_kept`]) counted as used. One
+/// count for both, so the sweep cannot see room where the queue sees none
+/// (the two sums were written out twice before and had to be kept equal by
+/// hand).
+#[cfg(windows)]
+pub(crate) fn card_use(used: u64) -> u64 {
+    used.saturating_sub(crate::pool::texture_room())
+        .saturating_add(crate::shadow::card_room_kept())
+        .saturating_add(targets_room_kept())
+}
+
+/// Whether `used` bytes (as [`card_use`] counts them) lie under `percent`
+/// of `budget`: [`room`]'s test past its floor, and where the sweep starts
+/// to let idle copies go (`crate::host::vram_keep`, same rounding).
+#[cfg(any(windows, test))]
+pub(crate) fn under_share(budget: u64, used: u64, percent: u64) -> bool {
+    used < budget / 100 * percent
 }
 
 /// The bytes of the card's memory the texture queue leaves free for
@@ -2193,12 +2210,7 @@ pub(crate) fn let_go_idle() {
     let keep = *KEEP
         .get_or_init(|| !matches!(std::env::var("VICTORY_TEXTURE_KEEP").as_deref(), Ok("0") | Ok("1")));
     let (idle_ms, most) = match memory {
-        Some([budget, used, ..]) if keep => {
-            let used = used.saturating_sub(crate::pool::texture_room())
-                + crate::shadow::card_room_kept()
-                + targets_room_kept();
-            crate::host::vram_keep(budget, used)
-        }
+        Some([budget, used, ..]) if keep => crate::host::vram_keep(budget, card_use(used)),
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
     };
     // For the trail (`crate::host::trail`): how many went, their bytes,

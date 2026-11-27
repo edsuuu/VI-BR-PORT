@@ -137,8 +137,8 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 /// How long host copies of textures the title fills must have been idle to
 /// be let go, in milliseconds, and how many bytes of them go at most (the
 /// longest idle first): none but those of ten minutes while what is in use
-/// of the card (`used`: without what our own blocks have free, with what is
-/// kept free for others) is under 88 % of its budget, else enough to come
+/// of the card (`used`, as `crate::resource::card_use` counts it for the
+/// texture queue too) is under 88 % of its budget, else enough to come
 /// down to 85 %. `VICTORY_TEXTURE_KEEP=0`: [`vram_idle_ms`]' older rule,
 /// all that are idle; `=1`: that rule with its two longer times.
 ///
@@ -153,7 +153,7 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
         return (IDLE_MS, u64::MAX);
     }
     let share = |percent: u64| budget / 100 * percent;
-    if used < share(88) {
+    if crate::resource::under_share(budget, used, 88) {
         (KEPT_MS, u64::MAX)
     } else if used < share(95) {
         (IDLE_MS, used - share(85))
