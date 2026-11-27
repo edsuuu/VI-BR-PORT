@@ -653,6 +653,73 @@ fn need(block: usize) {
     });
 }
 
+/// Whether the two-host-wave form proves a first-lane read alike with the fixed-point analysis
+/// [`lane_uniform`] (`VICTORY_UNIFORM_PROOF=1`) rather than the single pass
+/// [`lane_uniform_first`]. Off by default: the proof is what made the structure builder's three
+/// refused programs translate on 26 Nov (branch `teste/bvh`), but it changes what is emitted
+/// for a fourth builder program too, so it waits for a run that keeps it. Part of the shader
+/// cache's key.
+fn uniform_proof() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UNIFORM_PROOF").is_some_and(|v| v == "1"))
+}
+
+/// VGPR values that are the same in every lane holding them (`all` is [`all_lane_blocks`]):
+/// written by an instruction every arriving lane runs (no guard), lane by lane, from scalars,
+/// constants and such values; or loaded from an address made of them. The compiler keeps
+/// wave-uniform data in VGPRs and fetches it with `v_readfirstlane`. The analysis used unless
+/// `VICTORY_UNIFORM_PROOF=1` ([`lane_uniform`]).
+/// shortcut: a value joined by a phi counts only where every predecessor is a block all lanes
+/// run (no lane branch can have split the arriving lanes); loop-carried values never do.
+fn lane_uniform_first(p: &Program, st: &Structured, all: &[bool]) -> HashSet<Value> {
+    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+    let mut same: HashSet<Value> = HashSet::new();
+    for b in crate::ir::reverse_postorder(&p.blocks) {
+        let block = &p.blocks[b];
+        let whole = block.preds.iter().all(|&q| all.get(q).copied().unwrap_or(false));
+        for phi in &block.phis {
+            if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
+                same.insert(phi.value);
+            }
+        }
+        for (i, inst) in block.insts.iter().enumerate() {
+            let name = inst.name();
+            let ops: Vec<Operand> = match &inst.fields {
+                Fields::Valu(v)
+                    if v.dpp.is_none()
+                        && v.sdwa.is_none()
+                        && !name.starts_with("v_mbcnt")
+                        && !name.starts_with("v_cmpx")
+                        && !name.contains("lane") =>
+                {
+                    v.src.clone()
+                }
+                _ => continue,
+            };
+            if st.guards[b][i].is_some() {
+                continue; // lanes outside EXEC keep another value
+            }
+            let alike = ops.iter().all(|op| match *op {
+                Operand::Vector { reg, .. } => {
+                    // every dword of the operand the instruction reads from that register on
+                    let read: Vec<Value> =
+                        inst.reads.iter().filter(|r| matches!(r.0, Reg::V(x) if x >= reg)).map(|r| r.1).collect();
+                    !read.is_empty() && read.iter().all(|x| same.contains(x))
+                }
+                // a scalar is one value; a lane mask is not, unless a compare of such values made it
+                Operand::Scalar { code, .. } if code != NULL => {
+                    inst.read(Reg::S(code)).is_none_or(|x| !is_mask(x) || same.contains(&x))
+                }
+                _ => true,
+            });
+            if alike {
+                same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
+            }
+        }
+    }
+    same
+}
+
 /// VGPR values that are the same in every lane of a console wave holding them (`all` is
 /// [`all_lane_blocks`]): written lane by lane from scalars, constants and such values, by an
 /// instruction that either every arriving lane runs or that runs under a condition itself the
@@ -665,7 +732,7 @@ fn need(block: usize) {
 /// wave reaches together: no branch on a lane-dependent condition can have split them (a
 /// branch on such alike values does not). Loop-carried values count only when what the loop
 /// carries is made of such values; the analysis runs to a fixed point from nothing, so a value
-/// that needs itself to be alike never is.
+/// that needs itself to be alike never is. Used with `VICTORY_UNIFORM_PROOF=1` ([`uniform_proof`]).
 fn lane_uniform(
     p: &Program,
     st: &Structured,
@@ -2279,7 +2346,10 @@ impl<'a> Lower<'a> {
             local_ok: false,
             local_any: LOCAL_ANY.get(),
             uniform: match &exchange {
-                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform(p, x.st, all, wave_tid(p, x)),
+                Some((_, false, all)) if !LOCAL_WAVES.get() && uniform_proof() => {
+                    lane_uniform(p, x.st, all, wave_tid(p, x))
+                }
+                Some((_, false, all)) if !LOCAL_WAVES.get() => lane_uniform_first(p, x.st, all),
                 _ => HashSet::new(),
             },
             own_bits: match &exchange {

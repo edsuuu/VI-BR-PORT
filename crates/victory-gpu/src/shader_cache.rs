@@ -83,6 +83,7 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_UNIFORM_PROOF",
             // Whether the ray-tracing node test always misses.
             "VICTORY_RT_MISS",
         ] {
