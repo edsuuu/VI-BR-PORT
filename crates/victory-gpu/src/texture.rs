@@ -101,6 +101,9 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// That read found it changed: it is streaming in
+    /// ([`partial_frames`]).
+    partial_moved: bool,
     /// Until this frame a guarded texture is hashed at every check: its
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
@@ -463,6 +466,30 @@ fn through_copy() -> bool {
 #[cfg(test)]
 fn with_title<R>(memory: *const u8, size: usize, f: impl FnOnce(&[u8]) -> R) -> R {
     with_title_held(memory, size, &mut None, false, f)
+}
+
+/// Frames between two reads of a partly mapped texture: 30, or with
+/// `VICTORY_PARTIAL_REREAD=N` (1 to 30; unset or 0: 30 always) N after a
+/// read that found it changed (`moved`), 30 after one that did not.
+///
+/// A partly mapped texture is the usual state of one streaming in, and a
+/// read around its unmapped pages is slow, so it is read again at most every
+/// 30 frames and a level that arrives shows up to 30 frames late. At a
+/// scene's start thousands stream in a level after the other for 400-700
+/// frames: a level every few frames, each up to a second late at 30 fps.
+/// One whose last read found nothing new (a texture the title holds only the
+/// smaller levels of, the steady state) stays at 30.
+fn partial_frames(moved: bool) -> u64 {
+    static FAST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let fast = *FAST.get_or_init(|| {
+        std::env::var("VICTORY_PARTIAL_REREAD").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0).min(30)
+    });
+    partial_wait(moved, fast)
+}
+
+/// [`partial_frames`] with the switch's value `fast` (0: off).
+fn partial_wait(moved: bool, fast: u64) -> u64 {
+    if moved && fast > 0 { fast } else { 30 }
 }
 
 /// Whether a refresh that reads a texture through the kernel lets the
@@ -1381,7 +1408,7 @@ impl Staging {
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            if last.partial.is_some_and(|at| frame < at + partial_frames(last.partial_moved)) {
                 return 0;
             }
             last.partial = Some(frame);
@@ -1406,6 +1433,7 @@ impl Staging {
             if changed {
                 found_blind(last);
             }
+            last.partial_moved = changed;
             return size;
         }
         if through_copy() {
@@ -1967,7 +1995,18 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 
 #[cfg(test)]
 mod title_memory_tests {
-    use super::{with_title, with_title_held};
+    use super::{partial_wait, with_title, with_title_held};
+
+    /// A partly mapped texture is read again after 30 frames; with
+    /// `VICTORY_PARTIAL_REREAD` sooner, but only after a read that found it
+    /// changed.
+    #[test]
+    fn a_texture_streaming_in_is_read_sooner_only_with_the_switch() {
+        assert_eq!(partial_wait(false, 0), 30);
+        assert_eq!(partial_wait(true, 0), 30);
+        assert_eq!(partial_wait(true, 4), 4);
+        assert_eq!(partial_wait(false, 4), 30);
+    }
 
     /// With the short lock (`VICTORY_SHORT_REMAP_LOCK=1`) a remapping that
     /// asks while a refresh hashes and detiles its copy goes on at once, and
