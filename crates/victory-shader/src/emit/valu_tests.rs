@@ -2530,3 +2530,37 @@ fn a_format_load_read_as_halves_loads_the_integer() {
     }
     assert!(ran > 0, "no SM 6.6 device available");
 }
+
+#[test]
+fn sdwa_word_0_results_of_16_bits_sign_extend_pad_or_preserve() {
+    // VOP1 SDWA `op v0, v1 dst_sel:WORD_0 dst_unused:<unused> src0_sel:WORD_0`
+    // after `v_mov_b32 v0, v4`, so a preserved high word is the input's s3.
+    let sdwa = |op: u16, unused: u32| {
+        build_valu_cs(&[
+            vop1(0x001, 0, vgpr(4)),
+            vop1(op, 0, 0xF9),
+            1 | 4 << 8 | unused << 11 | 4 << 16,
+        ])
+    };
+    const I16: u16 = 0x053; // v_cvt_i16_f16
+    const U16: u16 = 0x052; // v_cvt_u16_f16
+    let old = 0xABCD_1234;
+    for (name, op, half, want) in [
+        // -1.0 -> -1: sext gives the whole dword's -1, pad 0x0000FFFF.
+        ("i16 -1.0", I16, 0xBC00, [0x0000_FFFF, 0xFFFF_FFFF, 0xABCD_FFFF]),
+        // 2.0 -> 2: bit 15 clear, so sext pads with zero.
+        ("i16 2.0", I16, 0x4000, [0x0000_0002, 0x0000_0002, 0xABCD_0002]),
+        // 65504 -> 0xFFE0: sext copies bit 15 whatever the type.
+        ("u16 65504", U16, 0x7BFF, [0x0000_FFE0, 0xFFFF_FFE0, 0xABCD_FFE0]),
+    ] {
+        for (unused, want) in want.into_iter().enumerate() {
+            let shader = sdwa(op, unused as u32);
+            run_cases(&shader, &[[half, 0, 0, old]], |backend, _, _, got| {
+                assert_eq!(
+                    got, want,
+                    "{backend}, {name}, dst_unused {unused}: {got:#010x}, want {want:#010x}"
+                );
+            });
+        }
+    }
+}

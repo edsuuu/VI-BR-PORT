@@ -1237,6 +1237,14 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_SDWA_SEXT=0`: a 16-bit result written by SDWA to WORD_0 with
+/// dst_unused = sext is padded with zero above it, as before, instead of
+/// sign-extended as the console does ([`Lower::write_half`]). On by default.
+fn sdwa_sext_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SDWA_SEXT").is_none_or(|v| v != "0"))
+}
+
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -9471,15 +9479,25 @@ impl<'a> Lower<'a> {
             return Err("a 16-bit result outside a VGPR");
         };
         let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
+        // SDWA: the word written, the other one kept (preserve), bit 15
+        // copied upward (sext with WORD_0), or zero (pad; a sign extension
+        // above the high word or of a whole dword adds nothing). The
+        // reserved dst_unused 3 is refused. [`sdwa_sext_on`] off: sext
+        // padded with zero as before, and 3 taken as pad.
         let mut keep = true;
+        let mut sext = false;
         if let Some(sd) = v.sdwa {
             match (sd.dst_sel, sd.dst_unused) {
                 (4, 2) => {}
                 (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+                _ if !sdwa_sext_on() => match sd.dst_sel {
+                    4 | 6 => keep = false,
+                    5 => (high, keep) = (true, false),
+                    _ => return Err("an SDWA destination of a 16-bit operation"),
+                },
+                (4, 1) => (keep, sext) = (false, true),
+                (4, 0) | (6, 0..=2) => keep = false,
+                (5, 0 | 1) => (high, keep) = (true, false),
                 _ => return Err("an SDWA destination of a 16-bit operation"),
             }
         }
@@ -9490,7 +9508,10 @@ impl<'a> Lower<'a> {
         };
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
         let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
+        let r = if sext {
+            let t = self.s.m.bin(c, Bin::Shl, x, k16);
+            self.s.m.bin(c, Bin::AShr, t, k16)
+        } else if high {
             let o = self.s.m.bin(c, Bin::And, old, low);
             let x = self.s.m.bin(c, Bin::Shl, x, k16);
             self.s.m.bin(c, Bin::Or, o, x)
