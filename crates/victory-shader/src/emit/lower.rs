@@ -1287,21 +1287,71 @@ pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
         && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
 }
 
-/// `VICTORY_EARLY_DEPTH=0`: no pixel program declares early depth
-/// ([`early_depth`]); default on.
-fn early_depth_on() -> bool {
+/// Which pixel programs that may test depth before they run ([`early_depth`])
+/// are told to (`VICTORY_EARLY_DEPTH`). Given to all of them (`Wide`, as
+/// 562dce1dd had it by default) the opening's cutscene came out wrong in the
+/// game (27 Nov: a white top black, a policeman's tattoos pink, darker
+/// scenes, the sea around the boat trembling), so by default only the
+/// programs named in `VICTORY_EARLY_DEPTH_FOR` get it, and with nothing named
+/// none does: the translation is the one from before the flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum EarlyDepth {
+    /// `VICTORY_EARLY_DEPTH=0`: none, named or not.
+    Off,
+    /// Unset (the default): the programs named in `VICTORY_EARLY_DEPTH_FOR`
+    /// ([`super::with_early_depth_named`]).
+    Named,
+    /// `=rule`: the named ones and those [`early_depth_rule`] picks.
+    Rule,
+    /// `=1`: every program with the bit (562dce1dd's rule, to compare).
+    Wide,
+}
+
+fn early_depth_mode() -> EarlyDepth {
     #[cfg(test)]
-    if let Some(on) = TEST_EARLY_DEPTH.get() {
-        return on;
+    if let Some(mode) = TEST_EARLY_DEPTH.get() {
+        return mode;
     }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
+    static MODE: std::sync::OnceLock<EarlyDepth> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_EARLY_DEPTH").as_deref() {
+        Ok("0") => EarlyDepth::Off,
+        Ok("1") => EarlyDepth::Wide,
+        Ok("rule") => EarlyDepth::Rule,
+        _ => EarlyDepth::Named,
+    })
+}
+
+/// Whether the console's early depth is declared for the pixel program being
+/// lowered: [`early_depth`] says it may be, and the mode
+/// ([`early_depth_mode`]) gives it to this one. `writes_uavs`: the program
+/// stores to or does atomics on views.
+fn early_depth_wanted(io: &StageIo, outputs: &[SigElement], writes_uavs: bool) -> bool {
+    let given = match early_depth_mode() {
+        EarlyDepth::Off => false,
+        EarlyDepth::Named => super::EARLY_DEPTH_NAMED.get(),
+        EarlyDepth::Rule => super::EARLY_DEPTH_NAMED.get() || early_depth_rule(io, writes_uavs),
+        EarlyDepth::Wide => true,
+    };
+    given && early_depth(io, outputs)
+}
+
+/// The programs `VICTORY_EARLY_DEPTH=rule` gives early depth to without being
+/// named: those that write views. Where the program neither writes views nor
+/// kills, testing before or after it gives the same picture, so the flag
+/// changes nothing there; where it kills, D3D's early test writes depth and
+/// stencil for the pixels it then kills, which is where the host and the
+/// console may part (not proven either way), and a program that kills and
+/// writes no view needs the flag for nothing. Writing views is the one case
+/// where the late test is visibly wrong: the writes land for pixels the test
+/// then rejects (the glass prepass in the prison cell).
+pub(super) fn early_depth_rule(io: &StageIo, writes_uavs: bool) -> bool {
+    matches!(io, StageIo::Ps { .. }) && writes_uavs
 }
 
 #[cfg(test)]
 thread_local! {
-    /// A test's choice for [`early_depth_on`], for its thread only.
-    pub(super) static TEST_EARLY_DEPTH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    /// A test's choice for [`early_depth_mode`], for its thread only.
+    pub(super) static TEST_EARLY_DEPTH: std::cell::Cell<Option<EarlyDepth>> = const { std::cell::Cell::new(None) };
 }
 
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
@@ -1582,14 +1632,14 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
-        if early_depth_on() && early_depth(&x.native.io, &x.outputs) {
-            s.flags |= flags::EARLY_DEPTH;
-        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
                 && (i.name().contains("store") || i.name().contains("atomic"))
         });
+        if early_depth_wanted(&x.native.io, &x.outputs, writes_uavs) {
+            s.flags |= flags::EARLY_DEPTH;
+        }
         let mut console_lanes = false;
         // LDS accesses get a group barrier each (a console wave split in two host waves)
         let mut split_lds = false;
