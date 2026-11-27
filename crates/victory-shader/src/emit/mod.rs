@@ -94,6 +94,7 @@ mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
+mod rayquery;
 mod rect;
 mod sampler;
 mod shader;
@@ -119,6 +120,10 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
+pub use rayquery::{
+    COMMITTED_NOTHING, COMMITTED_TRIANGLE_HIT, PROBE_GROUP, PROBE_HIT_DWORDS, PROBE_HITS, PROBE_RAY_DWORDS, PROBE_RAYS,
+    PROBE_STRUCTURE, ray_query_probe,
+};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,

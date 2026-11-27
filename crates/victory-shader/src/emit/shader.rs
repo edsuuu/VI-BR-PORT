@@ -106,6 +106,8 @@ pub(crate) mod flags {
     pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
+    /// Inline ray tracing (ray queries, `rayquery.rs`).
+    pub const RAYTRACING_1_1: u64 = 1 << 25;
     pub const INT64: u64 = 1 << 20;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
@@ -217,6 +219,9 @@ pub(crate) struct Shader {
     pub root_srvs: Vec<(u8, V)>,
     /// Root UAVs (raw buffers) read or written, likewise.
     pub root_uavs: Vec<(u8, V)>,
+    /// Host ray-tracing structures bound as root SRVs, likewise
+    /// (`rayquery.rs`).
+    pub structures: Vec<(u8, V)>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -274,6 +279,7 @@ impl Shader {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            structures: Vec::new(),
             flags: 0,
             nonuniform_handles: 0,
             threads: None,
@@ -585,6 +591,7 @@ impl Shader {
             || !self.root_cbvs.is_empty()
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
+            || !self.structures.is_empty()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -639,13 +646,13 @@ impl Shader {
                 cbvs = Some(self.m.md_node(cbv_list));
             }
             let mut srvs = None;
+            let mut list = Vec::new();
             if !self.root_srvs.is_empty() {
                 let ty = self
                     .m
                     .named_struct("struct.ByteAddressBuffer", vec![self.t.i32]);
                 let p = self.m.ptr(ty);
                 let u = self.m.undef(p);
-                let mut list = Vec::new();
                 for (n, (slot, _)) in self.root_srvs.clone().into_iter().enumerate() {
                     let ops = vec![
                         Some(i32c(&mut self, n as u32)),
@@ -666,6 +673,42 @@ impl Shader {
                         dxil_kind: 11,
                     });
                 }
+            }
+            if !self.structures.is_empty() {
+                // Numbered on from the raw buffers; shape 16: a ray-tracing
+                // acceleration structure, which PSV0 counts as a raw SRV (as
+                // the validator does).
+                let ty = self
+                    .m
+                    .named_struct("struct.RaytracingAccelerationStructure", vec![self.t.i32]);
+                let p = self.m.ptr(ty);
+                let u = self.m.undef(p);
+                // The validator wants an element type of every SRV that is
+                // neither raw nor structured: tag 0, 5 (U32).
+                let element = [i32c(&mut self, 0), i32c(&mut self, 5)];
+                let element = self.m.md_node(element.map(Some).to_vec());
+                for (slot, _) in self.structures.clone() {
+                    let ops = vec![
+                        Some(i32c(&mut self, list.len() as u32)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, ROOT_CBV_SPACE)),
+                        Some(i32c(&mut self, u32::from(slot))),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 16)),
+                        Some(i32c(&mut self, 0)),
+                        Some(element),
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 4,
+                        space: ROOT_CBV_SPACE,
+                        register: u32::from(slot),
+                        dxil_kind: 16,
+                    });
+                }
+            }
+            if !list.is_empty() {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
@@ -908,6 +951,9 @@ impl Shader {
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;
+        }
+        if self.flags & flags::RAYTRACING_1_1 != 0 {
+            features |= 0x10_0000;
         }
         if self.flags & flags::RESOURCE_HEAP != 0 {
             features |= 0x200_0000;
