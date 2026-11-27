@@ -1336,3 +1336,85 @@ fn a_loops_iteration_limit_leaves_through_its_exit_so_the_wave_meets_after_it() 
     assert_eq!(bad, 0, "runs in which some lane lost its slot");
     eprintln!("ran on the hardware device: one slot a live lane, the limit at the loop's exit");
 }
+
+/// A console wave32 program with console lanes (`v_mbcnt`) in a group of `x` by `y` threads
+/// (`x` a power of two): thread (tx, ty) stores 1 at dword x ty + tx.
+fn each_thread_once(x: u32, y: u32) -> NativeProgram {
+    let words = [
+        0xD765_0003,
+        0x0001_007E,                       // v_mbcnt_lo_u32_b32 v3, exec_lo, 0
+        0x3408_0280 | (0x80 + x.trailing_zeros()), // v_lshlrev_b32 v4, log2 x, v1
+        0x4A08_0104,                       // v_add_nc_u32 v4, v4, v0
+        0x3408_0882,                       // v_lshlrev_b32 v4, 2, v4
+        0x7E0A_0281,                       // v_mov_b32 v5, 1
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x80 << 24 | 2 << 16 | 5 << 8 | 4, // buffer_store_dword v5, v4, s[8:11], 0 offen
+    ];
+    let mut native = native_of(&words, false, x * y);
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 11, // 5 user SGPRs, thread ids x and y in v0, v1
+        threads: [x, y, 1],
+    });
+    native
+}
+
+/// A console wave32 program with console lanes in 2-D groups of two and more host waves: every
+/// thread of the group must be given once ([`lower::group_counter`]). With the old rounding the
+/// count of dwords written is printed, not checked: it depends on how the card fills a 2-D
+/// group's waves. (After 854f57ff7, remote tn1.)
+#[test]
+fn the_console_threads_of_a_two_dimensional_group_are_each_given_once() {
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    for (x, y) in [(32, 2), (8, 8), (16, 4), (8, 16)] {
+        let native = each_thread_once(x, y);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let lower_with = |on: bool| {
+            let was = lower::TEST_GROUP_COUNTER.replace(Some(on));
+            let shader = lowered_on(&native, &p, &HashSet::new(), 32);
+            lower::TEST_GROUP_COUNTER.set(was);
+            shader.expect("lower")
+        };
+        let (new, old) = (lower_with(true), lower_with(false));
+        assert_ne!(new.dxil, old.dxil, "{x} x {y}: the counter is used for a group of several host waves");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = new.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            return;
+        };
+        let n = (x * y) as usize;
+        let run = |shader: &HostShader| -> Option<Vec<u32>> {
+            let (root, pso) = match host.compute_pipeline(shader) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("the hardware device does not take this program: {e}; not run");
+                    return None;
+                }
+            };
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(n as u32)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            Some(out[0][..n].to_vec())
+        };
+        let Some(got) = run(&new) else { return };
+        let missing: Vec<usize> = (0..n).filter(|&i| got[i] != 1).collect();
+        assert!(missing.is_empty(), "{x} x {y}: dwords not written once: {missing:?}");
+        if let Some(before) = run(&old) {
+            let written = before.iter().filter(|&&d| d == 1).count();
+            eprintln!("{x} x {y}: the old rounding on this device wrote {written} of {n} dwords");
+        }
+    }
+    eprintln!("ran on the hardware device: every console thread once, with the group counter");
+}

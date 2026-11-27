@@ -384,9 +384,15 @@ struct Lower<'a> {
     /// A console wave64 program in host waves of 32: the LDS dword counting the console threads
     /// handed to host waves (`wave_base`), and the base made in the entry block.
     halves: Option<u32>,
+    /// Console lanes in a group of several host waves, not `halves` ([`group_counter`]): the
+    /// LDS dword of `wave_base`'s counter.
+    ticket: Option<u32>,
     /// VGPRs the program reads lanes of, also kept per lane in LDS ([`LaneMirror`]).
     mirror: Option<LaneMirror>,
     wave_base: Option<V>,
+    /// With `wave_base` taken by [`group_counter`]: this thread's place among the active lanes
+    /// of its host wave.
+    wave_rank: Option<V>,
     /// The host waves of a console wave meet on their own ([`with_pair_meetings`]): the first
     /// of the LDS dwords that count each console wave's arrivals, and the dword of this
     /// thread's console wave (made in the entry block).
@@ -1413,6 +1419,28 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+/// Whether console lanes in a group of several host waves take their console threads from a
+/// group counter, as console wave64 programs in host waves of 32 already do (`halves`), and
+/// each wave's lanes their place among its active lanes (`VICTORY_WAVE_GROUP_COUNTER=1`; off
+/// by default). Otherwise a host wave's console threads are its first flat thread index rounded
+/// down to the wave size plus the lane, which assumes the host gives each wave a wave-aligned
+/// run of flat indices: if a host fills a 2-D group's waves otherwise, two waves take the same
+/// threads and other threads none. Part of the translation (shader cache key).
+fn group_counter() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_GROUP_COUNTER.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_GROUP_COUNTER").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`group_counter`] as given (unset: the switch).
+    pub(super) static TEST_GROUP_COUNTER: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 pub(super) fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
@@ -1649,6 +1677,8 @@ impl<'a> Lower<'a> {
         let mut exchange: Option<(u32, bool, Vec<bool>)> = None;
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
+        // console lanes in a group of several host waves (`group_counter`): `wave_base`'s dword
+        let mut ticket: Option<u32> = None;
         // its host waves meet per console wave (`with_pair_meetings`): the first counter's dword
         let mut pairs: Option<u32> = None;
         let mut mirror: Option<LaneMirror> = None;
@@ -1783,6 +1813,10 @@ impl<'a> Lower<'a> {
                     pairs = Some(s.lds_dwords);
                     s.lds_dwords += group / 64;
                 }
+            } else if console_lanes && group > wave && group_counter() {
+                // a host wave's threads from the group counter, not its rounded first flat id
+                ticket = Some(s.lds_dwords);
+                s.lds_dwords += 1;
             }
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
@@ -1979,8 +2013,10 @@ impl<'a> Lower<'a> {
             clane: None,
             pair: None,
             halves,
+            ticket,
             mirror,
             wave_base: None,
+            wave_rank: None,
             pairs,
             meeting: None,
             flat: None,
@@ -4383,7 +4419,7 @@ impl<'a> Lower<'a> {
     /// zeroes it, the group meets, each wave's first lane adds 32 and the wave takes what it
     /// found. Branch-free, in the entry block, which every thread runs.
     fn wave_base(&mut self) -> Option<V> {
-        let slot = self.halves?;
+        let slot = self.halves.or(self.ticket)?;
         if let Some(v) = self.wave_base {
             return Some(v);
         }
@@ -4407,6 +4443,38 @@ impl<'a> Lower<'a> {
             self.s.m.store(e, ptr, zero);
         }
         self.group_sync(e);
+        if group_counter() {
+            // Each wave counts its active lanes and ranks them. A full wave takes the next
+            // run of wave-size threads from the low half of the counter; a wave with fewer
+            // lanes (the group's last, when the group is not a multiple of the wave size)
+            // counts in the high half and takes its threads after all full runs.
+            let w = self.s.wave_size.unwrap_or(32);
+            let group: u32 = self.s.threads.map_or(w, |t| t.iter().product());
+            let one = self.s.m.i32(1);
+            let (sum, unsigned) = (self.s.m.i8(0), self.s.m.i8(1));
+            let count = self.s.op(e, "waveActiveOp.i32", Attr::NoUnwind, i32t, 119, &[one, sum, unsigned]);
+            let rank = self.s.op(e, "wavePrefixOp.i32", Attr::NoUnwind, i32t, 121, &[one, sum, unsigned]);
+            let kw = self.s.m.i32(w);
+            let full = self.s.m.cmp(e, pred::EQ, count, kw);
+            let first = self.s.m.cmp(e, pred::EQ, rank, zero);
+            let sixteen = self.s.m.i32(16);
+            let high = self.s.m.bin(e, Bin::Shl, count, sixteen);
+            let take = self.s.m.select(e, full, kw, high);
+            let add = self.s.m.select(e, first, take, zero);
+            let ptr = self.s.m.element(e, lds, k);
+            let old = self.s.m.atomic(e, Rmw::Add, ptr, add);
+            let found = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[old]);
+            let low_mask = self.s.m.i32(0xffff);
+            let low = self.s.m.bin(e, Bin::And, found, low_mask);
+            let past = self.s.m.bin(e, Bin::LShr, found, sixteen);
+            let runs = self.s.m.i32(group / w * w);
+            let tail = self.s.m.bin(e, Bin::Add, runs, past);
+            let base = self.s.m.select(e, full, low, tail);
+            self.s.flags |= flags::WAVE_OPS;
+            self.wave_base = Some(base);
+            self.wave_rank = Some(rank);
+            return Some(base);
+        }
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
         let k32 = self.s.m.i32(32);
@@ -4425,7 +4493,8 @@ impl<'a> Lower<'a> {
         let (e, i32t) = (self.s.entry, self.s.t.i32);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         if let Some(base) = self.wave_base() {
-            return self.s.m.bin(e, Bin::Add, base, lane);
+            let place = self.wave_rank.unwrap_or(lane);
+            return self.s.m.bin(e, Bin::Add, base, place);
         }
         let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
         let first = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[flat]);
@@ -5015,7 +5084,7 @@ impl<'a> Lower<'a> {
         let [x, y, _] = self.s.threads.expect("compute");
         let e = self.s.entry;
         let i32t = self.s.t.i32;
-        if self.halves.is_some() {
+        if self.halves.is_some() || self.ticket.is_some() {
             let f = self.console_thread();
             self.s.flags |= flags::WAVE_OPS;
             let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
