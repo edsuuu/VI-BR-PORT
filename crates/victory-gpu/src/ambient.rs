@@ -45,6 +45,7 @@
 //! day ([`day`]). `VICTORY_AMBIENT_CONTRAST=<ratio>[:<most gain>]` raises a
 //! dark bulk under a few bright lights outside rooms ([`contrast`]).
 //! `VICTORY_AMBIENT_CUT=<factor>` follows a cut at once ([`cut`]).
+//! `VICTORY_AMBIENT_AIR_SOFT=1` bends the air's bound in ([`air_soft`]).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -440,6 +441,34 @@ fn is_cut(was: f32, now: f32, cut: f32) -> bool {
     cut > 0.0 && (now - was).abs() > cut
 }
 
+/// `VICTORY_AMBIENT_AIR_SOFT=1`: the bound on what the air scatters
+/// (`VICTORY_AMBIENT_AIR`) is taken between the four points around a cell
+/// of the volume, not at the nearest one, and bends in from half the bound
+/// instead of cutting off at it ([`soft_bound`]). Unset: as before.
+///
+/// Why (read from the code, not seen on this host): where the bound cuts
+/// off, the air of a cell of the volume (80x46, 16 pixels wide at 1280)
+/// takes the bound's level, flat, and the bound is read at the nearest of
+/// two points: a smooth glow on a wall becomes a few flat vertical steps.
+/// The key's word `air` divides the bound by the gain (2.3-3.5 in the
+/// prison), so it cuts off far more often than with the constant alone: the
+/// tester's banding on the prison corridor's wall came with the new set.
+fn air_soft() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| std::env::var("VICTORY_AMBIENT_AIR_SOFT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The bound of `VICTORY_AMBIENT_AIR_SOFT`, as the air pass works it out:
+/// `has` itself up to half of `cap`, then bent towards `cap`, which it never
+/// reaches, with no corner.
+fn soft_bound(has: f32, cap: f32) -> f32 {
+    let knee = 0.5 * cap;
+    if has <= knee || cap <= 0.0 {
+        return has.min(cap.max(0.0));
+    }
+    knee + (cap - knee) * (1.0 - (-(has - knee) / (cap - knee)).exp())
+}
+
 /// The word `tint`: the air's colour goes 60% of the way (times how much the
 /// key raises the room: none at a gain of 1, all from 2) to that of the light
 /// around. Its own switch word, since it changes colours, not levels.
@@ -483,7 +512,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=30, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
+#define RS "RootConstants(num32BitConstants=31, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -524,6 +553,9 @@ cbuffer Set : register(b0) {
     // from the slow one for the slow measures to start over from it (0:
     // never).
     float cut;
+    // (VICTORY_AMBIENT_AIR_SOFT) Whether the air's bound is taken between
+    // the points and bends in instead of cutting off.
+    float air_soft;
 };
 Texture2D<float> depth : register(t0);
 // The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
@@ -580,6 +612,15 @@ float gain_at(float4 mean_now, int2 p) {
     return gain_to_key(mean_now);
 }
 
+
+// A bound that bends in (VICTORY_AMBIENT_AIR_SOFT): `has` itself up to half
+// of `cap`, then towards `cap` with the same slope where it starts. Its
+// Rust twin is `soft_bound`.
+float soft_bound(float has, float cap) {
+    float knee = 0.5 * cap;
+    if (has <= knee || cap <= 0.0) return min(has, max(cap, 0.0));
+    return knee + (cap - knee) * (1.0 - exp(-(has - knee) / (cap - knee)));
+}
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
@@ -757,6 +798,21 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    // (VICTORY_AMBIENT_AIR_SOFT) Between the four points around, not the
+    // nearest: a cell of the volume is two points wide, and the nearest one
+    // gave its column a level of its own.
+    if (air_soft > 0.0) {
+        float2 g = (float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY) - 0.5;
+        int2 g0 = int2(floor(g));
+        float2 t = g - float2(g0);
+        seen_there = 0;
+        for (int k = 0; k < 4; k++) {
+            int2 o = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+            uint at1 = (uint(o.y) * PX + uint(o.x)) * 3;
+            float b = (k & 1 ? t.x : 1.0 - t.x) * (k >> 1 ? t.y : 1.0 - t.y);
+            seen_there += b * float3(points[at1].w, points[at1 + 1].w, points[at1 + 2].w);
+        }
+    }
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     // The light the key adds to surfaces does not raise what the air may
@@ -770,7 +826,16 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     // night street, whose lamps light its fog.
     float bound_share = 1.0;
     if (outside_level > 0.0 && cells[INSIDE_MEAN].y > 0.0) bound_share = saturate(cells[INSIDE].z);
-    if (has > cap) c *= lerp(1.0, cap / has, bound_share);
+    if (air_soft > 0.0) {
+        // (VICTORY_AMBIENT_AIR_SOFT) Up to half the bound the title's own; above,
+        // bent towards the bound and never at it: what is cut off is flat
+        // (the bound's level, a column of the volume at a time), what bends
+        // keeps the title's gradient (the banding on the prison corridor's
+        // wall once the key's `air` lowered the bound).
+        c *= lerp(1.0, soft_bound(has, cap) / max(has, 1e-9), bound_share);
+    } else if (has > cap) {
+        c *= lerp(1.0, cap / has, bound_share);
+    }
     // (`tint`) Where the key raises a dark room, the air's colour goes part
     // of the way to that of the light its surfaces send out: without rays the
     // probes that light a hall's air hold the sky's light (a brown veil at
@@ -923,7 +988,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 6) * 16;
 /// The passes' root constants, in words (the `Set` buffer).
-const WORDS: usize = 30;
+const WORDS: usize = 31;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -1138,6 +1203,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[27] = contrast.to_bits();
     words[28] = contrast_most.to_bits();
     words[29] = cut().to_bits();
+    words[30] = if air_soft() { 1.0f32 } else { 0.0 }.to_bits();
     let measure_rooms = ((key > 0.0 && key_room()) || outdoors) && views.stencil.is_some();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
@@ -1412,6 +1478,27 @@ mod tests {
         assert!(contrast_run(1.0, 0.001, set, 60).iter().all(|&g| g <= 8.0 + 1e-4));
         // Inside rooms it does not build up.
         assert_eq!(contrast_step(0.0, 1.0, 0.001, set, 0.0), 0.0);
+    }
+
+    #[test]
+    fn soft_air_bound() {
+        let cap = 0.2;
+        // Below half the bound: the title's own.
+        assert_eq!(soft_bound(0.05, cap), 0.05);
+        assert_eq!(soft_bound(0.1, cap), 0.1);
+        // Above: under the bound, never at it, and still rising, so a
+        // glow that the hard bound made flat keeps a gradient (up to three
+        // times the bound; far above it rounds to the bound in f32).
+        let mut last = soft_bound(0.1, cap);
+        for i in 1..=10 {
+            let now = soft_bound(0.1 + 0.05 * i as f32, cap);
+            assert!(now > last && now < cap, "{i}: {now}");
+            last = now;
+        }
+        // No corner at the knee: the slope just above it is about 1.
+        let slope = (soft_bound(0.1001, cap) - soft_bound(0.1, cap)) / 0.0001;
+        assert!((slope - 1.0).abs() < 0.01, "{slope}");
+        assert_eq!(soft_bound(1.0, 0.0), 0.0);
     }
 
     #[test]
