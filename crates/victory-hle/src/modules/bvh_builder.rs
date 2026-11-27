@@ -597,6 +597,19 @@ unsafe extern "system" fn rehydrate_batched(
                     d.scratch,
                     value.map_or("?".to_string(), |v| format!("{v:#x}")),
                 );
+                // Whether an unpacking still says what the structure is made
+                // of (what a host build of it would need), and how much.
+                let (g, whole) = desc::geometries(&Process, &d.inputs);
+                let triangles: u64 = g.iter().map(|g| g.triangles()).sum();
+                let _ = write!(
+                    text,
+                    "; {} geometries read{}, {triangles} triangles",
+                    g.len(),
+                    if whole { "" } else { " (not all)" }
+                );
+                if let Some(first) = g.first() {
+                    let _ = write!(text, "; the first: {}", first.describe());
+                }
             }
         }
     }
