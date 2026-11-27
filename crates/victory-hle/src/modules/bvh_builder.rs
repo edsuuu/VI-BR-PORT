@@ -17,12 +17,18 @@
 //!
 //! The descriptions are decoded in [`desc`]; the console's own batched
 //! layout is inferred and its first calls are dumped in hex to confirm it.
+//!
+//! `VICTORY_RT_NATIVE=1` (off by default) binds the imports here too, and
+//! the builds and copies the title asks for tell the by-address memory how
+//! long each structure is ([`native`]). Without `VICTORY_DXR_TRACE` nothing
+//! is logged or counted then: each call goes straight to the title's own.
 // The exported names are the title's.
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod desc;
+pub mod native;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -96,7 +102,7 @@ pub struct Interpose<'a> {
 impl ImportResolver for Interpose<'_> {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
         let found = self.inner.resolve(dll, symbol);
-        if !dll.eq_ignore_ascii_case(BUILDER_DLL) || rtcalls::trace() == Trace::Off {
+        if !dll.eq_ignore_ascii_case(BUILDER_DLL) || (quiet() && !native::on()) {
             return found;
         }
         // Only what the title's DLL itself provides is wrapped: a stub for a
@@ -136,6 +142,14 @@ fn interpose(name: &str, original: usize) -> Option<usize> {
         rehydrate_batched as *const () as usize,
         set_morton as *const () as usize,
     ][i];
+    if quiet() {
+        tracing::info!(
+            kind = KINDS[i],
+            original = format_args!("{original:#x}"),
+            "ray tracing: the title's call of its structure builder goes through ours (VICTORY_RT_NATIVE)"
+        );
+        return Some(ours);
+    }
     tracing::info!(
         kind = KINDS[i],
         original = format_args!("{original:#x}"),
@@ -146,6 +160,13 @@ fn interpose(name: &str, original: usize) -> Option<usize> {
 
 fn original(i: usize) -> *const () {
     ORIGINALS[i].load(Relaxed) as *const ()
+}
+
+/// Bound for `VICTORY_RT_NATIVE` alone: nothing is logged or counted, each
+/// call goes straight to the title's own (with [`native`] beside builds and
+/// copies).
+fn quiet() -> bool {
+    rtcalls::trace() == Trace::Off
 }
 
 /// The process's own memory, read only where it is committed and readable
@@ -391,6 +412,10 @@ unsafe extern "system" fn construct(
     device: *mut c_void,
     flag: u8,
 ) -> *mut c_void {
+    if quiet() {
+        // SAFETY: the title's own function, with its arguments.
+        return unsafe { std::mem::transmute::<*const (), Construct>(original(CONSTRUCT))(this, device, flag) };
+    }
     number(CONSTRUCT);
     tracing::info!(
         this = format_args!("{this:p}"),
@@ -403,6 +428,10 @@ unsafe extern "system" fn construct(
 }
 
 unsafe extern "system" fn destroy(this: *mut c_void) {
+    if quiet() {
+        // SAFETY: as above.
+        return unsafe { std::mem::transmute::<*const (), Destroy>(original(DESTROY))(this) };
+    }
     number(DESTROY);
     tracing::info!(
         this = format_args!("{this:p}"),
@@ -413,6 +442,10 @@ unsafe extern "system" fn destroy(this: *mut c_void) {
 }
 
 unsafe extern "system" fn set_morton(this: *mut c_void, on: u8) {
+    if quiet() {
+        // SAFETY: as above.
+        return unsafe { std::mem::transmute::<*const (), Morton>(original(MORTON))(this, on) };
+    }
     number(MORTON);
     tracing::info!(on, "dxr trace: 64-bit Morton codes");
     // SAFETY: as above.
@@ -425,6 +458,13 @@ unsafe extern "system" fn build_batched(
     count: u32,
     descs: *const u8,
 ) {
+    if native::on() {
+        native::batch(this, count, descs);
+    }
+    if quiet() {
+        // SAFETY: as above.
+        return unsafe { std::mem::transmute::<*const (), Build>(original(BUILD))(this, list, count, descs) };
+    }
     let call = number(BUILD);
     rtcalls::add(Count::Batches, 1);
     let n = count.min(ENTRIES);
@@ -482,6 +522,13 @@ unsafe extern "system" fn copy_structure(
     source: u64,
     mode: i32,
 ) {
+    if native::on() {
+        native::copy(dest, source);
+    }
+    if quiet() {
+        // SAFETY: as above.
+        return unsafe { std::mem::transmute::<*const (), Copy>(original(COPY))(this, list, dest, source, mode) };
+    }
     let call = number(COPY);
     rtcalls::add(
         match mode {
@@ -517,6 +564,10 @@ unsafe extern "system" fn prebuild_info(
     stream: *const u8,
     info: *mut PrebuildInfo,
 ) {
+    if quiet() {
+        // SAFETY: as above.
+        return unsafe { std::mem::transmute::<*const (), Prebuild>(original(PREBUILD))(this, inputs, stream, info) };
+    }
     let call = number(PREBUILD);
     rtcalls::add(Count::PrebuildAsks, 1);
     let since = Instant::now();
@@ -582,6 +633,12 @@ unsafe extern "system" fn rehydrate_batched(
     descs: *const u8,
     extra: *const u64,
 ) -> i32 {
+    if quiet() {
+        // SAFETY: as above.
+        return unsafe {
+            std::mem::transmute::<*const (), Rehydrate>(original(REHYDRATE))(this, list, count, descs, extra)
+        };
+    }
     let call = number(REHYDRATE);
     rtcalls::add(Count::Rehydrated, u64::from(count));
     let n = count.min(ENTRIES) as usize;
