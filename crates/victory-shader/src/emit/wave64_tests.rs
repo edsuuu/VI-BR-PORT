@@ -859,3 +859,6 @@ fn a_loop_lanes_leave_one_by_one_is_taken_wave_wide_before_host_waves_meet_in_it
     // (the other forms keep the block as one every lane runs: see `lower::with_loop_exits`)
     assert_eq!(lower::branches_around(&st, &[head]), Some(Vec::new()));
 }
+
+#[path = "paired_tests.rs"]
+mod paired;
