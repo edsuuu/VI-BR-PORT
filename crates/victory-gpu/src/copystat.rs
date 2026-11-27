@@ -848,6 +848,12 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    tracing::info!(
+        "memory of the title's R9G9B9E5 targets: {} host copies {:.0} MB, in the stand-in format \
+         (VICTORY_E5_TARGETS=r11g11b10: 32 bits a pixel; else 64)",
+        census[10],
+        mb(census[11]),
+    );
     {
         let [textures, staging] = crate::pool::memory();
         tracing::info!("memory in blocks (VICTORY_TEXTURE_POOL=0 turns them off): {textures} MB of textures, {staging} MB of their staging buffers");

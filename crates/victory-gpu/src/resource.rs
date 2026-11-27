@@ -260,7 +260,8 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 /// nothing. There 8-bit RGBA stands in: the same channels in the same
 /// order, every 4-bit level exact and every 5-bit level within 1/510.
 /// The title also renders to R9G9B9E5 (67), which no PC GPU does: 16-bit
-/// float RGBA stands in, with at least R9G9B9E5's precision and range.
+/// float RGBA stands in, with at least R9G9B9E5's precision and range, or
+/// R11G11B10_FLOAT with `VICTORY_E5_TARGETS=r11g11b10` ([`e5_stand_in`]).
 /// The title's pipelines and views of such targets name the stand-in too
 /// ([`view_format`], the host view checks).
 /// shortcut: copies between such a target and a texture the title fills
@@ -296,16 +297,91 @@ pub(crate) fn target_format(format: u32) -> u32 {
                     | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
                 let refused = asked.is_err() || support.Support1.0 & both != both;
                 if refused {
+                    let to = if f == 67 { e5_stand_in() } else { to };
                     tracing::info!(format = f, stand_in = to, "the host does not render to this format: a stand-in is used");
                 }
                 refused
             })
         });
         if refused[i] {
-            return STAND_INS[i].1;
+            return if format == 67 { e5_stand_in() } else { STAND_INS[i].1 };
         }
     }
     format
+}
+
+/// DXGI's R11G11B10_FLOAT and 16-bit float RGBA.
+const R11G11B10_FLOAT: u32 = 26;
+const RGBA16_FLOAT: u32 = 10;
+
+/// The stand-in of the title's R9G9B9E5 targets ([`target_format`]). 16-bit
+/// float RGBA (64 bits a pixel) by default; `VICTORY_E5_TARGETS=r11g11b10`:
+/// R11G11B10_FLOAT, 32 bits a pixel like the console's own format, which
+/// halves the bytes those targets take and move on the card. Its mantissas
+/// are shorter (6/6/5 bits against E5's shared 9) and it has no alpha:
+/// alpha reads 1.0, as it does on the console in R9G9B9E5 (the 16-bit
+/// stand-in kept whatever a shader wrote there). Used only if the host
+/// renders to it, blends it, and loads and stores it as unordered access;
+/// else the 16-bit stand-in, said in the log line.
+fn e5_stand_in() -> u32 {
+    static STAND_IN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *STAND_IN.get_or_init(|| {
+        let asked = e5_asked(std::env::var("VICTORY_E5_TARGETS").ok().as_deref());
+        let chosen = if asked == R11G11B10_FLOAT && !host_renders_e5_stand_in(asked) {
+            RGBA16_FLOAT
+        } else {
+            asked
+        };
+        tracing::info!(
+            stand_in = chosen,
+            asked,
+            "the title's R9G9B9E5 targets: the stand-in format in use (VICTORY_E5_TARGETS=r11g11b10: R11G11B10_FLOAT, 26; else 16-bit float RGBA, 10)"
+        );
+        chosen
+    })
+}
+
+/// The stand-in `VICTORY_E5_TARGETS` (its value, if set) asks for.
+fn e5_asked(value: Option<&str>) -> u32 {
+    match value {
+        Some(v) if v.trim().eq_ignore_ascii_case("r11g11b10") => R11G11B10_FLOAT,
+        _ => RGBA16_FLOAT,
+    }
+}
+
+/// Whether the host renders to and blends `format`, and loads and stores
+/// it as unordered access (typed loads of R11G11B10 are one of the
+/// additional formats a host may lack).
+fn host_renders_e5_stand_in(format: u32) -> bool {
+    #[cfg(windows)]
+    {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = crate::host::host() else {
+            return false;
+        };
+        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(format as i32),
+            ..Default::default()
+        };
+        // SAFETY: a plain query into our own structure.
+        let asked = unsafe {
+            host.device.CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT,
+                (&raw mut support).cast(),
+                size_of_val(&support) as u32,
+            )
+        };
+        let one = D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0
+            | D3D12_FORMAT_SUPPORT1_BLENDABLE.0
+            | D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0;
+        let two = D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD.0 | D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0;
+        asked.is_ok() && support.Support1.0 & one == one && support.Support2.0 & two == two
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = format;
+        false
+    }
 }
 
 /// Whether the host copy of the title texture `this` is in a stand-in
@@ -2370,11 +2446,13 @@ pub(crate) fn targets_census() -> [u64; 12] {
 /// of those a descriptor slot still shows (the card holds a texture the
 /// title has given up for as long as a slot shows it). The last two are
 /// estimates from every 16th such texture: asking Windows about the memory
-/// of all 16,000 takes too long.
+/// of all 16,000 takes too long. Then the host copies the host renders to
+/// or writes of the title's R9G9B9E5 textures and their bytes, in the
+/// stand-in's format ([`e5_stand_in`]): what that stand-in's size can save.
 #[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn census() -> [u64; 10] {
+pub(crate) fn census() -> [u64; 12] {
     const EVERY: u64 = 16;
-    let mut count = [0u64; 10];
+    let mut count = [0u64; 12];
     let mut placed_filled = 0u64;
     let all = textures();
     for &at in all.iter() {
@@ -2387,6 +2465,10 @@ pub(crate) fn census() -> [u64; 10] {
                 count[kind] += 1;
                 count[kind + 1] += host.bytes + twin.as_ref().map_or(0, |t| t.colour.bytes);
                 count[7] += twin.as_ref().map_or(0, |t| t.colour.bytes);
+                if !host.filled && r.desc.format == 67 {
+                    count[10] += 1;
+                    count[11] += host.bytes;
+                }
                 let placed = r.host.placed.load(std::sync::atomic::Ordering::Relaxed);
                 if placed {
                     count[6] += 1;
@@ -3450,6 +3532,21 @@ pub(crate) fn test_buffer(width: u64) -> This {
 mod tests {
     use super::*;
     use crate::object::slot;
+
+    /// `VICTORY_E5_TARGETS`: only `r11g11b10` (any case) asks for
+    /// R11G11B10_FLOAT; unset or anything else keeps 16-bit float RGBA.
+    #[test]
+    fn the_e5_stand_in_is_r11g11b10_only_when_asked() {
+        assert_eq!(e5_asked(None), RGBA16_FLOAT);
+        assert_eq!(e5_asked(Some("")), RGBA16_FLOAT);
+        assert_eq!(e5_asked(Some("0")), RGBA16_FLOAT);
+        assert_eq!(e5_asked(Some("rgba16")), RGBA16_FLOAT);
+        assert_eq!(e5_asked(Some("r11g11b10")), R11G11B10_FLOAT);
+        assert_eq!(e5_asked(Some("R11G11B10 ")), R11G11B10_FLOAT);
+        // The other targets' formats are not stand-ins of it.
+        assert_eq!(target_format(R11G11B10_FLOAT), R11G11B10_FLOAT);
+        assert_eq!(target_format(RGBA16_FLOAT), RGBA16_FLOAT);
+    }
 
     #[test]
     fn the_room_for_targets_follows_what_they_take_once_known() {
