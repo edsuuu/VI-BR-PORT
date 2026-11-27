@@ -27,8 +27,12 @@
 //! decoration (the bake's own 22 MB targets), and memory that is not the
 //! title's placed textures are never sources; the sources are not watched
 //! after the bake; and the bake waits only for its own sources' uploads on the
-//! copy queue, a bounded time ([`wait_budget`]), not for every upload on its
-//! way.
+//! copy queue, not for every upload on its way. That wait is the list's: a
+//! source is never taken as read through a table (the attempt's second
+//! fault: the pass marked such a slot done with no upload), so its upload is
+//! recorded into the bake's list, and recording it waits for the upload of it
+//! on its way, a second at most (`crate::texture::ahead::listed`), then
+//! records one of its own.
 //!
 //! Nothing here writes title memory: the buffers are read through the kernel
 //! (`host::copy_mapped`, which fails instead of faulting on memory that is
@@ -42,21 +46,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) fn admit_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_ADMIT").is_some_and(|v| v == "1"))
-}
-
-/// How long one bake draw waits, in all, for its sources' first uploads that
-/// are on their way on the copy queue of their own (`crate::texture::ahead`,
-/// `VICTORY_UPLOAD_AHEAD=1`): `VICTORY_BAKE_ADMIT_WAIT_MS`, 100; 0: it does
-/// not wait. Such a source's slot is made from its host copy at the bake,
-/// before the copy has run, and the bake would sample what the new texture
-/// held (nothing, or the bytes of what was in that card memory before). The
-/// wait is on the thread that translates the bake's list, which is the
-/// title's (`VICTORY_THIN_BAKE=2`): bounded, and only for the bake's own few.
-pub(crate) fn wait_budget() -> std::time::Duration {
-    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    std::time::Duration::from_millis(*MS.get_or_init(|| {
-        std::env::var("VICTORY_BAKE_ADMIT_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(100)
-    }))
 }
 
 /// The largest texture taken as a source: the decorations met as sources in
@@ -126,45 +115,6 @@ impl PastLine {
     }
 }
 
-/// A bake draw's time for waiting ([`wait_budget`]), spent across its sources.
-pub(crate) struct Wait {
-    most: std::time::Duration,
-    spent: std::time::Duration,
-    /// Uploads waited for, and those the time ran out on.
-    pub(crate) waited: u32,
-    pub(crate) ran_out: u32,
-}
-
-impl Wait {
-    pub(crate) fn new(most: std::time::Duration) -> Wait {
-        Wait { most, spent: std::time::Duration::ZERO, waited: 0, ran_out: 0 }
-    }
-
-    /// The time left for the next wait.
-    pub(crate) fn left(&self) -> std::time::Duration {
-        self.most.saturating_sub(self.spent)
-    }
-
-    /// The time waited so far.
-    pub(crate) fn spent(&self) -> std::time::Duration {
-        self.spent
-    }
-
-    /// Notes one wait that `took` so long: `None`, there was nothing on its
-    /// way; `Some(true)`, it ran; `Some(false)`, the time ran out first.
-    pub(crate) fn note(&mut self, outcome: Option<bool>, took: std::time::Duration) {
-        self.spent += took;
-        match outcome {
-            None => {}
-            Some(true) => self.waited += 1,
-            Some(false) => {
-                self.waited += 1;
-                self.ran_out += 1;
-            }
-        }
-    }
-}
-
 /// What became of one bake draw's sources in its pass.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Sources {
@@ -184,25 +134,30 @@ pub(crate) struct Sources {
     /// A source there may be among the slots refused for room.
     pub(crate) cut: u32,
     pub(crate) same: u32,
+    /// Sources whose first upload was on its way on the copy queue of its
+    /// own (`VICTORY_UPLOAD_AHEAD=1`) when the bake's pass met them, and the
+    /// microseconds recording their uploads took: the list waits for that
+    /// upload there, a second at most for each.
+    pub(crate) on_their_way: u32,
+    pub(crate) waited_us: u64,
 }
 
 impl Sources {
     /// The sources this bake samples without their texture on the card for
-    /// it because of us: refused, not reached, or their upload on the copy
-    /// queue had not run when the wait ran out. The count the warning line of
-    /// a bake's pass goes by while [`admit_on`]: 0 is the fix working.
-    pub(crate) fn missing(&self, wait: &Wait) -> u32 {
-        self.refused + self.not_reached + wait.ran_out
+    /// it because of us: refused or not reached.
+    pub(crate) fn missing(&self) -> u32 {
+        self.refused + self.not_reached
     }
 }
 
 /// Since the start: bake draws whose sources were looked for, sources found,
 /// made past the room line, their bytes, refused past [`PAST_LINE_BYTES`],
-/// not mapped, uploads waited for, waits that ran out, microseconds waited.
-pub(crate) static COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+/// not mapped, on their way on the copy queue, microseconds their uploads
+/// took to record.
+pub(crate) static COUNTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 /// Adds one bake draw's numbers to [`COUNTS`]; returns the draws so far.
-pub(crate) fn count(sources: &Sources, past: &PastLine, wait: &Wait) -> u64 {
+pub(crate) fn count(sources: &Sources, past: &PastLine) -> u64 {
     let add = |i: usize, n: u64| COUNTS[i].fetch_add(n, Ordering::Relaxed) + n;
     let n = add(0, 1);
     add(1, u64::from(sources.found));
@@ -210,9 +165,8 @@ pub(crate) fn count(sources: &Sources, past: &PastLine, wait: &Wait) -> u64 {
     add(3, past.bytes);
     add(4, u64::from(past.refused));
     add(5, u64::from(sources.not_mapped));
-    add(6, u64::from(wait.waited));
-    add(7, u64::from(wait.ran_out));
-    add(8, wait.spent().as_micros() as u64);
+    add(6, u64::from(sources.on_their_way));
+    add(7, sources.waited_us);
     n
 }
 
@@ -264,38 +218,20 @@ mod tests {
     }
 
     #[test]
-    fn a_bakes_wait_is_bounded_in_all() {
-        let ms = std::time::Duration::from_millis;
-        let mut wait = Wait::new(ms(100));
-        assert_eq!((wait.spent(), wait.left()), (ms(0), ms(100)));
-        // Nothing on its way costs nothing; a wait that ran spends its time.
-        wait.note(None, ms(0));
-        wait.note(Some(true), ms(30));
-        assert_eq!(wait.left(), ms(70));
-        // One that ran out had all that was left; none is left after it.
-        wait.note(Some(false), ms(70));
-        assert_eq!((wait.left(), wait.spent()), (ms(0), ms(100)));
-        assert_eq!((wait.waited, wait.ran_out), (2, 1));
-        // A later source gets no wait: the time a draw waits is bounded.
-        wait.note(Some(false), ms(1));
-        assert_eq!(wait.left(), ms(0));
-        assert!(wait.spent() <= ms(101));
-        // No wait at all with a budget of 0.
-        assert_eq!(Wait::new(ms(0)).left(), ms(0));
-    }
-
-    #[test]
     fn missing_sources_are_the_ones_we_left() {
-        let ms = std::time::Duration::from_millis;
-        let mut wait = Wait::new(ms(100));
-        wait.note(None, ms(0));
-        wait.note(Some(true), ms(5));
-        let sources = Sources { found: 12, uploaded: 3, same: 8, not_mapped: 1, ..Sources::default() };
-        // Not mapped is the title's: not missing on our account.
-        assert_eq!(sources.missing(&wait), 0);
-        wait.note(Some(false), ms(95));
+        let sources = Sources {
+            found: 12,
+            uploaded: 3,
+            same: 8,
+            not_mapped: 1,
+            on_their_way: 2,
+            waited_us: 40_000,
+            ..Sources::default()
+        };
+        // Not mapped is the title's, and one on its way is waited for by the
+        // list: neither is missing on our account.
+        assert_eq!(sources.missing(), 0);
         let sources = Sources { refused: 1, not_reached: 2, ..sources };
-        assert_eq!(sources.missing(&wait), 4);
-        assert_eq!((wait.waited, wait.ran_out), (2, 1));
+        assert_eq!(sources.missing(), 3);
     }
 }
