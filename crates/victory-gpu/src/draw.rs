@@ -2436,31 +2436,37 @@ impl State {
         // memory (`VICTORY_BAKE_ROOM=1`): its textures are made all the same, see where they are refused.
         let mut bake_room = baking && bake_room_on() && crate::resource::room_for_bake(memory);
         let mut past_the_line = 0u64;
-        let (mut due, census) = host.texture_slots_due(frame, if baking { 1 << 16 } else { 4096 });
+        // The textures a bake draw samples (`VICTORY_BAKE_ADMIT=1`,
+        // `crate::bake`): due now whatever the queue knew of them, served
+        // first, past the pass's time and bytes, and past the room line up to
+        // `crate::bake::PAST_LINE_BYTES`. A pass that serves them alone does
+        // not take the queue's due slots at all.
+        let (sources, alone, cut) = BAKE_SOURCES.take().unwrap_or_default();
+        let (mut due, census) = host.texture_slots_due(frame, if alone { 0 } else if baking { 1 << 16 } else { 4096 });
         // (Those that are due later after all that are due.)
         let on_time = due.len();
-        if baking {
+        if baking && !alone {
             let known: std::collections::HashSet<u32> = due.iter().map(|&(index, _)| index).collect();
             static AHEAD: AtomicU64 = AtomicU64::new(u64::MAX);
             let again = AHEAD.swap(frame, Ordering::Relaxed) == frame;
             let (ahead, _) = host.texture_slots_due(frame + BAKE_AHEAD[usize::from(again)], 1 << 16);
             due.extend(ahead.into_iter().filter(|(index, _)| !known.contains(index)));
         }
-        // The textures a bake draw samples (`VICTORY_BAKE_ADMIT=1`,
-        // `crate::bake`): due now whatever the queue knew of them, served
-        // first, past the pass's time and bytes, and past the room line up to
-        // `crate::bake::PAST_LINE_BYTES`.
-        let (sources, alone, cut) = BAKE_SOURCES.take().unwrap_or_default();
         let admit = !sources.is_empty();
         let sources = if admit { host.texture_slots_now(&sources, frame) } else { Vec::new() };
         let source_count = sources.len();
+        // A pass that serves the sources alone keeps what the last full pass
+        // said (`BAKE_SERVED`), renewed past these sources' own writes, when
+        // nothing but they came since: the next bake draw with nothing new
+        // then skips the queue again, instead of every other one running a
+        // full pass. (`texture_slots_now` makes its writes under one lock,
+        // one after the other: the first is the one after the last full
+        // pass's when nothing came between.)
+        let served_before = BAKE_SERVED.load(Ordering::Relaxed);
+        let keeps_served = alone && crate::bake::keeps_served(served_before, sources.first().map(|&(_, write)| write));
         if admit {
             let mine: std::collections::HashSet<u32> = sources.iter().map(|&(index, _)| index).collect();
-            if alone {
-                due.clear();
-            } else {
-                due.retain(|(index, _)| !mine.contains(index));
-            }
+            due.retain(|(index, _)| !mine.contains(index));
             let mut front = sources;
             front.append(&mut due);
             due = front;
@@ -2520,7 +2526,9 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
-        BAKE_SERVED.store(0, Ordering::Relaxed);
+        if !alone {
+            BAKE_SERVED.store(0, Ordering::Relaxed);
+        }
         let mut served = true;
         // For the line of a bake's pass that left slots (below): how many
         // were due, how many it did not reach, and which bound ended it.
@@ -2904,7 +2912,9 @@ impl State {
                 None => host.texture_slot_done(index, write, again),
             }
         }
-        if baking && served && !alone {
+        // (After a pass of the sources alone, when nothing but they were new
+        // since the last full one: see `keeps_served`.)
+        if baking && served && (!alone || keeps_served) {
             BAKE_SERVED.store(host.texture_news().0 + 1, Ordering::Relaxed);
         }
         // (A source the loop did not get to: none, since they come first and
