@@ -214,15 +214,49 @@ static WAITS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(No
 /// their microseconds, and the longest one's.
 static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
 
+/// Beside [`COMMANDS_BY_WORK`], by the same key: the groups of the commands
+/// whose note gives them (`dispatch XxYxZ`, `mesh X`), and the longest one's.
+/// A pipeline's time alone did not say whether a dispatch was slow for its
+/// size: `InstanceCullingCS_Tree_BatchCull` took 2-7 ms a dispatch in the
+/// prison, and the only frames listed (`VICTORY_CAPTURE_WORLD`) were the
+/// opening's, where it ran 2-36 groups for 0.02-0.05 ms.
+static GROUPS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
+
 /// A command took `ms` on the card (timing run). `op` is its note: the
 /// kind and size first, then the pipeline in brackets, then what it binds.
 pub(crate) fn command_took(op: &str, ms: f64) {
     let us = (ms * 1e3) as u64;
-    let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-    let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
-    e.0 += 1;
-    e.1 += us;
-    e.2 = e.2.max(us);
+    let key = command_key(op);
+    let longest = {
+        let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let e = by.get_or_insert_with(HashMap::new).entry(key.clone()).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += us;
+        let longest = us >= e.2;
+        e.2 = e.2.max(us);
+        longest
+    };
+    if let Some(groups) = command_groups(op) {
+        let mut by = GROUPS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
+        let e = by.get_or_insert_with(HashMap::new).entry(key).or_insert((0, 0, 0));
+        e.0 += 1;
+        e.1 += groups;
+        if longest {
+            e.2 = groups;
+        }
+    }
+}
+
+/// The groups a command's note says it runs: `dispatch XxYxZ` (X·Y·Z) or
+/// `mesh X`; none for the others (an indirect command's count is on the
+/// card).
+fn command_groups(op: &str) -> Option<u64> {
+    let mut words = op.split(' ');
+    let size = match words.next()? {
+        "dispatch" | "mesh" => words.next()?,
+        _ => return None,
+    };
+    size.split('x').map(|n| n.parse::<u64>().ok()).product()
 }
 
 /// What a command's note is summed under: its pipeline (`[compute ...]`,
@@ -446,6 +480,17 @@ mod command_tests {
         );
         assert_eq!(command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"), "texture upload");
         assert_eq!(command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"), "alias copy");
+    }
+
+    /// Dispatches and mesh draws name their groups; other commands do not.
+    #[test]
+    fn commands_give_their_groups() {
+        use super::command_groups;
+        assert_eq!(command_groups("dispatch 3x1x1 [compute 55679a0547649d0b] | 55679a0547649d0b: u4=0xa00000"), Some(3));
+        assert_eq!(command_groups("dispatch 40x22x2 [compute 24f989b98dcb03f0]"), Some(1760));
+        assert_eq!(command_groups("mesh 86 [mesh f0c7efd2aceb2aaa, pixel 7d85c9cab3c80721]"), Some(86));
+        assert_eq!(command_groups("indirect kind 10 max 1 at 0xd9358fce0 [mesh 0750cb2d975c7563]"), None);
+        assert_eq!(command_groups("alias copy of 0x26f66aca780 into 0x26fbdc93890"), None);
     }
 }
 
@@ -1335,9 +1380,19 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
+    let mut groups = GROUPS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
     for (what, (n, us, longest)) in by.into_iter().take(40) {
+        // The groups after the line's usual text, which scripts read up to the pipeline.
+        let sizes = match groups.remove(&what) {
+            Some((counted, sum, of_longest)) if counted > 0 => format!(
+                "; {:.1} groups a command, {:.2} us a group, the longest {of_longest} groups",
+                sum as f64 / counted as f64,
+                us as f64 / sum.max(1) as f64
+            ),
+            _ => String::new(),
+        };
         tracing::info!(
-            "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
+            "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}{sizes}",
             us as f64 / 1e3 / frames,
             n as f64 / frames,
             longest as f64 / 1e3
