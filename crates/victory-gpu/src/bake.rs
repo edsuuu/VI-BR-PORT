@@ -72,6 +72,10 @@ pub(crate) const MOST: usize = 64;
 /// The most bytes of one buffer looked through for indices.
 pub(crate) const BUFFER_BYTES: usize = 64 << 10;
 
+/// The bytes looked through behind a root view no title buffer is known to
+/// hold (a root view names an address alone): a constant buffer's worth.
+pub(crate) const ROOT_VIEW_BYTES: u64 = 4 << 10;
+
 /// The most bytes of sources one bake draw makes past the queue's room line:
 /// sixteen sources of the largest a decoration is. On a card with no room, the
 /// rest are refused as any texture is.
@@ -175,6 +179,10 @@ pub(crate) struct Sources {
     /// it is).
     pub(crate) not_mapped: u32,
     pub(crate) uploaded: u32,
+    /// Places looked in for sources that were read only in part: buffers
+    /// past [`BUFFER_BYTES`], and the dwords left once [`MOST`] were found.
+    /// A source there may be among the slots refused for room.
+    pub(crate) cut: u32,
     pub(crate) same: u32,
 }
 
