@@ -38,7 +38,9 @@ function Get-McpInitializeResult {
     if ($asked -and $asked -in $script:McpProtocolVersions) { $version = $asked }
     $info = [ordered]@{}
     $info['name'] = $script:McpServerName
-    $info['version'] = [string](Get-McpVersion)['version']
+    $serverVersion = [string](Get-McpVersion)['version']
+    if (-not $serverVersion) { $serverVersion = '?' }
+    $info['version'] = $serverVersion
     $result = [ordered]@{}
     $result['protocolVersion'] = $version
     $result['capabilities'] = [ordered]@{ tools = [ordered]@{} }
