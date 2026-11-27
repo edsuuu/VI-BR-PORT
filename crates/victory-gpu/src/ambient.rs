@@ -258,6 +258,17 @@ fn key_flags() -> (bool, bool, bool) {
     })
 }
 
+/// The word `tint`: the air's colour goes 60% of the way (times how much the
+/// key raises the room: none at a gain of 1, all from 2) to that of the light
+/// around. Its own switch word, since it changes colours, not levels.
+fn key_tint() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default();
+        set.split(':').skip(2).any(|w| w.trim() == "tint")
+    })
+}
+
 fn key_geo() -> bool {
     key_flags().2
 }
@@ -286,12 +297,14 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=20, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
+#define RS "RootConstants(num32BitConstants=21, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
 // After the cells' places: the slow log-average of their luminance.
 #define GEO (2 * CELLS + 1)
+// Then the slow log-average of each of their colours (the hue of the bulk).
+#define GEO_RGB (2 * CELLS + 2)
 #define PX 160
 #define PY 90
 cbuffer Set : register(b0) {
@@ -300,6 +313,7 @@ cbuffer Set : register(b0) {
     float follow; float most; float air; float around;
     float lamps; float full; float least; float key;
     float most_gain; float inside_only; float air_hold; float geo_key;
+    float air_tint;
 };
 Texture2D<float> depth : register(t0);
 // The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
@@ -381,6 +395,11 @@ void mean() {
     float geo_now = logs / CELLS;
     float geo_log = geo_was.a > 0.0 ? lerp(geo_was.y, geo_now, follow) : geo_now;
     cells[GEO] = float4(max(exp(geo_log) - 1e-3, 0.0), geo_log, 0.0, 1.0);
+    float3 logs_rgb = 0;
+    for (uint j = 0; j < CELLS; j++) logs_rgb += log(cells[j].rgb + 1e-3);
+    float4 rgb_was = cells[GEO_RGB];
+    float3 rgb_now = logs_rgb / CELLS;
+    cells[GEO_RGB] = float4(rgb_was.a > 0.0 ? lerp(rgb_was.rgb, rgb_now, follow) : rgb_now, 1.0);
 }
 #endif
 
@@ -449,7 +468,23 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     if (air_hold > 0.0) cap /= gain_to_key(cells[CELLS]);
     float3 c = scattered[at];
     float has = dot(c, LUMA);
-    if (has > cap) scattered[at] = c * (cap / has);
+    if (has > cap) c *= cap / has;
+    // (`tint`) Where the key raises a dark room, the air's colour goes part
+    // of the way to that of the light its surfaces send out: without rays the
+    // probes that light a hall's air hold the sky's light (a brown veil at
+    // sunset), not its lamps'. As much as the key acts: none at a gain of 1.
+    float4 mean_now = cells[CELLS];
+    float mean_luma = dot(mean_now.rgb, LUMA);
+    if (air_tint > 0.0 && mean_now.a > 0.0 && mean_luma > 1e-5) {
+        float t = air_tint * saturate(gain_to_key(mean_now) - 1.0);
+        // The hue of the bulk of the picture (log-average of each colour),
+        // not of its bright windows.
+        float4 bulk = cells[GEO_RGB];
+        float3 rgb = bulk.a > 0.0 ? max(exp(bulk.rgb) - 1e-3, 1e-5) : mean_now.rgb;
+        float3 hue = rgb / max(dot(rgb, LUMA), 1e-5);
+        c = lerp(c, dot(c, LUMA) * hue, t);
+    }
+    scattered[at] = c;
 }
 #endif
 
@@ -558,7 +593,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 2) * 16;
+const CELL_BYTES: u64 = (2 * CELLS + 3) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -719,7 +754,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 20];
+    let mut words = [0u32; 21];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -740,6 +775,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[17] = if key_inside() && views.stencil.is_some() { 1.0f32 } else { 0.0 }.to_bits();
     words[18] = if key_air_hold() { 1.0f32 } else { 0.0 }.to_bits();
     words[19] = if key_geo() { 1.0f32 } else { 0.0 }.to_bits();
+    words[20] = if key_tint() { 0.6f32 } else { 0.0 }.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -747,7 +783,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 20, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 21, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -855,7 +891,7 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
-    let mut words = [0u32; 20];
+    let mut words = [0u32; 21];
     words[0] = word;
     words[6] = views.size[0];
     words[7] = views.size[1];
@@ -867,7 +903,7 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 20, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 21, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
