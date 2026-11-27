@@ -591,6 +591,14 @@ pub(super) fn lane_branches_around(st: &Structured, needs: &[usize]) -> Option<V
     )
 }
 
+/// The instructions of `p` in blocks only some lanes run ([`all_lane_blocks`]), which a host
+/// wave none of whose lanes is there leaves out, and all of `p`'s (`VICTORY_WAVE_WHY=1`).
+pub(super) fn under_lane_branches(p: &Program, st: &Structured) -> Option<(usize, usize)> {
+    let all = all_lane_blocks(st)?;
+    let some = p.blocks.iter().enumerate().filter(|(b, _)| !all.get(*b).copied().unwrap_or(true)).map(|(_, blk)| blk.insts.len());
+    Some((some.sum(), p.blocks.iter().map(|blk| blk.insts.len()).sum()))
+}
+
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
 /// waves meeting there), which the other forms of the program may give it.
 pub(super) fn needs_every_lane(what: &str) -> bool {
