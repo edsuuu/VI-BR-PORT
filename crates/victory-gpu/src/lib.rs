@@ -38,6 +38,8 @@ mod book;
 #[cfg(windows)]
 mod dxc;
 #[cfg(windows)]
+mod dxr;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;

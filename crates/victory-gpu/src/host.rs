@@ -925,6 +925,9 @@ fn create() -> windows::core::Result<Host> {
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
         }
+        // whether the host could walk ray-tracing structures itself (tier 1.1: ray queries in
+        // translated programs); nothing uses it yet (`dxr`)
+        crate::dxr::log_tier(&device);
         let messages = debug
             .then(|| device.cast::<ID3D12InfoQueue>().ok())
             .flatten();
