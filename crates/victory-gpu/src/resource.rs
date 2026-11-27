@@ -1858,8 +1858,11 @@ pub(crate) fn targets_rule(most: u64, fixed: bool, now: u64, peak: u64, known: b
 /// draws or more since the last present), grows the targets' margin when
 /// the card's memory in use passed the system's budget (once a second at
 /// most), and says what the room for textures stands at: once a minute,
-/// and when the room kept for targets moved by 256 MB or more (once every
-/// five seconds at most).
+/// and when the room kept for targets moved by 256 MB or more or the
+/// queue's answer changed (once every five seconds at most). The line says
+/// what the queue counts as used and where it and the sweep stop, and the
+/// passes refused, copies let go and copies made again since the line
+/// before, so that a release run shows them too.
 ///
 /// What protects a cutscene or a resolution change whose new targets are
 /// larger than any before, once the textures have the room: the margin
@@ -1895,20 +1898,59 @@ pub(crate) fn targets_presented(frame: u64) {
             TARGETS_GROWN.store((grown + TARGETS_GROW_STEP).min(most), Relaxed);
         }
     }
-    static SAID: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+    // When the line was said, the room kept for targets then, and the
+    // queue's answer then (1 no room, 2 room).
+    static SAID: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
     let kept = targets_room_kept();
+    let has_room = room(Some([budget, used, 0, 0]));
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
     let (_, by) = targets_rule(most, fixed, targets, TARGETS_PEAK.load(Relaxed), targets_known(), TARGETS_GROWN.load(Relaxed));
     let last_ms = SAID[0].load(Relaxed);
     let moved = SAID[1].load(Relaxed).abs_diff(kept) >= 256 << 20;
-    if last_ms != 0 && now_ms.saturating_sub(last_ms) < 60_000 && !(moved && now_ms.saturating_sub(last_ms) >= 5000) {
+    // And when the queue's answer changed: a run shows when it was refused.
+    let more = room_line();
+    let turned = more && SAID[2].load(Relaxed) != 1 + u64::from(has_room);
+    if last_ms != 0
+        && now_ms.saturating_sub(last_ms) < 60_000
+        && !((moved || turned) && now_ms.saturating_sub(last_ms) >= 5000)
+    {
         return;
     }
     SAID[0].store(now_ms.max(1), Relaxed);
     SAID[1].store(kept, Relaxed);
+    SAID[2].store(1 + u64::from(has_room), Relaxed);
+    // Since the line before: passes refused (`crate::draw::HEAP_TEXTURES_FULL`),
+    // host copies let go and their bytes, made again and their bytes.
+    static BEFORE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+    let now = [
+        crate::draw::HEAP_TEXTURES_FULL.load(Relaxed),
+        KINDS[2].load(Relaxed),
+        KINDS[3].load(Relaxed),
+        KINDS[4].load(Relaxed),
+        KINDS[5].load(Relaxed),
+    ];
+    let since: [u64; 5] = std::array::from_fn(|i| now[i].saturating_sub(BEFORE[i].swap(now[i], Relaxed)));
+    let counted = card_use(used);
     let mb = |b: u64| b >> 20;
+    let told = if more {
+        format!(
+            " ({} MB in use as the queue counts it, {:.1} % of the budget; the queue stops at {} %{}, the sweep lets idle copies go from {} %, VICTORY_SWEEP_FROM_ROOM); since the line before: {} passes refused, {} host copies let go ({} MB), {} made again ({} MB)",
+            mb(counted),
+            counted as f64 * 100.0 / budget.max(1) as f64,
+            room_percent(),
+            texture_limit().map_or(String::new(), |limit| format!(" or {} MB of host copies (VICTORY_TEXTURE_BUDGET_MB)", mb(limit))),
+            crate::host::sweep_from(room_percent()),
+            since[0],
+            since[1],
+            mb(since[2]),
+            since[3],
+            mb(since[4]),
+        )
+    } else {
+        String::new()
+    };
     tracing::info!(
-        "the card's memory for textures: {} MB in use of a budget of {} MB (the system's count); kept for render targets not made yet {} MB ({:?}: targets hold {} MB now, {} MB at most; {} MB added after the budget was passed; VICTORY_CARD_ROOM_FOR_TARGETS_MB), {} MB for card copies of buffers, {} MB of texture blocks free; room for new textures: {}",
+        "the card's memory for textures: {} MB in use of a budget of {} MB (the system's count); kept for render targets not made yet {} MB ({:?}: targets hold {} MB now, {} MB at most; {} MB added after the budget was passed; VICTORY_CARD_ROOM_FOR_TARGETS_MB), {} MB for card copies of buffers, {} MB of texture blocks free; room for new textures: {}{}",
         mb(used),
         mb(budget),
         mb(kept),
@@ -1918,8 +1960,19 @@ pub(crate) fn targets_presented(frame: u64) {
         mb(TARGETS_GROWN.load(Relaxed)),
         mb(crate::shadow::card_room_kept()),
         mb(crate::pool::texture_room()),
-        if room(Some([budget, used, 0, 0])) { "yes" } else { "no" }
+        if has_room { "yes" } else { "no" },
+        told,
     );
+}
+
+/// Whether the room line ([`targets_presented`]) also comes when the
+/// queue's answer changed and says the queue's count, its line, the
+/// sweep's, and the refusals and copies let go and made again since the
+/// line before: `VICTORY_ROOM_LINE`, on unless `0` (the line as before).
+#[cfg(windows)]
+fn room_line() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ROOM_LINE").is_none_or(|v| v != "0"))
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
