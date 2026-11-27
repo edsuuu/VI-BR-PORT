@@ -1454,11 +1454,21 @@ pub(crate) extern "system" fn create_uav(
     record(handle, view);
 }
 
+/// `VICTORY_PLACED_VIEW_WORDS=0`: placed views are recorded with every word the title passed, padding
+/// and unused union words too, as before the two fixes below (each stray value a new shape).
+fn placed_fields_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PLACED_VIEW_WORDS").map_or(true, |v| v.trim() != "0"))
+}
+
 /// Copy only the fields of a placed resource description. Padding can differ
 /// between two views of the same texture and the caller may leave it unwritten.
 fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
     if desc.is_null() {
         return None;
+    }
+    if !placed_fields_only() {
+        return words(desc);
     }
     let src = desc.cast::<u32>();
     let mut fields = [0; 14];
@@ -1483,6 +1493,9 @@ fn placed_resource_words(desc: *const [u32; 14]) -> Option<[u32; 14]> {
 /// console's own fields) are kept; an unknown dimension keeps all.
 fn placed_view_words(desc: *const [u32; 16], unordered: bool) -> Option<[u32; 16]> {
     let mut d = words(desc)?;
+    if !placed_fields_only() {
+        return Some(d);
+    }
     // Words of the union each dimension uses (D3D12_BUFFER_SRV and the like).
     let (start, used) = if unordered {
         // D3D12_UAV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS,
