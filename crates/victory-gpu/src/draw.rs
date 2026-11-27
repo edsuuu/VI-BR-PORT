@@ -4372,6 +4372,11 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                 SHADER_RESOURCE
             };
             crate::list::ensure_state(list, *resource as This, state);
+            // Depth textures a program reads through a table (the lamps'
+            // cached shadow maps that `shadowSmartBlit:CS_DepthCopy` copies
+            // every frame are never written in it) are saved too.
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_read_depth(*resource as This);
             #[cfg(feature = "diagnostics")]
             if tracing::enabled!(tracing::Level::DEBUG)
                 && let Some(t) = crate::resource::host_resource(*resource as This)
