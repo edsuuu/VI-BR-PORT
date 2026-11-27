@@ -598,9 +598,316 @@ pub(crate) fn device_made(device: &ID3D12Device) -> Option<ID3D12CommandQueue> {
         log_version(sl, abi::FEATURE_REFLEX, "Reflex");
     }
     let dlss = functions.dlss_optimal.is_some() && functions.dlss_set_options.is_some();
+    // Reflex: low latency, which frame generation needs as well, or the mode
+    // `VICTORY_REFLEX` names; the markers go whenever either is on.
+    let mut reflex = false;
+    if let (Some(set_options), Some(_)) = (functions.reflex_set_options, functions.pcl_set_marker) {
+        let mode = plan
+            .asked
+            .reflex
+            .map_or(abi::REFLEX_LOW_LATENCY, Reflex::sl_mode);
+        let options = abi::ReflexOptions {
+            base: abi::BaseStructure::new(abi::REFLEX_OPTIONS, 1),
+            mode,
+            frame_limit_us: 0,
+            use_markers_to_optimize: false,
+            virtual_key: 0,
+            id_thread: 0,
+        };
+        // SAFETY: filled options; nothing else calls the library yet.
+        let code = unsafe { set_options(&options) };
+        reflex = code == 0;
+        tracing::info!(
+            code,
+            result = abi::result_name(code),
+            mode = plan
+                .asked
+                .reflex
+                .map_or("on (for frame generation)", Reflex::name),
+            sleep = plan.available.reflex && functions.reflex_sleep.is_some(),
+            "Streamline: Reflex options set; latency markers at the frame's begin, first submission and present"
+        );
+    } else if plan.available.framegen || plan.available.reflex {
+        tracing::warn!(
+            "Streamline: a Reflex or latency-marker function is missing; Reflex stays off"
+        );
+    }
     let _ = FUNCTIONS.set(functions);
     DLSS_READY.store(dlss, Release);
+    // (After the functions: a title thread that sees this finds them.)
+    REFLEX_READY.store(reflex, Release);
     None
+}
+
+/// Whether the latency markers run (Reflex or frame generation, with
+/// Streamline's functions found): the title's side then says where its
+/// frames begin, submit and present.
+#[inline]
+pub(crate) fn reflex_marking() -> bool {
+    REFLEX_READY.load(Relaxed)
+}
+
+/// Reflex's view of the title's frames: the newest begun (its index, the
+/// title's frame token) and whether its simulation ended (its first render
+/// submission), and the frames the title presented that our present has
+/// not shown yet, oldest first (our present comes later, on the line's
+/// thread, when the title may be in its next frame).
+struct Frames {
+    newest: Option<u32>,
+    ended: bool,
+    presents: std::collections::VecDeque<u32>,
+}
+
+static FRAMES: Mutex<Frames> = Mutex::new(Frames {
+    newest: None,
+    ended: true,
+    presents: std::collections::VecDeque::new(),
+});
+
+/// One frame token made and in use at a time: the programming guide calls
+/// `slGetNewFrameToken` not thread safe, and the headers do not say how
+/// many tokens it keeps, so a token is made from the frame's index where it
+/// is used and read before another is made.
+static TOKENS: Mutex<()> = Mutex::new(());
+
+/// Runs `f` with the frame token of `index`, none other made meanwhile.
+fn with_token(index: u32, f: impl FnOnce(*mut abi::FrameToken)) {
+    let Some(sl) = SL.get() else { return };
+    let _one = lock(&TOKENS);
+    let mut token = std::ptr::null_mut();
+    // SAFETY: an out pointer and an index.
+    let code = unsafe { (sl.get_new_frame_token)(&mut token, &index) };
+    if code == 0 && !token.is_null() {
+        f(token);
+    }
+}
+
+/// `markers` of frame `index`, in order.
+fn mark(index: u32, markers: &[u32]) {
+    let Some(marker) = FUNCTIONS.get().and_then(|f| f.pcl_set_marker) else {
+        return;
+    };
+    with_token(index, |token| {
+        for &m in markers {
+            // SAFETY: a marker for a token of ours.
+            unsafe { marker(m, token) };
+        }
+    });
+}
+
+/// Since the last Reflex line: frames begun, sleeps, the microseconds slept
+/// and the longest sleep, presents bound to a frame and those without one.
+static REFLEX_COUNTS: [std::sync::atomic::AtomicU64; 6] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+const R_BEGUN: usize = 0;
+const R_SLEEPS: usize = 1;
+const R_SLEPT_US: usize = 2;
+const R_SLEPT_LONGEST: usize = 3;
+const R_PRESENTS: usize = 4;
+const R_UNBOUND: usize = 5;
+/// A sleep took more than 2 s: none is asked for any more (the markers go
+/// on). The sleep has no bound in the header and runs on the title's thread.
+static SLEEP_OFF: AtomicBool = AtomicBool::new(false);
+const SLEEP_TOO_LONG_US: u64 = 2_000_000;
+
+/// The title waited for its frame origin and frame `frame` begins (its
+/// token): with `VICTORY_REFLEX` Reflex's sleep, then the simulation's
+/// start. On the title's thread, after our own clock's wait, with no lock
+/// of ours held. A frame before it that never submitted ends here first.
+///
+/// shortcut: the sleep is at the origin wait, where the title begins its
+/// frame; the title may read its input later in the frame (the other
+/// fork's runs saw that), and then the sleep paces a frame whose input is
+/// already read. Moving it to the title's input reading is the next step
+/// if the latency report says so.
+pub(crate) fn frame_begins(frame: u64) {
+    if !reflex_marking() {
+        return;
+    }
+    let index = frame as u32;
+    let owed = {
+        let mut frames = lock(&FRAMES);
+        let owed = frames.newest.filter(|_| !frames.ended);
+        frames.ended = true;
+        owed
+    };
+    if let Some(owed) = owed {
+        mark(owed, &[abi::SIMULATION_END, abi::RENDER_SUBMIT_START]);
+    }
+    REFLEX_COUNTS[R_BEGUN].fetch_add(1, Relaxed);
+    let sleep = FUNCTIONS.get().and_then(|f| f.reflex_sleep);
+    let asked = PLAN.get().is_some_and(|p| p.available.reflex);
+    if let Some(sleep) = sleep.filter(|_| asked && !SLEEP_OFF.load(Relaxed)) {
+        let mut made = std::ptr::null_mut();
+        with_token(index, |token| made = token);
+        // The token is read without the lock: held across the sleep, it
+        // would hold up the markers of the frame before.
+        let began = std::time::Instant::now();
+        // SAFETY: a token of ours.
+        unsafe { sleep(made) };
+        let took = began.elapsed().as_micros() as u64;
+        REFLEX_COUNTS[R_SLEEPS].fetch_add(1, Relaxed);
+        REFLEX_COUNTS[R_SLEPT_US].fetch_add(took, Relaxed);
+        REFLEX_COUNTS[R_SLEPT_LONGEST].fetch_max(took, Relaxed);
+        if took > SLEEP_TOO_LONG_US && !SLEEP_OFF.swap(true, Relaxed) {
+            tracing::warn!(
+                ms = took / 1000,
+                "Reflex: one slReflexSleep took more than 2 s: no further sleep is asked for in this run (the markers go on)"
+            );
+        }
+    }
+    mark(index, &[abi::SIMULATION_START]);
+    let mut frames = lock(&FRAMES);
+    frames.newest = Some(index);
+    frames.ended = false;
+}
+
+/// The title submits to a queue that draws: the newest frame's first such
+/// submission ends its simulation and begins its submissions.
+pub(crate) fn title_submits() {
+    if !reflex_marking() {
+        return;
+    }
+    let index = {
+        let mut frames = lock(&FRAMES);
+        if frames.ended {
+            return;
+        }
+        frames.ended = true;
+        frames.newest
+    };
+    if let Some(index) = index {
+        mark(index, &[abi::SIMULATION_END, abi::RENDER_SUBMIT_START]);
+    }
+}
+
+/// The title presents: the newest frame is the one shown (bound here, in
+/// the title's order); what it still owes is sent first.
+pub(crate) fn title_presents() {
+    if !reflex_marking() {
+        return;
+    }
+    let mut frames = lock(&FRAMES);
+    let Some(index) = frames.newest else { return };
+    if !frames.ended {
+        frames.ended = true;
+        drop(frames);
+        mark(index, &[abi::SIMULATION_END, abi::RENDER_SUBMIT_START]);
+        frames = lock(&FRAMES);
+    }
+    // A present shown twice, or presents our side never shows: kept short.
+    if frames.presents.back() != Some(&index) {
+        frames.presents.push_back(index);
+    }
+    while frames.presents.len() > 8 {
+        frames.presents.pop_front();
+    }
+}
+
+/// Our present of the oldest frame the title presented begins: its
+/// submissions end and its present starts. The frame's index, if it has one.
+fn reflex_present_begins() -> Option<u32> {
+    if !reflex_marking() {
+        return None;
+    }
+    let index = lock(&FRAMES).presents.pop_front();
+    match index {
+        Some(index) => {
+            REFLEX_COUNTS[R_PRESENTS].fetch_add(1, Relaxed);
+            mark(index, &[abi::RENDER_SUBMIT_END, abi::PRESENT_START]);
+        }
+        None => {
+            REFLEX_COUNTS[R_UNBOUND].fetch_add(1, Relaxed);
+        }
+    }
+    index
+}
+
+/// Our present of frame `index` returned.
+fn reflex_present_ends(index: Option<u32>) {
+    if let Some(index) = index {
+        mark(index, &[abi::PRESENT_END]);
+    }
+    if let Some(line) = reflex_line() {
+        tracing::info!("{line}");
+    }
+}
+
+/// About every ten seconds (on the presenting thread): Reflex's own state
+/// and what was done since the last line.
+fn reflex_line() -> Option<String> {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    {
+        let mut last = lock(&LAST);
+        let now = std::time::Instant::now();
+        match *last {
+            Some(at) if now.duration_since(at) < std::time::Duration::from_secs(10) => return None,
+            None => {
+                *last = Some(now);
+                return None;
+            }
+            _ => *last = Some(now),
+        }
+    }
+    let [begun, sleeps, slept, longest, presents, unbound] =
+        [0, 1, 2, 3, 4, 5].map(|i| REFLEX_COUNTS[i].swap(0, Relaxed));
+    let state = FUNCTIONS.get().and_then(|f| f.reflex_get_state).map(|get| {
+        let mut state = abi::ReflexState::new();
+        // SAFETY: a state to fill.
+        let code = unsafe { get(&mut *state) };
+        (code, state)
+    });
+    let reported = match &state {
+        Some((0, state)) => {
+            let (low, available) = (
+                state.low_latency_available != 0,
+                state.latency_report_available != 0,
+            );
+            let valid: Vec<&abi::ReflexReport> = state
+                .frame_report
+                .iter()
+                .filter(|r| {
+                    r.frame_id != 0
+                        && r.sim_start_time != 0
+                        && r.gpu_render_end_time > r.sim_start_time
+                })
+                .collect();
+            let n = valid.len().max(1) as f64;
+            let total = valid
+                .iter()
+                .map(|r| (r.gpu_render_end_time - r.sim_start_time) as f64)
+                .sum::<f64>()
+                / n;
+            let gpu = valid
+                .iter()
+                .map(|r| f64::from(r.gpu_frame_time_us))
+                .sum::<f64>()
+                / n;
+            format!(
+                "low latency {}, latency report {}: over {} frames from simulation start to the end of GPU rendering {total:.0} on average (the header names no unit), GPU frame time {:.2} ms on average",
+                if low { "available" } else { "NOT available" },
+                if available {
+                    "available"
+                } else {
+                    "not available"
+                },
+                valid.len(),
+                gpu / 1000.0
+            )
+        }
+        Some((code, _)) => format!("slReflexGetState: {} ({code})", abi::result_name(*code)),
+        None => "no slReflexGetState".into(),
+    };
+    Some(format!(
+        "Reflex state: {reported}; since the last line {begun} frames begun, {sleeps} sleeps of {:.2} ms on average (the longest {:.2} ms){}, {presents} presents bound to a frame, {unbound} without one",
+        slept as f64 / 1000.0 / sleeps.max(1) as f64,
+        longest as f64 / 1000.0,
+        if SLEEP_OFF.load(Relaxed) {
+            ", NO sleep is asked for any more"
+        } else {
+            ""
+        }
+    ))
 }
 
 fn log_version(sl: &Sl, feature: u32, name: &str) {
@@ -618,5 +925,25 @@ fn log_version(sl: &Sl, feature: u32, name: &str) {
             "Streamline: {name} has no version: {} ({code})",
             abi::result_name(code)
         );
+    }
+}
+
+/// What [`present_begins`] began, for [`present_ends`].
+pub(crate) struct Presenting {
+    /// The Reflex index of the frame shown, if it has one.
+    index: Option<u32>,
+}
+
+/// Right before our swap chain's Present: the frame's latency markers.
+pub(crate) fn present_begins() -> Presenting {
+    Presenting {
+        index: reflex_present_begins(),
+    }
+}
+
+/// Right after our swap chain's Present returned.
+pub(crate) fn present_ends(presenting: Presenting) {
+    if reflex_marking() {
+        reflex_present_ends(presenting.index);
     }
 }

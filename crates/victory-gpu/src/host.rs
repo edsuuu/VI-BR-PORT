@@ -10991,7 +10991,9 @@ impl Host {
             // it, or the copy would write a buffer the compositor holds
             // (device removed, 0x887A002B).
             send_thread::wait_idle();
+            let presenting = crate::streamline::present_begins();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -11166,7 +11168,9 @@ impl Host {
             // it, or the copy would write a buffer the compositor holds
             // (device removed, 0x887A002B).
             send_thread::wait_idle();
+            let presenting = crate::streamline::present_begins();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            crate::streamline::present_ends(presenting);
             p.meter.frame(p.hwnd);
         }
         Some(false)
