@@ -97,6 +97,7 @@ mod upload;
 mod watch;
 #[cfg(windows)]
 mod texback;
+mod water;
 
 #[cfg(windows)]
 pub use host::on_failure;

@@ -406,7 +406,6 @@ pub(crate) fn skips_rt_skin(this: This) -> bool {
     static ACTIVATE: OnceLock<bool> = OnceLock::new();
     static TRACE: OnceLock<bool> = OnceLock::new();
     static SHADOW: OnceLock<bool> = OnceLock::new();
-    static WATER: OnceLock<bool> = OnceLock::new();
     if this.is_null() {
         return false;
     }
@@ -432,10 +431,9 @@ pub(crate) fn skips_rt_skin(this: This) -> bool {
         // 4060 Ti, Series S profile, the first boat ride, runs barco-s-agua0 and barco-s-agua1
         // of 27 Nov) they cost half a frame a second (23.8 fps with them, 24.3 without) and
         // without them the water near the boat is black instead of lit green, so they run;
-        // `VICTORY_WATER_LIGHT=0` leaves them out on a host of 32-lane waves.
-        RayOnly::WaterLight => *WATER.get_or_init(|| {
-            victory_shader::emit::host_settings()[0] == 32 && std::env::var_os("VICTORY_WATER_LIGHT").is_some_and(|v| v == "0")
-        }),
+        // `VICTORY_WATER_LIGHT=0` leaves them out on a host of 32-lane waves, and `auto` in
+        // the frames that draw no water ([`crate::water`]).
+        RayOnly::WaterLight => crate::water::leaves_out(),
     }
 }
 
@@ -571,6 +569,10 @@ struct Pipeline {
     /// ([`for_rays`]).
     #[cfg(windows)]
     rt_only: RayOnly,
+    /// Its programs count as water drawn for `VICTORY_WATER_LIGHT=auto`
+    /// ([`crate::water::is_sign`]).
+    #[cfg(windows)]
+    water_sign: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -589,6 +591,12 @@ pub(crate) fn bound(this: This) {
         return;
     }
     let p = pipeline(this);
+    // At every bind, not only the first: the water's light runs in frames
+    // that draw water.
+    #[cfg(windows)]
+    if p.water_sign {
+        crate::water::seen();
+    }
     if p.bound.swap(true, std::sync::atomic::Ordering::Relaxed) {
         return;
     }
@@ -766,6 +774,8 @@ fn hand_out(
         builder,
         #[cfg(windows)]
         rt_only: shaders.iter().filter(|s| s.stage == "compute").map(|s| for_rays(&s.container)).find(|k| *k != RayOnly::No).unwrap_or(RayOnly::No),
+        #[cfg(windows)]
+        water_sign: crate::water::is_sign(shaders.iter().map(|s| &s.container[..])),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
