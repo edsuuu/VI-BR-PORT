@@ -395,6 +395,26 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             first_points_at = format_args!("{first:x?}"),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
+        // Diagnostic: `VICTORY_PSO_DUMP=<dir>` writes the description and every block it names
+        // as (title address, byte count), to learn what the method is given.
+        #[cfg(windows)]
+        if let (Some(dir), Some(w)) = (std::env::var_os("VICTORY_PSO_DUMP"), description.as_ref()) {
+            let dir = std::path::Path::new(&dir);
+            let _ = std::fs::create_dir_all(dir);
+            let stem = format!("{SLOT:x}-{calls:05}");
+            let mut text = format!("{w:x?}\n");
+            for k in 1..w.len() - 1 {
+                let (at, len) = (w[k], w[k + 1]);
+                if (0x1_0000_0000..0x100_0000_0000).contains(&at) && (1..=0x10_0000).contains(&len) {
+                    let mut bytes = vec![0u8; len as usize];
+                    let got = crate::host::read_there(at as *const u8, &mut bytes);
+                    let head: String = bytes.iter().take(16).map(|b| format!("{b:02x}")).collect();
+                    text.push_str(&format!("word {k}: {at:#x} {len:#x} read {got} head {head}\n"));
+                    let _ = std::fs::write(dir.join(format!("{stem}-w{k}-{at:x}.bin")), &bytes);
+                }
+            }
+            let _ = std::fs::write(dir.join(format!("{stem}.txt")), text);
+        }
     }
     E_NOTIMPL
 }
