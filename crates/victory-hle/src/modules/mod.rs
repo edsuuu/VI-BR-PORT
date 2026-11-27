@@ -18,6 +18,8 @@ pub mod dsp;
 pub mod dstorage;
 #[cfg(windows)]
 pub mod files;
+#[cfg(windows)]
+pub mod fidelityfx;
 pub mod gameinput;
 pub mod kernel;
 #[cfg(windows)]

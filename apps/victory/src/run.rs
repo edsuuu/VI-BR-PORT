@@ -149,6 +149,14 @@ pub fn run(
         inner: &resolver,
         dlls: &dlls,
     };
+    // NVIDIA Streamline (`VICTORY_DLSS`, `VICTORY_FRAMEGEN`, `VICTORY_REFLEX`;
+    // off by default): loaded before the imports are bound, so that with
+    // DLSS the title's FidelityFX imports go through ours; nothing is loaded
+    // without a switch.
+    #[cfg(windows)]
+    let streamline = victory_hle::streamline::init();
+    #[cfg(windows)]
+    let with_dlls = victory_hle::modules::fidelityfx::Interpose { inner: &with_dlls };
     let show = |name: &str, report: BindReport| {
         println!(
             "bound          {name}: {} hle, {} host, {} title, {} missing",
@@ -183,7 +191,15 @@ pub fn run(
     // took FidelityFX, whose passes do not run here, and lost the card.
     // First, before any thread started below can read or write the image.
     #[cfg(windows)]
-    crate::title_patch::apply(&image)?;
+    {
+        let asked = victory_hle::streamline::Asked::from_env().ok();
+        let dlss = crate::title_patch::DlssAsk {
+            asked: asked.as_ref().is_some_and(|a| a.dlss.on()),
+            loaded: streamline.dlss,
+            scale: asked.and_then(|a| a.dlss.mode()).map(|m| m.scale()),
+        };
+        crate::title_patch::apply(&image, dlss)?;
+    }
     #[cfg(feature = "diagnostics")]
     diagnostics(&image, &cfg)?;
     let late = LateDlls {

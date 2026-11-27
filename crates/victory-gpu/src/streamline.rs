@@ -29,7 +29,7 @@ pub use plan::{Dlss, Mode, Reflex};
 
 use std::ffi::{CStr, c_char, c_void};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::*};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -697,8 +697,7 @@ fn mark(index: u32, markers: &[u32]) {
 
 /// Since the last Reflex line: frames begun, sleeps, the microseconds slept
 /// and the longest sleep, presents bound to a frame and those without one.
-static REFLEX_COUNTS: [std::sync::atomic::AtomicU64; 6] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+static REFLEX_COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 const R_BEGUN: usize = 0;
 const R_SLEEPS: usize = 1;
 const R_SLEPT_US: usize = 2;
@@ -945,5 +944,429 @@ pub(crate) fn present_begins() -> Presenting {
 pub(crate) fn present_ends(presenting: Presenting) {
     if reflex_marking() {
         reflex_present_ends(presenting.index);
+    }
+}
+
+/// The viewport of the upscaling; frame generation's is 0.
+const VIEWPORT_DLSS: u32 = 1;
+
+/// Whether the title's FidelityFX calls are to be served (DLSS on and
+/// Streamline loaded): `victory_hle` then puts its own in front of them.
+pub fn serving() -> bool {
+    PLAN.get().is_some_and(|p| p.available.dlss)
+}
+
+/// One upscaling the title asked for: a FidelityFX `ffxDispatch` of an
+/// upscale, in its own terms (`victory_hle::modules::fidelityfx` reads it).
+#[derive(Clone, Copy, Debug)]
+pub struct Upscale {
+    /// The FidelityFX context.
+    pub context: usize,
+    /// The title's command list.
+    pub list: *const crate::object::Object,
+    /// Colour, depth, motion vectors, exposure, reactive mask, transparency
+    /// and composition mask, output: the title's resource (null if none) and
+    /// the FidelityFX state it is in.
+    pub resources: [(*const crate::object::Object, u32); 7],
+    pub camera: plan::Camera,
+    pub pre_exposure: f32,
+}
+
+// SAFETY: pointers to title objects that live until the list has run (the
+// title's part, as on the console); nothing else is shared.
+unsafe impl Send for Upscale {}
+
+pub const COLOUR: usize = 0;
+pub const DEPTH: usize = 1;
+pub const MOTION: usize = 2;
+pub const EXPOSURE: usize = 3;
+pub const REACTIVE: usize = 4;
+pub const OUTPUT: usize = 6;
+
+/// What became of an upscaling.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Taken {
+    /// DLSS does it: the title's own must not run.
+    Dlss,
+    /// Not taken: the title's own runs. Why, for the log.
+    No(&'static str),
+}
+
+// Since the last frame-rate line: upscalings recorded by DLSS, failed (the
+// output keeps what it had), left to the title's FidelityFX.
+static EVALUATED: AtomicU64 = AtomicU64::new(0);
+static FAILED: AtomicU64 = AtomicU64::new(0);
+static FORWARDED: AtomicU64 = AtomicU64::new(0);
+static EVALUATED_ALL: AtomicU64 = AtomicU64::new(0);
+/// Upscalings noted so far (their ids, the DLSS frame index).
+static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Library calls that are not thread safe, and what the upscaling keeps
+/// between frames, one caller at a time.
+struct Calls {
+    /// Optimal render sizes by output size and mode.
+    optimal: Vec<([u32; 2], u32, Option<[u32; 2]>)>,
+    /// The mode and sizes the last options named.
+    last: Option<(u32, [u32; 2], [u32; 2])>,
+}
+
+static CALLS: Mutex<Calls> = Mutex::new(Calls {
+    optimal: Vec::new(),
+    last: None,
+});
+
+/// The upscaling `up` asked for on the title's thread: DLSS records it at
+/// this place of the title's list instead; the title's own runs otherwise.
+pub fn upscale(up: &Upscale) -> Taken {
+    if !serving() {
+        return Taken::No("Streamline's DLSS is not loaded");
+    }
+    if !DLSS_READY.load(Acquire) {
+        return Taken::No("Streamline has no device yet, or DLSS's functions were not found");
+    }
+    if [COLOUR, DEPTH, MOTION, OUTPUT]
+        .iter()
+        .any(|&i| up.resources[i].0.is_null())
+    {
+        return Taken::No("a required texture (colour, depth, motion vectors, output) is missing");
+    }
+    if up.camera.render.contains(&0) || up.camera.output.contains(&0) {
+        return Taken::No("an empty render or output size");
+    }
+    if let Err(why) = validate(up) {
+        return Taken::No(why);
+    }
+    let id = NEXT_ID.fetch_add(1, Relaxed) + 1;
+    let up = *up;
+    let asked = crate::list::external(
+        up.list.cast(),
+        Box::new(move |host| {
+            framegen_note(host, &up, id);
+            evaluate(host, &up, id)
+        }),
+    );
+    if !asked {
+        return Taken::No("the title's list records nowhere (no host list)");
+    }
+    Taken::Dlss
+}
+
+/// The title's own upscaling ran.
+pub fn forwarded() {
+    FORWARDED.fetch_add(1, Relaxed);
+}
+
+/// What an upscaling's textures must be for DLSS, checked on the title's
+/// thread (the title's own runs if not): host textures, in states they can
+/// be in.
+fn validate(up: &Upscale) -> Result<(), &'static str> {
+    for (i, &(resource, state)) in up.resources.iter().enumerate() {
+        if resource.is_null() || i == 5 {
+            continue;
+        }
+        let resource = resource.cast();
+        if !crate::resource::is_resource(resource) {
+            return Err("a texture of the upscaling is no resource of ours");
+        }
+        let Some(copy) = crate::resource::host_copy(resource) else {
+            return Err("a texture of the upscaling has no host copy (a buffer?)");
+        };
+        let wanted = if i == OUTPUT {
+            plan::output_state(state)
+        } else {
+            plan::input_state(state)
+        };
+        if crate::host::legal_state(&copy.texture, wanted) != wanted {
+            return Err(if i == OUTPUT {
+                "the output cannot be written by a shader (no unordered access)"
+            } else {
+                "an input cannot be read by a shader"
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Colour, depth, motion vectors, exposure, reactive mask, (transparency),
+/// output: the host textures DLSS is given and the states they are in.
+type Textures = [Option<(ID3D12Resource, u32)>; 7];
+
+/// DLSS in place of the title's upscaling, recorded into `host` (where the
+/// title's list is now). Whether it recorded anything.
+fn evaluate(host: &crate::host::HostList, up: &Upscale, id: u64) -> bool {
+    let Some(plan) = PLAN.get() else { return false };
+    let camera = up.camera;
+    let fail = |why: &str| {
+        FAILED.fetch_add(1, Relaxed);
+        tracing::warn!(
+            id,
+            "DLSS: the upscaling was not recorded: {why} (the output keeps what it had)"
+        );
+        false
+    };
+    // The inputs as a compute shader's would be (aliased views, uploads of
+    // title-written textures, depth twins), then in the states DLSS is told.
+    let used = |i: usize| {
+        !up.resources[i].0.is_null()
+            && (i != REACTIVE || plan.asked.reactive)
+            && (i != EXPOSURE || camera.flags & plan::FFX_AUTO_EXPOSURE == 0)
+    };
+    let mut textures: Textures = Default::default();
+    for i in [COLOUR, DEPTH, MOTION, EXPOSURE, REACTIVE, OUTPUT] {
+        if !used(i) {
+            continue;
+        }
+        let (resource, state) = up.resources[i];
+        let resource = resource.cast();
+        if i != OUTPUT && crate::external::prepare_input(host, resource).is_none() {
+            return fail("an input could not be prepared");
+        }
+        let wanted = if i == OUTPUT {
+            plan::output_state(state)
+        } else {
+            plan::input_state(state)
+        };
+        let Some((texture, legal)) = crate::external::host_texture(host, resource, wanted) else {
+            return fail("a texture has no host copy");
+        };
+        if legal != wanted {
+            return fail("a texture cannot be in the state DLSS needs");
+        }
+        textures[i] = Some((texture, legal));
+    }
+    let recorded = match record(host.list.as_raw(), &textures, &camera, up.pre_exposure, id) {
+        Ok(recorded) => recorded,
+        Err(why) => return fail(&why),
+    };
+    crate::external::output_written(up.resources[OUTPUT].0.cast());
+    EVALUATED.fetch_add(1, Relaxed);
+    let all = EVALUATED_ALL.fetch_add(1, Relaxed) + 1;
+    if all == 1 || recorded.changed {
+        let formats: Vec<i32> = textures
+            .iter()
+            .flatten()
+            // SAFETY: a live texture.
+            .map(|(t, _)| unsafe { t.GetDesc() }.Format.0)
+            .collect();
+        tracing::info!(
+            render = ?camera.render,
+            output = ?camera.output,
+            mode = plan::sl_mode_name(recorded.mode),
+            asked = plan.asked.dlss.mode().map_or("by the sizes", Mode::name),
+            preset = plan.asked.preset,
+            optimal = ?recorded.optimal,
+            hdr = camera.flags & plan::FFX_HIGH_DYNAMIC_RANGE != 0,
+            depth_inverted = camera.depth_inverted(),
+            auto_exposure = textures[EXPOSURE].is_none(),
+            reactive = textures[REACTIVE].is_some(),
+            display_motion_vectors = camera.display_motion_vectors(),
+            jitter = ?recorded.jitter,
+            mvec_scale = ?recorded.mvec_scale,
+            near = camera.near,
+            far = camera.far,
+            fov = camera.fov_y,
+            ?formats,
+            evaluations = all,
+            "DLSS: upscaling recorded in place of the title's FidelityFX"
+        );
+    }
+    true
+}
+
+/// What [`record`] recorded.
+struct Recorded {
+    mode: u32,
+    optimal: Option<[u32; 2]>,
+    /// Another mode or size than the last time.
+    changed: bool,
+    jitter: [f32; 2],
+    mvec_scale: [f32; 2],
+}
+
+/// The DLSS evaluation of `textures` recorded into the open command list
+/// `list`: the mode whose render size holds the title's, the options, the
+/// frame's constants (frame `id` of the upscaling's viewport), the textures
+/// as local tags. The textures are left in the states given (Streamline
+/// moves them to what it needs and back).
+fn record(
+    list: *mut c_void,
+    textures: &Textures,
+    camera: &plan::Camera,
+    pre_exposure: f32,
+    id: u64,
+) -> Result<Recorded, String> {
+    let (Some(plan), Some(sl), Some(functions)) = (PLAN.get(), SL.get(), FUNCTIONS.get()) else {
+        return Err("Streamline is not ready".into());
+    };
+    let (Some(optimal_of), Some(set_options)) =
+        (functions.dlss_optimal, functions.dlss_set_options)
+    else {
+        return Err("no DLSS functions".into());
+    };
+    let mut calls = lock(&CALLS);
+    let output = camera.output;
+    let mut sizes = Vec::new();
+    for &mode in &plan::MODES {
+        let known = calls
+            .optimal
+            .iter()
+            .find(|(o, m, _)| *o == output && *m == mode)
+            .map(|k| k.2);
+        let size = known.unwrap_or_else(|| {
+            let options = abi::DlssOptions::new(mode, output, plan.asked.preset);
+            let mut settings = abi::DlssOptimalSettings::default();
+            // SAFETY: filled options and a structure to fill.
+            let code = unsafe { optimal_of(&options, &mut settings) };
+            let size = (code == 0 && settings.optimal_render_width > 0).then_some([
+                settings.optimal_render_width,
+                settings.optimal_render_height,
+            ]);
+            calls.optimal.push((output, mode, size));
+            size
+        });
+        sizes.push((mode, size));
+    }
+    let optimal_of_mode = |m: u32| sizes.iter().find(|s| s.0 == m).and_then(|s| s.1);
+    let preferred = plan.asked.dlss.mode().map(Mode::sl_mode);
+    let mode =
+        plan::pick_mode(camera.render, output, preferred, optimal_of_mode).ok_or_else(|| {
+            format!(
+                "no DLSS mode takes a {:?} render for a {output:?} output",
+                camera.render
+            )
+        })?;
+    let mut options = abi::DlssOptions::new(mode, output, plan.asked.preset);
+    options.pre_exposure = if pre_exposure > 0.0 {
+        pre_exposure
+    } else {
+        1.0
+    };
+    options.color_buffers_hdr = abi::boolean(camera.flags & plan::FFX_HIGH_DYNAMIC_RANGE != 0);
+    options.use_auto_exposure = abi::boolean(textures[EXPOSURE].is_none());
+    let viewport = abi::ViewportHandle::new(VIEWPORT_DLSS);
+    // SAFETY: filled options for our viewport.
+    let code = unsafe { set_options(&viewport, &options) };
+    if code != 0 {
+        return Err(format!(
+            "slDLSSSetOptions: {} ({code})",
+            abi::result_name(code)
+        ));
+    }
+    let changed = calls.last != Some((mode, camera.render, output));
+    calls.last = Some((mode, camera.render, output));
+    let constants = camera.constants(plan.asked.jitter, plan.asked.mvec);
+    let kinds = [
+        (COLOUR, abi::BUFFER_SCALING_INPUT_COLOR, camera.render),
+        (DEPTH, abi::BUFFER_DEPTH, camera.render),
+        (MOTION, abi::BUFFER_MOTION_VECTORS, camera.motion_size()),
+        (EXPOSURE, abi::BUFFER_EXPOSURE, [1, 1]),
+        (REACTIVE, abi::BUFFER_BIAS_CURRENT_COLOR_HINT, camera.render),
+        (OUTPUT, abi::BUFFER_SCALING_OUTPUT_COLOR, output),
+    ];
+    let mut resources: Vec<(abi::Resource, u32, [u32; 2])> = kinds
+        .iter()
+        .filter_map(|&(i, kind, size)| {
+            let (t, state) = textures[i].as_ref()?;
+            Some((abi::Resource::texture(t.as_raw(), *state), kind, size))
+        })
+        .collect();
+    let mut tags: Vec<abi::ResourceTag> = resources
+        .iter_mut()
+        .map(|(r, kind, size)| {
+            abi::ResourceTag::new(
+                r,
+                *kind,
+                abi::VALID_UNTIL_EVALUATE,
+                abi::Extent::sized(*size),
+            )
+        })
+        .collect();
+    let mut result = Ok(());
+    // The constants and the evaluation name one frame: one token for both,
+    // none other made meanwhile.
+    with_token(id as u32, |token| {
+        // SAFETY: constants for this frame and viewport.
+        let code = unsafe { (sl.set_constants)(&constants, token, &viewport) };
+        if code != 0 {
+            result = Err(format!(
+                "slSetConstants: {} ({code})",
+                abi::result_name(code)
+            ));
+            return;
+        }
+        let mut inputs: Vec<*const abi::BaseStructure> = vec![std::ptr::from_ref(&viewport.base)];
+        inputs.extend(tags.iter_mut().map(|t| std::ptr::from_ref(&t.base)));
+        // SAFETY: an open command list; inputs that live through the call.
+        let code = unsafe {
+            (sl.evaluate_feature)(
+                abi::FEATURE_DLSS,
+                token,
+                inputs.as_ptr(),
+                inputs.len() as u32,
+                list,
+            )
+        };
+        if code != 0 {
+            result = Err(format!(
+                "slEvaluateFeature: {} ({code})",
+                abi::result_name(code)
+            ));
+        }
+    });
+    result?;
+    Ok(Recorded {
+        mode,
+        optimal: optimal_of_mode(mode),
+        changed,
+        jitter: constants.jitter_offset,
+        mvec_scale: constants.mvec_scale,
+    })
+}
+
+/// The title's FidelityFX upscaler is destroyed: what DLSS made for it goes
+/// once submitted work has run.
+pub fn upscaler_destroyed() {
+    let (Some(sl), true) = (SL.get(), DLSS_READY.load(Acquire)) else {
+        return;
+    };
+    crate::external::finish_submitted();
+    let viewport = abi::ViewportHandle::new(VIEWPORT_DLSS);
+    let mut calls = lock(&CALLS);
+    // SAFETY: our viewport; nothing that names it is in flight.
+    let code = unsafe { (sl.free_resources)(abi::FEATURE_DLSS, &viewport) };
+    calls.last = None;
+    tracing::info!(
+        code,
+        result = abi::result_name(code),
+        "DLSS: the title's upscaler was destroyed; DLSS let go of its resources"
+    );
+}
+
+/// For the frame-rate line (`frames` presented since the last): what DLSS
+/// did. `None` with Streamline's DLSS not loaded.
+fn dlss_line(frames: f64) -> Option<String> {
+    if !serving() {
+        return None;
+    }
+    let per_frame = |c: &AtomicU64| c.swap(0, Relaxed) as f64 / frames.max(1.0);
+    let (done, failed, forwarded) = (
+        per_frame(&EVALUATED),
+        per_frame(&FAILED),
+        per_frame(&FORWARDED),
+    );
+    Some(format!(
+        "DLSS per frame: {done:.2} upscalings by DLSS, {failed:.2} failed, {forwarded:.2} left to the title's FidelityFX"
+    ))
+}
+
+/// Frame generation's note of an upscaling's depth and motion vectors on
+/// the host list that recorded it (nothing until frame generation is in).
+fn framegen_note(_host: &crate::host::HostList, _up: &Upscale, _id: u64) {}
+
+/// The lines of the frame-rate line's second (`frames` presented since the
+/// last), with Streamline's features on.
+pub(crate) fn line(frames: f64) {
+    if let Some(line) = dlss_line(frames) {
+        tracing::info!("{line}");
     }
 }

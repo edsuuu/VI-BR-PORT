@@ -10218,6 +10218,7 @@ impl Meter {
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
         late_line(frames);
+        crate::streamline::line(frames);
         crate::queue::behind_line(frames);
         crate::titletime::line(frames);
         card_clock_line(frames, ms);
