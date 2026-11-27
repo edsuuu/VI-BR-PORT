@@ -5343,7 +5343,8 @@ impl Host {
                         let run = crate::shadow::CardSpan { pieces: (j - i) as u32, ..r.span };
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        card_pass(list, &run, size as u32, r.at, 2);
+                        let n = card_pass(list, &run, size as u32, r.at, 2);
+                        CARD_PASSES[4].fetch_add(n, Ordering::Relaxed);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                         let copy = std::sync::Arc::as_ptr(&r.shadow) as usize;
                         match read.as_mut() {
