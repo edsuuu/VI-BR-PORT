@@ -632,11 +632,148 @@ pub(crate) fn device_made(device: &ID3D12Device) -> Option<ID3D12CommandQueue> {
             "Streamline: a Reflex or latency-marker function is missing; Reflex stays off"
         );
     }
+    // Frame generation: its functions, Reflex's markers, and the direct
+    // queue made through the device proxy (it hooks queue creation).
+    let framegen_functions =
+        functions.dlssg_set_options.is_some() && functions.dlssg_get_state.is_some();
+    let queue = (plan.available.framegen && framegen_functions && reflex)
+        .then(|| proxied_queue(sl, device))
+        .flatten();
+    if plan.available.framegen && queue.is_none() {
+        tracing::warn!(
+            "DLSS Frame Generation stays off: the device hand-over to Streamline did not complete"
+        );
+    }
+    if plan.available.framegen && !plan.available.dlss {
+        tracing::warn!(
+            "DLSS Frame Generation takes the depth and motion vectors of DLSS's upscaling: without VICTORY_DLSS it never switches on"
+        );
+    }
     let _ = FUNCTIONS.set(functions);
     DLSS_READY.store(dlss, Release);
+    FG_READY.store(queue.is_some(), Release);
     // (After the functions: a title thread that sees this finds them.)
     REFLEX_READY.store(reflex, Release);
-    None
+    queue
+}
+
+/// The direct queue, made through Streamline's proxy of `device` (frame
+/// generation hooks queue creation); the native queue is returned for our
+/// use and the proxy kept for the swap chain.
+fn proxied_queue(sl: &Sl, device: &ID3D12Device) -> Option<ID3D12CommandQueue> {
+    let mut raw = device.as_raw();
+    // SAFETY: an owned reference of ours; on success `raw` is a new proxy
+    // that holds its own reference to the device.
+    let code = unsafe { (sl.upgrade_interface)(&mut raw) };
+    if code != 0 || raw.is_null() || raw == device.as_raw() {
+        tracing::warn!(
+            "Streamline: the device was not upgraded: {} ({code})",
+            abi::result_name(code)
+        );
+        return None;
+    }
+    // SAFETY: the proxy's one reference, now ours.
+    let proxy_device = unsafe { ID3D12Device::from_raw(raw) };
+    let desc = D3D12_COMMAND_QUEUE_DESC {
+        Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+        ..Default::default()
+    };
+    // SAFETY: plain queue creation through the proxy.
+    let proxy_queue: ID3D12CommandQueue = match unsafe { proxy_device.CreateCommandQueue(&desc) } {
+        Ok(q) => q,
+        Err(e) => {
+            tracing::warn!(error = %e, "Streamline: no queue from the device proxy");
+            return None;
+        }
+    };
+    let mut native = std::ptr::null_mut();
+    // SAFETY: a proxy queue; the native one comes back with a reference.
+    let code = unsafe { (sl.get_native_interface)(proxy_queue.as_raw(), &mut native) };
+    if code != 0 || native.is_null() {
+        tracing::warn!(
+            "Streamline: no native queue behind the proxy: {} ({code})",
+            abi::result_name(code)
+        );
+        return None;
+    }
+    // SAFETY: the reference slGetNativeInterface added.
+    let native = unsafe { ID3D12CommandQueue::from_raw(native) };
+    tracing::info!(
+        "Streamline: the direct queue was made through the device proxy (frame generation)"
+    );
+    let _ = PROXIES.set(Proxies {
+        _device: proxy_device,
+        queue: proxy_queue,
+    });
+    Some(native)
+}
+
+/// Streamline's proxies kept for frame generation: the device that made the
+/// direct queue and the queue the swap chain is made on.
+struct Proxies {
+    _device: ID3D12Device,
+    queue: ID3D12CommandQueue,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for Proxies {}
+// SAFETY: as above.
+unsafe impl Sync for Proxies {}
+
+static PROXIES: OnceLock<Proxies> = OnceLock::new();
+/// Our present goes through Streamline's swap chain.
+static SWAP_CHAIN_PROXIED: AtomicBool = AtomicBool::new(false);
+
+/// Whether frame generation is ready to take our swap chain (the back
+/// buffer is then made at the scene plane's size, `plan::framegen_back_buffer`).
+pub(crate) fn framegen_ready() -> bool {
+    FG_READY.load(Acquire)
+}
+
+/// For frame generation: Streamline's proxy of `factory` and the queue
+/// proxy to make the swap chain with; `None` to make it as before.
+pub(crate) fn swap_chain_factory(
+    factory: &IDXGIFactory2,
+) -> Option<(IDXGIFactory2, ID3D12CommandQueue)> {
+    if !framegen_ready() {
+        return None;
+    }
+    let sl = SL.get()?;
+    let queue = PROXIES.get()?.queue.clone();
+    let mut raw = factory.as_raw();
+    // SAFETY: as for the device: a new proxy with its own reference.
+    let code = unsafe { (sl.upgrade_interface)(&mut raw) };
+    if code != 0 || raw.is_null() || raw == factory.as_raw() {
+        tracing::warn!(
+            "Streamline: the DXGI factory was not upgraded: {} ({code})",
+            abi::result_name(code)
+        );
+        FG_READY.store(false, Release);
+        return None;
+    }
+    // SAFETY: the proxy's reference, now ours.
+    Some((unsafe { IDXGIFactory2::from_raw(raw) }, queue))
+}
+
+/// The swap chain was made through the proxy (or not, after all: then
+/// frame generation stays off).
+pub(crate) fn swap_chain_made(proxied: bool, error: Option<&windows::core::Error>) {
+    SWAP_CHAIN_PROXIED.store(proxied, Release);
+    if proxied {
+        tracing::info!(
+            "Streamline: our swap chain is Streamline's proxy; DLSS Frame Generation can run on its presents"
+        );
+    } else {
+        FG_READY.store(false, Release);
+        tracing::warn!(
+            error = error.map(|e| e.to_string()).unwrap_or_default(),
+            "Streamline: the swap chain could not be made through the proxy; made as before, frame generation off"
+        );
+    }
+}
+
+fn framegen_presenting() -> bool {
+    FG_READY.load(Acquire) && SWAP_CHAIN_PROXIED.load(Acquire)
 }
 
 /// Whether the latency markers run (Reflex or frame generation, with
@@ -933,11 +1070,49 @@ pub(crate) struct Presenting {
     index: Option<u32>,
 }
 
-/// Right before our swap chain's Present: the frame's latency markers.
-pub(crate) fn present_begins() -> Presenting {
-    Presenting {
-        index: reflex_present_begins(),
+/// The planes a present shows (Series S: the scene and the interface over
+/// it), the host states they are in, and the back buffer's size.
+pub(crate) struct Planes<'a> {
+    pub base: (&'a ID3D12Resource, u32),
+    pub overlay: Option<(&'a ID3D12Resource, u32)>,
+    pub size: [u32; 2],
+}
+
+/// The viewport frame generation wants.
+const VIEWPORT_FG: u32 = 0;
+
+/// A frame index of frame generation's own for a present no title frame
+/// is bound to (its markers all go at the present): far from the title's.
+static OWN_INDEX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x8000_0000);
+
+/// Right before our swap chain's Present: the frame's latency markers and,
+/// with frame generation, its constants and tags, and whether it runs on
+/// this present (it does when an upscaling was submitted since the last).
+pub(crate) fn present_begins(planes: Planes<'_>) -> Presenting {
+    let index = reflex_present_begins();
+    if !framegen_presenting() {
+        return Presenting { index };
     }
+    // Frame generation wants every marker of the frame it presents: a
+    // present without a title frame gets a frame of its own.
+    let index = index.or_else(|| {
+        let own = OWN_INDEX.fetch_add(1, Relaxed);
+        mark(
+            own,
+            &[
+                abi::SIMULATION_START,
+                abi::SIMULATION_END,
+                abi::RENDER_SUBMIT_START,
+                abi::RENDER_SUBMIT_END,
+                abi::PRESENT_START,
+            ],
+        );
+        Some(own)
+    });
+    if let Some(index) = index {
+        framegen_before(index, &planes);
+    }
+    Presenting { index }
 }
 
 /// Right after our swap chain's Present returned.
@@ -945,6 +1120,337 @@ pub(crate) fn present_ends(presenting: Presenting) {
     if reflex_marking() {
         reflex_present_ends(presenting.index);
     }
+    if framegen_presenting() {
+        framegen_after();
+    }
+}
+
+/// An upscaling's depth and motion vectors for frame generation.
+struct Noted {
+    id: u64,
+    depth: std::sync::Arc<crate::resource::HostTexture>,
+    motion: std::sync::Arc<crate::resource::HostTexture>,
+    camera: plan::Camera,
+}
+
+/// Noted on host lists not submitted yet; the latest submitted.
+static PENDING: Mutex<Vec<Noted>> = Mutex::new(Vec::new());
+static SUBMITTED: Mutex<Option<Noted>> = Mutex::new(None);
+/// The upscaling the last present tagged.
+static PRESENTED_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Frame generation's note of an upscaling's depth and motion vectors on
+/// the host list that recorded it ([`submitted`] makes them the latest).
+fn framegen_note(host: &crate::host::HostList, up: &Upscale, id: u64) {
+    if !framegen_ready() {
+        return;
+    }
+    let (Some(depth), Some(motion)) = (
+        crate::resource::host_copy(up.resources[DEPTH].0.cast()),
+        crate::resource::host_copy(up.resources[MOTION].0.cast()),
+    ) else {
+        return;
+    };
+    let mut pending = lock(&PENDING);
+    pending.retain(|n| id.saturating_sub(n.id) < 16);
+    pending.push(Noted {
+        id,
+        depth,
+        motion,
+        camera: up.camera,
+    });
+    drop(pending);
+    host.mark_upscale(id);
+}
+
+/// A host list that recorded upscaling `id` is submitted (in submission
+/// order, before the present that follows it).
+pub(crate) fn submitted(id: u64) {
+    let noted = {
+        let mut pending = lock(&PENDING);
+        let at = pending.iter().position(|n| n.id == id);
+        at.map(|i| pending.swap_remove(i))
+    };
+    if let Some(noted) = noted {
+        let mut latest = lock(&SUBMITTED);
+        if latest.as_ref().is_none_or(|l| l.id < noted.id) {
+            *latest = Some(noted);
+        }
+    }
+}
+
+/// Frame generation's switch as last set, and its counters since the last
+/// frame-rate line: presents with it on and off, frames it reported shown;
+/// its last status; frames shown since the caption last asked.
+static FG_ON_NOW: AtomicBool = AtomicBool::new(false);
+static FG_COUNTS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+const FG_PRESENTS_ON: usize = 0;
+const FG_PRESENTS_OFF: usize = 1;
+const FG_SHOWN: usize = 2;
+const FG_SHOWN_CAPTION: usize = 3;
+static FG_STATUS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Before the present of frame `index`: constants and tags of the latest
+/// upscaling submitted, and frame generation on (off without a fresh one:
+/// menus, loads, films).
+fn framegen_before(index: u32, planes: &Planes<'_>) {
+    let (Some(sl), Some(functions), Some(plan)) = (SL.get(), FUNCTIONS.get(), PLAN.get()) else {
+        return;
+    };
+    let Some(set_options) = functions.dlssg_set_options else {
+        return;
+    };
+    let fresh = {
+        let latest = lock(&SUBMITTED);
+        latest
+            .as_ref()
+            .filter(|n| n.id > PRESENTED_ID.load(Relaxed))
+            .map(|n| (n.id, n.depth.clone(), n.motion.clone(), n.camera))
+    };
+    let viewport = abi::ViewportHandle::new(VIEWPORT_FG);
+    // (Read in the closure; sizes of a texture its description gives.)
+    let size_of = |t: &ID3D12Resource| {
+        // SAFETY: a live texture.
+        let d = unsafe { t.GetDesc() };
+        [d.Width as u32, d.Height]
+    };
+    let mut tagged = false;
+    with_token(index, |token| {
+        if let Some((id, depth, motion, camera)) = &fresh {
+            PRESENTED_ID.store(*id, Relaxed);
+            // (Frame generation reads the camera's planes: the nearer is
+            // the near one, whichever way the title names them.)
+            let camera = camera.planes_in_order();
+            let constants = camera.constants(plan.asked.jitter, plan.asked.mvec);
+            // SAFETY: constants for this frame and viewport.
+            let code = unsafe { (sl.set_constants)(&constants, token, &viewport) };
+            if code != 0 {
+                once!(
+                    warn,
+                    "frame generation: slSetConstants: {} ({code})",
+                    abi::result_name(code)
+                );
+            }
+            let mut resources = vec![
+                (
+                    abi::Resource::texture(depth.texture.as_raw(), depth.state.load(Relaxed)),
+                    abi::BUFFER_DEPTH,
+                    camera.render,
+                ),
+                (
+                    abi::Resource::texture(motion.texture.as_raw(), motion.state.load(Relaxed)),
+                    abi::BUFFER_MOTION_VECTORS,
+                    camera.motion_size(),
+                ),
+            ];
+            // Two planes: the scene is the colour without the interface
+            // (the back buffer is made at its size and format), the
+            // interface plane its colour and alpha (premultiplied, as our
+            // compose blends it) where it is the back buffer's size too.
+            if let Some((over, over_state)) = planes.overlay {
+                if size_of(planes.base.0) == planes.size {
+                    resources.push((
+                        abi::Resource::texture(planes.base.0.as_raw(), planes.base.1),
+                        abi::BUFFER_HUDLESS_COLOR,
+                        planes.size,
+                    ));
+                }
+                if size_of(over) == planes.size {
+                    resources.push((
+                        abi::Resource::texture(over.as_raw(), over_state),
+                        abi::BUFFER_UI_COLOR_AND_ALPHA,
+                        planes.size,
+                    ));
+                }
+            }
+            let tags: Vec<abi::ResourceTag> = resources
+                .iter_mut()
+                .map(|(r, kind, size)| {
+                    abi::ResourceTag::new(
+                        r,
+                        *kind,
+                        abi::VALID_UNTIL_PRESENT,
+                        abi::Extent::sized(*size),
+                    )
+                })
+                .collect();
+            // SAFETY: tags of live textures in the states they are in at the
+            // present (the line sends the present after those submissions).
+            let code = unsafe {
+                (sl.set_tag_for_frame)(
+                    token,
+                    &viewport,
+                    tags.as_ptr(),
+                    tags.len() as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if code != 0 {
+                once!(
+                    warn,
+                    "frame generation: slSetTagForFrame: {} ({code})",
+                    abi::result_name(code)
+                );
+            }
+            once!(
+                info,
+                render = ?camera.render,
+                output = ?camera.output,
+                back_buffer = ?planes.size,
+                interface_plane = planes.overlay.is_some(),
+                tags = tags.len(),
+                depth_state = format_args!("{:#x}", resources[0].0.state),
+                motion_state = format_args!("{:#x}", resources[1].0.state),
+                near = constants.camera_near,
+                far = constants.camera_far,
+                depth_inverted = camera.depth_inverted(),
+                jitter = ?constants.jitter_offset,
+                mvec_scale = ?constants.mvec_scale,
+                "DLSS Frame Generation: first frame with depth and motion vectors tagged (2 tags: no colour without the interface; 3: with it; 4: and the interface)"
+            );
+            tagged = code == 0;
+        } else if FG_ON_NOW.load(Relaxed) {
+            // No upscaling this frame: what was tagged may no longer hold
+            // what it did.
+            let tags = [
+                abi::BUFFER_DEPTH,
+                abi::BUFFER_MOTION_VECTORS,
+                abi::BUFFER_HUDLESS_COLOR,
+                abi::BUFFER_UI_COLOR_AND_ALPHA,
+            ]
+            .map(|kind| {
+                abi::ResourceTag::new(
+                    std::ptr::null_mut(),
+                    kind,
+                    abi::VALID_UNTIL_PRESENT,
+                    abi::Extent::default(),
+                )
+            });
+            // SAFETY: null tags.
+            unsafe {
+                (sl.set_tag_for_frame)(
+                    token,
+                    &viewport,
+                    tags.as_ptr(),
+                    tags.len() as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+        }
+    });
+    if tagged != FG_ON_NOW.load(Relaxed) {
+        let mut options = abi::DlssgOptions::new(if tagged {
+            abi::DLSSG_ON
+        } else {
+            abi::DLSSG_OFF
+        });
+        options.flags = abi::DLSSG_RETAIN_RESOURCES_WHEN_OFF;
+        options.num_back_buffers = 2;
+        options.color_width = planes.size[0];
+        options.color_height = planes.size[1];
+        options.on_error_callback = Some(present_error);
+        // SAFETY: filled options for viewport 0, on the presenting thread.
+        let code = unsafe { set_options(&viewport, &options) };
+        tracing::info!(
+            index,
+            on = tagged,
+            code,
+            result = abi::result_name(code),
+            "DLSS Frame Generation switched"
+        );
+        if code == 0 || code == 39 {
+            FG_ON_NOW.store(tagged, Relaxed);
+        }
+        static FIRST: AtomicBool = AtomicBool::new(true);
+        if tagged
+            && code == 0
+            && FIRST.swap(false, Relaxed)
+            && let Some(host) = crate::host::host()
+        {
+            host.log_video_memory("right before the first present with frame generation on");
+        }
+    }
+    FG_COUNTS[if FG_ON_NOW.load(Relaxed) {
+        FG_PRESENTS_ON
+    } else {
+        FG_PRESENTS_OFF
+    }]
+    .fetch_add(1, Relaxed);
+}
+
+unsafe extern "C" fn present_error(error: *const i32) {
+    // SAFETY: the error for the call.
+    let code = unsafe { error.as_ref() }.copied().unwrap_or(0);
+    once!(
+        warn,
+        hresult = format_args!("{:#x}", code as u32),
+        "DLSS Frame Generation: a present failed"
+    );
+}
+
+/// After the present: what frame generation reports.
+fn framegen_after() {
+    if !FG_ON_NOW.load(Relaxed) {
+        FG_COUNTS[FG_SHOWN].fetch_add(1, Relaxed);
+        FG_COUNTS[FG_SHOWN_CAPTION].fetch_add(1, Relaxed);
+        return;
+    }
+    let Some(get_state) = FUNCTIONS.get().and_then(|f| f.dlssg_get_state) else {
+        return;
+    };
+    let mut state = abi::DlssgState::default();
+    let viewport = abi::ViewportHandle::new(VIEWPORT_FG);
+    // SAFETY: a structure to fill, no options (no estimate asked).
+    let code = unsafe { get_state(&viewport, &mut state, std::ptr::null()) };
+    if code != 0 {
+        return;
+    }
+    let shown = u64::from(state.num_frames_actually_presented);
+    FG_COUNTS[FG_SHOWN].fetch_add(shown, Relaxed);
+    FG_COUNTS[FG_SHOWN_CAPTION].fetch_add(shown, Relaxed);
+    if FG_STATUS.swap(state.status, Relaxed) != state.status {
+        tracing::warn!(
+            status = format_args!("{:#x}", state.status),
+            vram_mb = state.estimated_vram_usage_in_bytes >> 20,
+            "DLSS Frame Generation status changed (0 ok, 1 output too small, 2 Reflex not seen, 4 HDR format, 8 constants invalid, 16 back buffer index not asked)"
+        );
+    }
+}
+
+/// Our swap chain's buffers are about to be made again: frame generation is
+/// off until the next present with an upscaling (Streamline asks so).
+pub(crate) fn resizing() {
+    if !framegen_presenting() || !FG_ON_NOW.load(Relaxed) {
+        return;
+    }
+    let Some(set_options) = FUNCTIONS.get().and_then(|f| f.dlssg_set_options) else {
+        return;
+    };
+    let options = abi::DlssgOptions::new(abi::DLSSG_OFF);
+    let viewport = abi::ViewportHandle::new(VIEWPORT_FG);
+    // SAFETY: filled options.
+    unsafe { set_options(&viewport, &options) };
+    FG_ON_NOW.store(false, Relaxed);
+}
+
+/// With frame generation on our swap chain: the frames shown since the last
+/// call (the generated ones too), for the caption; `None` without it.
+pub(crate) fn shown_since() -> Option<u64> {
+    framegen_presenting().then(|| FG_COUNTS[FG_SHOWN_CAPTION].swap(0, Relaxed))
+}
+
+fn framegen_line(frames: f64, fps: f64) -> Option<String> {
+    if !framegen_presenting() {
+        return None;
+    }
+    let [on, off, shown] =
+        [FG_PRESENTS_ON, FG_PRESENTS_OFF, FG_SHOWN].map(|i| FG_COUNTS[i].swap(0, Relaxed));
+    Some(format!(
+        "DLSS Frame Generation: {fps:.1} fps rendered, {:.1} fps shown; {on} presents with it on, {off} off, {shown} frames shown ({:.2} per rendered frame; status {:#x})",
+        fps * shown as f64 / frames.max(1.0),
+        shown as f64 / frames.max(1.0),
+        FG_STATUS.load(Relaxed)
+    ))
 }
 
 /// The viewport of the upscaling; frame generation's is 0.
@@ -1359,14 +1865,13 @@ fn dlss_line(frames: f64) -> Option<String> {
     ))
 }
 
-/// Frame generation's note of an upscaling's depth and motion vectors on
-/// the host list that recorded it (nothing until frame generation is in).
-fn framegen_note(_host: &crate::host::HostList, _up: &Upscale, _id: u64) {}
-
 /// The lines of the frame-rate line's second (`frames` presented since the
 /// last), with Streamline's features on.
-pub(crate) fn line(frames: f64) {
+pub(crate) fn line(frames: f64, fps: f64) {
     if let Some(line) = dlss_line(frames) {
+        tracing::info!("{line}");
+    }
+    if let Some(line) = framegen_line(frames, fps) {
         tracing::info!("{line}");
     }
 }
