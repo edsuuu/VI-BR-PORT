@@ -409,6 +409,7 @@ fn parse_contrast(set: &str) -> [f32; 2] {
 /// a fifth of the way to the ratio of `mean` to `ratio` times `bulk` (the
 /// frame's log-average), as much as the screen is outside rooms, between
 /// no gain and `most`.
+#[cfg(test)]
 fn contrast_step(log_gain: f32, mean: f32, bulk: f32, [ratio, most]: [f32; 2], outside_share: f32) -> f32 {
     let err = (mean.max(1e-6) / (ratio * bulk.max(1e-5))).ln();
     (log_gain + 0.2 * err * outside_share.clamp(0.0, 1.0)).clamp(0.0, most.max(1.0).ln())
@@ -438,6 +439,7 @@ fn parse_cut(set: &str) -> f32 {
 
 /// Whether a frame's log-average `now` is a cut from the slow `was` (both in
 /// the log), as the mean pass tells it.
+#[cfg(test)]
 fn is_cut(was: f32, now: f32, cut: f32) -> bool {
     cut > 0.0 && (now - was).abs() > cut
 }
@@ -482,6 +484,7 @@ fn parse_edge(set: &str) -> f32 {
 /// The bound of `VICTORY_AMBIENT_AIR_SOFT`, as the air pass works it out:
 /// `has` itself up to half of `cap`, then bent towards `cap`, which it never
 /// reaches, with no corner.
+#[cfg(test)]
 fn soft_bound(has: f32, cap: f32) -> f32 {
     let knee = 0.5 * cap;
     if has <= knee || cap <= 0.0 {
@@ -1582,6 +1585,33 @@ mod tests {
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"..CS_DenoiseShadowMaskLDSPacked_113e2add_Wrapped.."), Some(Role::LampShadows));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    /// Every pass compiles, without a device (the test above returns early
+    /// where there is none): each part of the source as `make` builds it.
+    /// The switches are root constants, read at run time, so these are all
+    /// the variants there are.
+    #[test]
+    fn every_pass_compiles() {
+        let passes = [
+            ("KEEP", "keep"),
+            ("KEEP", "mean"),
+            ("PLACE", "place"),
+            ("PLACE", "inside_share"),
+            ("GATHER", "gather"),
+            ("RAISE", "raise"),
+            ("AIR", "clear_air"),
+            ("UNSHADOW", "unshadow"),
+        ];
+        for (part, entry) in passes {
+            let source = format!("#define {part}\n{SOURCE}");
+            let entry_z = format!("{entry}\0");
+            let code = crate::host::compile(&source, windows::core::PCSTR(entry_z.as_ptr()), s!("cs_5_1"))
+                .unwrap_or_else(|e| panic!("{part} {entry}: {e}"));
+            assert!(!code.is_empty(), "{part} {entry}");
+        }
+        // The root constants the passes declare are the words they are given.
+        assert!(SOURCE.contains(&format!("RootConstants(num32BitConstants={WORDS}, b0)")));
     }
 
     /// The passes compile with the system's compiler and the host takes them.
