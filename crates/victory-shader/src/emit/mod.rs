@@ -435,13 +435,29 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     }
 }
 
+thread_local! {
+    /// See [`with_code_patches`].
+    static CODE_PATCHES: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Runs `f` (a translation) with the console program's instruction words at the given byte offsets
+/// replaced, each only where the word there is the expected one: `(offset, expected, new)`. For a
+/// title program whose own code takes a path this host cannot serve (the caller knows which program
+/// by its hash); a word that does not match leaves the program as it is.
+pub fn with_code_patches<R>(patches: &[(usize, u32, u32)], f: impl FnOnce() -> R) -> R {
+    let was = CODE_PATCHES.replace(patches.to_vec());
+    let r = f();
+    CODE_PATCHES.set(was);
+    r
+}
+
 fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
     let dxil = c
         .part(FourCC::DXIL)
         .or(c.part(FourCC::ACCC))
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    let mut native = crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -453,6 +469,15 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
+    CODE_PATCHES.with_borrow(|patches| {
+        for &(at, expected, new) in patches {
+            if let Some(word) = native.code.get_mut(at..at + 4)
+                && word == expected.to_le_bytes()
+            {
+                word.copy_from_slice(&new.to_le_bytes());
+            }
+        }
+    });
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
