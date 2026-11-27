@@ -394,6 +394,20 @@ pub(crate) fn note_target(resource: crate::object::This) {
     }
 }
 
+/// With `VICTORY_DUMP_DEPTH_READ=1` as well: a depth texture a program reads
+/// through a table is saved like a target (the lamps' cached shadow maps,
+/// which `shadowSmartBlit:CS_DepthCopy` copies into the frame's maps and
+/// nothing writes in the frame).
+pub(crate) fn note_read_depth(resource: crate::object::This) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| crate::switch::on("VICTORY_DUMP_DEPTH_READ")) {
+        return;
+    }
+    if crate::resource::host_copy(resource).is_some_and(|t| t.flags() & 2 != 0) {
+        note_target(resource);
+    }
+}
+
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -408,8 +422,60 @@ pub(crate) fn dump_targets(frame: u64) {
         }
         // Every submission has run; the dump's list moves it there and back.
         let state = copy.state.load(Relaxed);
-        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d);
+        dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d, 0);
+        // The slices after the first of a one-level 16-bit depth array (the
+        // lamps' shadow maps have three), each on its own.
+        if d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0
+            && matches!(d.Format.0, 53..=56)
+            && d.MipLevels == 1
+        {
+            for slice in 1..u32::from(d.DepthOrArraySize).min(8) {
+                dump_one(host, texture, state, frame, i, *resource as crate::object::This, &d, slice);
+            }
+        }
     }
+}
+
+/// Logs what a 16-bit depth plane read back holds: texels at 0 (nearest),
+/// at 0xffff (cleared far), the range and mean of the others and the most
+/// common values. (A lamp's shadow map that is 0 everywhere puts the lamp in
+/// full shadow.)
+fn depth16_values(rows: &[u8], pitch: usize, w: usize, h: usize, frame: u64, resource: crate::object::This, slice: u32) {
+    let (mut zero, mut far, mut low, mut high, mut sum, mut n) = (0u32, 0u32, u16::MAX, 0u16, 0f64, 0u32);
+    let mut values = std::collections::HashMap::<u16, u32>::new();
+    for y in 0..h {
+        for x in 0..w {
+            let at = y * pitch + x * 2;
+            let v = u16::from_le_bytes([rows[at], rows[at + 1]]);
+            *values.entry(v).or_default() += 1;
+            match v {
+                0 => zero += 1,
+                u16::MAX => far += 1,
+                v => {
+                    low = low.min(v);
+                    high = high.max(v);
+                    sum += f64::from(v);
+                    n += 1;
+                }
+            }
+        }
+    }
+    let mut most: Vec<(u16, u32)> = values.into_iter().collect();
+    most.sort_by_key(|e| std::cmp::Reverse(e.1));
+    most.truncate(8);
+    tracing::info!(
+        frame,
+        ?resource,
+        slice,
+        texels = w * h,
+        zero,
+        far,
+        low,
+        high,
+        mean = if n > 0 { sum / f64::from(n) } else { 0.0 },
+        ?most,
+        "16-bit depth values"
+    );
 }
 
 fn dump_one(
@@ -420,6 +486,7 @@ fn dump_one(
     i: usize,
     resource: crate::object::This,
     d: &D3D12_RESOURCE_DESC,
+    slice: u32,
 ) {
     let Ok(list) = host.new_list() else { return };
     let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, state) as i32);
@@ -430,12 +497,13 @@ fn dump_one(
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
+        let read = read_back_of(&host.device, &list.list, texture, slice);
         // The stencil plane of a depth-stencil target, which the title's
         // lighting reads (material class in the low bits; 0x08 "inside a
         // room", which the lamps of a room are multiplied by): the plane
         // after the depth plane of a one-level, one-slice texture.
-        let stencil = (matches!(d.Format.0, 19..=22 | 44..=47)
+        let stencil = (slice == 0
+            && matches!(d.Format.0, 19..=22 | 44..=47)
             && d.MipLevels == 1
             && d.DepthOrArraySize == 1)
             .then(|| read_back_of(&host.device, &list.list, texture, 1))
@@ -482,10 +550,49 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        // A 16-bit depth texture (typeless on the host) holds unorm depth,
+        // not half floats: shown and counted as such.
+        let depth16 = d.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 && matches!(f.Format.0, 53..=56);
+        if depth16 {
+            depth16_values(rows, pitch, f.Width as usize, f.Height as usize, frame, resource, slice);
+        }
+        let format = if depth16 { 56 } else { f.Format.0 as u32 };
+        // `VICTORY_DUMP_RAW=1`: the texels as they are, row after row with
+        // no padding (`.bin` beside the picture; the PNG loses small integers
+        // and 16-bit depth): integer and depth formats only, at most 64 MB.
+        static RAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let bytes = match format {
+            41..=43 => 4,
+            53..=59 => 2,
+            60..=65 => 1,
+            _ => 0,
+        };
+        if *RAW.get_or_init(|| crate::switch::on("VICTORY_DUMP_RAW"))
+            && bytes > 0
+            && let Some(folder) = folder()
+        {
+            let row = f.Width as usize * bytes;
+            if row * (f.Height as usize) <= 64 << 20 {
+                let mut raw = Vec::with_capacity(row * f.Height as usize);
+                for y in 0..f.Height as usize {
+                    raw.extend_from_slice(&rows[y * pitch..y * pitch + row]);
+                }
+                let path = folder.join(format!(
+                    "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}-s{slice}.bin",
+                    f.Width, f.Height, f.Format.0
+                ));
+                if let Err(e) = std::fs::write(&path, raw) {
+                    tracing::warn!(error = %e, path = %path.display(), "raw texels not saved");
+                }
+            }
+        }
+        if let Some(rgba) = to_rgba(format, f.Width as usize, f.Height as usize, pitch, rows) {
             let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
+                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}{}",
+                d.Width,
+                d.Height,
+                d.Format.0,
+                if slice > 0 { format!("-s{slice}") } else { String::new() }
             );
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {
