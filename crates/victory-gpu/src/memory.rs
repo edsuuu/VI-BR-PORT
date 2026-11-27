@@ -66,6 +66,8 @@
 //! shortcut: pages a list does not name are looked at again in turn, over
 //! [`SWEEP`] frames.
 
+mod extents;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -203,6 +205,9 @@ struct Stats {
     /// view, a structure named in upload memory.
     came: [u64; 4],
     micros: u64,
+    /// Root views outside buffers made ready with a length the builder's
+    /// calls gave ([`structure_extent`]), and with a guessed one.
+    sized: [u64; 2],
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -789,8 +794,78 @@ impl Memory {
             s.came[3],
             self.faulted
         );
+        // Only once the builder's calls have named a structure
+        // (`VICTORY_RT_NATIVE=1`): without them there is nothing to say.
+        if s.sized[0] > 0 {
+            tracing::info!(
+                "title memory by address: root views outside buffers per frame sized by the builder's calls {:.1}, by a guess {:.1}; \
+                 {} extents known",
+                s.sized[0] as f64 / frames,
+                s.sized[1] as f64 / frames,
+                EXTENTS.read().unwrap_or_else(|e| e.into_inner()).len()
+            );
+        }
         self.stats.from = Some((now, self.frame));
     }
+}
+
+/// What the title's calls of its structure builder say lies where (see
+/// [`extents`]): filled only by `victory_hle::modules::bvh_builder` with
+/// `VICTORY_RT_NATIVE=1`. Empty, every dispatch is sized by the guesses
+/// ([`VIEW`], [`BUILT`]) as before.
+static EXTENTS: std::sync::RwLock<extents::Extents> = std::sync::RwLock::new(extents::Extents::new());
+
+/// The longest extent taken at its word (a size past it is a misread call).
+const EXTENT_MOST: u64 = 4 * ARENA;
+
+/// The builder was told to use `len` bytes of title memory from `start`: a
+/// structure being built or copied to, or its scratch memory, with the
+/// length the builder's own size calculation gives it.
+pub fn structure_extent(start: u64, len: u64) {
+    let put = EXTENTS.write().unwrap_or_else(|e| e.into_inner()).put(
+        start,
+        len,
+        1 << 32,
+        u64::from(MEMORY_PAGES) * PAGE,
+        EXTENT_MOST,
+    );
+    if put == extents::Put::Cleared {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                most = extents::MOST,
+                "title memory by address: more extents named by the builder's calls than are kept; all were let go"
+            )
+        });
+    }
+}
+
+/// The bytes from `at` to the end of the extent that holds it
+/// ([`structure_extent`]), if one does.
+pub fn structure_extent_from(at: u64) -> Option<u64> {
+    EXTENTS.read().unwrap_or_else(|e| e.into_inner()).from(at)
+}
+
+/// The builder was told to copy the structure at `source` to `dest`
+/// (compacting it). The title took the memory at `dest` by the compacted
+/// size it read at `size_at`, the title address the build was told to store
+/// that size at (0: not known). The copy's extent is that size if what is
+/// there now reads as one ([`extents::compacted`]); otherwise nothing is
+/// noted and the copy's dispatches are sized by the guess as before. The
+/// size taken.
+pub fn structure_copied(dest: u64, source: u64, size_at: u64) -> Option<u64> {
+    let whole = structure_extent_from(source)?;
+    if size_at < 1 << 32 {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    // (Through the kernel: the slot is the title's, and may be gone.)
+    if !crate::host::read_into(size_at as *const u8, &mut bytes) {
+        return None;
+    }
+    let size = extents::compacted(u64::from_le_bytes(bytes), whole)?;
+    structure_extent(dest, size);
+    Some(size)
 }
 
 /// A list with this key ([`HostList::used`]) asks the builder for sizes.
@@ -1002,7 +1077,10 @@ pub(crate) fn ready(
                     (built.1, built.2) = (frame, built.2 + 1);
                 }
                 let before = held(m);
-                m.ready(at, BUILT);
+                // As long as the builder's call said it is, where it did.
+                let known = structure_extent_from(at);
+                m.stats.sized[usize::from(known.is_none())] += 1;
+                m.ready(at, known.unwrap_or(BUILT));
                 came[1] += held(m).saturating_sub(before);
             }
         }
@@ -1017,7 +1095,11 @@ pub(crate) fn ready(
                 came[3] += held(m).saturating_sub(before);
             }
             None => {
-                m.ready(at, if builds { VIEW } else { PAGE });
+                // A structure a program walks, or memory a stage reads: all
+                // of it where the builder's call gave its length.
+                let known = structure_extent_from(at);
+                m.stats.sized[usize::from(known.is_none())] += 1;
+                m.ready(at, known.unwrap_or(if builds { VIEW } else { PAGE }));
                 came[2] += held(m).saturating_sub(before);
             }
         }
