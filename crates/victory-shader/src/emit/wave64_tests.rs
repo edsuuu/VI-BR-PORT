@@ -1377,3 +1377,6 @@ fn lds_unresolved_write_only_refused_under_analyze_and_allowed_under_write_only_
         &out[0][..8]
     );
 }
+
+#[path = "paired_tests.rs"]
+mod paired;

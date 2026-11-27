@@ -484,6 +484,53 @@ pub fn with_wide_first<R>(on: bool, f: impl FnOnce() -> R) -> R {
     r
 }
 
+thread_local! {
+    /// See [`with_paired_first`].
+    static PAIRED_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the paired form ([`emit_paired`]) tried for this program, as
+/// `VICTORY_WAVE_PAIRED=1` has it for every program: for the programs named in
+/// `VICTORY_WAVE_PAIRED_FOR` ([`paired_named`]).
+pub fn with_paired_first<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = PAIRED_FIRST.replace(on);
+    let r = f();
+    PAIRED_FIRST.set(was);
+    r
+}
+
+/// Whether the program whose container's hash (blake3, in hex, as the log names shaders) is
+/// `hash` is one of those named in `VICTORY_WAVE_PAIRED_FOR`: hashes or their beginnings,
+/// separated by commas, as `VICTORY_WAVE_WIDE_FOR` names them. Unset: none.
+pub fn paired_named(hash: &str) -> bool {
+    static FOR: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let named = FOR.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_PAIRED_FOR")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    let hash = hash.to_lowercase();
+    // (a tool that has only the hash's first 16 digits still knows a name of all 64)
+    named.iter().any(|h| hash.starts_with(h.as_str()) || hash.len() >= 16 && h.starts_with(hash.as_str()))
+}
+
+/// Whether some program is named in `VICTORY_WAVE_PAIRED_FOR` ([`paired_named`]): a caller
+/// hashes containers only then.
+pub fn paired_names_any() -> bool {
+    std::env::var_os("VICTORY_WAVE_PAIRED_FOR").is_some_and(|v| !v.is_empty())
+}
+
+/// Whether the paired form is tried for the program being translated: `VICTORY_WAVE_PAIRED=1`
+/// (every program), or [`with_paired_first`]. Off by default: each host lane does the work of
+/// two console lanes, and the form is new.
+fn paired_on() -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    PAIRED_FIRST.get() || *ALL.get_or_init(|| std::env::var_os("VICTORY_WAVE_PAIRED").is_some_and(|v| v == "1"))
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -822,6 +869,20 @@ pub fn emit(
                         return again.map(|(shader, _)| shader);
                     }
                 }
+                // The paired form ([`emit_paired`]): exact, without barriers inside branches,
+                // each host lane doing the work of two. Only when asked for
+                // (`VICTORY_WAVE_PAIRED=1`, or the program named in `VICTORY_WAVE_PAIRED_FOR`):
+                // here, past every exact form the program had before, so a program it takes
+                // is one that would have ended wave-wide, approximate or refused.
+                if paired_on() {
+                    let again = emit_paired(c, native, p, st);
+                    lower::take_needs();
+                    lower::take_meets();
+                    report("paired", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
@@ -1036,6 +1097,49 @@ fn widen_from(
         }
         wide.extend(more);
     }
+}
+
+/// `p` (a console wave64 compute program on a host of 32-lane waves) in the paired form: each
+/// host lane carries two console lanes, and one host wave of 32 runs a whole console wave
+/// (`bitcode::paired`). Every branch on a lane mask is taken wave-wide
+/// ([`structure::structure_wide`]), as the console takes it: what is left per lane are the
+/// guards of single instructions. The program is then lowered as for a host wave of 64 lanes
+/// (`lower::with_paired`), whose wave operations, lane reads and lane masks are the console's,
+/// and each of its instructions is written for both halves. `st` is the program's structure,
+/// which names the branches on lane masks ([`structure::Structured::wave_any`]).
+///
+/// Exact where the other forms are not: a wave reduction, a first-lane read or a wave OR used
+/// as data where not every lane runs, a lane read across the halves, LDS shared within the
+/// console wave, groups of several console waves (whose barriers stay where the console has
+/// them). It costs: each host lane runs the vector code of two console lanes, one after the
+/// other (code with the same operands in both halves, as scalar code, once).
+fn emit_paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let not = |what| Err(ShaderError::Unsupported { offset: 0, what });
+    if native.stage != HwStage::Cs || !native.wave64 || lower::host_max_wave() != 32 {
+        return not("paired: not a console wave64 compute program on a host of 32-lane waves");
+    }
+    let wide: std::collections::HashSet<usize> =
+        st.wave_any.iter().enumerate().filter_map(|(b, kind)| kind.map(|_| b)).collect();
+    let st = structure::structure_wide(p, &wide)?;
+    for (b, exit) in st.exits.iter().enumerate() {
+        match *exit {
+            structure::LaneExit::Branch { when, .. }
+                if !wide.contains(&b) && st.bools.support(when).iter().any(|a| !matches!(a, structure::Atom::Uniform(_))) =>
+            {
+                return not("paired: a branch per lane that is not on a lane mask");
+            }
+            structure::LaneExit::Indirect => return not("paired: an indirect jump"),
+            _ => {}
+        }
+    }
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    lower::with_paired(|| emit_program(c, native, p, &st, &io, &res))
 }
 
 /// The translated program, and the wave size it requires of the host.

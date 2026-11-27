@@ -416,6 +416,11 @@ struct Lower<'a> {
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
+    /// The paired form ([`with_paired`]): lowered as for a host wave of 64 lanes, then each
+    /// host lane carries two console lanes (`bitcode::paired`). Holds the LDS dword that numbers
+    /// the host waves of a group of several console waves (none for a group of one), and
+    /// whether it is one of the program's own.
+    paired: Option<Option<(u32, bool)>>,
 }
 
 /// Iterations after which a loop is left (per entry into it), unless
@@ -1152,6 +1157,22 @@ thread_local! {
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// See [`with_paired`].
+    static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with console wave64 compute programs on 32-lane hosts lowered in the paired form
+/// (`bitcode::paired`): the program is lowered as for a host wave of 64 lanes, the console's
+/// own, and then each host lane carries the values of two console lanes (host lane 7 runs
+/// console lanes 7 and 39), so one host wave of 32 runs the whole console wave. Its scalar
+/// decisions are made once, a lane read reaches either half, and no barrier stands inside a
+/// branch. For a program whose every branch on a lane mask is taken wave-wide
+/// ([`structure::structure_wide`]): see `super::emit_paired`.
+pub(super) fn with_paired<R>(f: impl FnOnce() -> R) -> R {
+    let was = PAIRED.replace(true);
+    let r = f();
+    PAIRED.set(was);
+    r
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1531,6 +1552,7 @@ impl<'a> Lower<'a> {
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         let mut mirror: Option<LaneMirror> = None;
+        let mut paired = None;
         if let StageIo::Cs(cs) = x.native.io {
             s.threads = Some(cs.threads);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1548,10 +1570,25 @@ impl<'a> Lower<'a> {
                     || reads_mask_as_data(x.st, i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
-                || !x.st.wide.is_empty();
+                || !x.st.wide.is_empty()
+                // (the paired form keeps the console's lanes in every program)
+                || PAIRED.get();
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
+            if PAIRED.get() {
+                // a group of several console waves numbers its host waves from an LDS counter
+                // (`bitcode::paired`), before the program's first instruction: a dword of its
+                // own, or the program's first where its LDS fills what the host has (32 KiB)
+                paired = Some((group > 64).then(|| {
+                    if s.lds_dwords < 8192 {
+                        s.lds_dwords += 1;
+                        (s.lds_dwords - 1, false)
+                    } else {
+                        (0, true)
+                    }
+                }));
+            }
             // A host whose waves are at most 32 lanes (NVIDIA) refuses `WaveSize(64)`. A console
             // wave64 program whose cross-lane code stays inside 32-lane halves – DPP rows,
             // `ds_swizzle`, `v_permlane16` / `v_permlanex16`, which the ISA confines there – runs
@@ -1560,7 +1597,7 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            if wave == 64 && host_max_wave() == 32 && paired.is_none() && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
@@ -1680,7 +1717,9 @@ impl<'a> Lower<'a> {
             // LOCAL: VGPRs read by `v_readlane_b32` kept per lane in LDS as well, so the
             // read needs no `WaveReadLaneAt` (dxil-spirv moves those out of branches and
             // recursed without end in the title's ray-traced shadow programs).
-            if exchange.is_none() && halves.is_none() && s.wave_size == Some(wave) {
+            // (not in the paired form: there the read is exact as it is, `WaveReadLaneAt` of
+            // either half)
+            if exchange.is_none() && halves.is_none() && paired.is_none() && s.wave_size == Some(wave) {
                 const MAX_LDS_DWORDS: u32 = 8192;
                 let mut regs: Vec<u8> = insts()
                     .filter(|i| i.name() == "v_readlane_b32")
@@ -1899,6 +1938,7 @@ impl<'a> Lower<'a> {
             code_table: None,
             counters: HashMap::new(),
             abort: None,
+            paired,
         }
     }
 
@@ -2487,6 +2527,8 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        // (the paired form: DXIL blocks where one instruction's code starts and joins again)
+        let mut lane_regions = Vec::new();
         if counted {
             // Before anything else, so that wave counts, reads of the first
             // lane and stores know only the lanes that run.
@@ -2575,16 +2617,27 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                let before = self.cur;
+                if self.paired.is_some() {
+                    self.paired_fence(&p.blocks[b].insts[i]);
+                }
                 self.inst(b, i)?;
                 self.mirror_writes(b, i)?;
-                if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
-                    for j in i + 1..end {
-                        self.section_inst(b, j, i);
+                let next = match self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                    Some(end) => {
+                        for j in i + 1..end {
+                            self.section_inst(b, j, i);
+                        }
+                        end
                     }
-                    i = end;
-                    continue;
+                    None => i + 1,
+                };
+                // (the paired form: the code of one instruction that branches per lane, which
+                // each half of the console wave runs in turn)
+                if self.paired.is_some() && before != self.cur {
+                    lane_regions.push((before, self.cur));
                 }
-                i += 1;
+                i = next;
             }
             self.mask_ok = self.mask_data == MaskData::Console;
             if self.lds_meet.as_ref().is_some_and(|(_, meet)| meet[b].1) {
@@ -2594,6 +2647,10 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if let Some(counter) = self.paired {
+            super::bitcode::paired::run(&mut self.s, &lane_regions, &self.tail, counter)
+                .map_err(|why| unsupported(0, why))?;
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -4316,6 +4373,22 @@ impl<'a> Lower<'a> {
         let mode = self.s.m.i32(meeting_mode());
         let void = self.s.t.void;
         self.s.op(block, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
+    }
+
+    /// The paired form ([`with_paired`]): before an LDS access, an LDS fence (no wait for the
+    /// group). The console orders a wave's LDS accesses one instruction after the other, and
+    /// its compiler leaves out barriers between lanes of one wave; here each instruction is two,
+    /// one per half, and a lane may read what the other half's copy of the instruction before
+    /// wrote. The fence keeps the host's compiler from moving the accesses past each other.
+    fn paired_fence(&mut self, inst: &Inst) {
+        let n = inst.name();
+        if !matches!(inst.fields, Fields::Ds { .. }) || n.starts_with("ds_swizzle") || n.contains("permute") {
+            return;
+        }
+        // (DXIL barrier mode 8: thread-group shared memory fence)
+        let mode = self.s.m.i32(8);
+        let void = self.s.t.void;
+        self.s.op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
     }
 
     /// Notes that the host waves meet in DXIL block `at` ([`take_meets`]).
