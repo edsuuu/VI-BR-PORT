@@ -46,6 +46,7 @@
 //! dark bulk under a few bright lights outside rooms ([`contrast`]).
 //! `VICTORY_AMBIENT_CUT=<factor>` follows a cut at once ([`cut`]).
 //! `VICTORY_AMBIENT_AIR_SOFT=1` bends the air's bound in ([`air_soft`]).
+//! `VICTORY_AMBIENT_EDGE=<pixels>` blends a room's edge ([`edge`]).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -458,6 +459,26 @@ fn air_soft() -> bool {
     *SET.get_or_init(|| std::env::var("VICTORY_AMBIENT_AIR_SOFT").is_ok_and(|v| v.trim() == "1"))
 }
 
+/// `VICTORY_AMBIENT_EDGE=<pixels>` (1-16): where the stencil plane's marking
+/// of a room stops, the room's light (the constant and the key's gain) and
+/// the light outside rooms (the estimate, `VICTORY_AMBIENT_OUTSIDE`) are
+/// mixed by the share of nine texels, the texel and eight `<pixels>` around
+/// it, marked inside. Unset: the texel's own bit, as before.
+///
+/// Why (read from the code): with the key's gain (2.3-3.5 in the prison)
+/// and the estimate outside rooms, a texel inside a room and its neighbour
+/// outside can get light several times apart; where the marking stops on a
+/// wall (a door's frame, a strip the title does not mark) that is a hard
+/// step the constant alone (the same light both sides) never had.
+fn edge() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| parse_edge(&std::env::var("VICTORY_AMBIENT_EDGE").unwrap_or_default()))
+}
+
+fn parse_edge(set: &str) -> f32 {
+    set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 1.0).map_or(0.0, |v| v.min(16.0))
+}
+
 /// The bound of `VICTORY_AMBIENT_AIR_SOFT`, as the air pass works it out:
 /// `has` itself up to half of `cap`, then bent towards `cap`, which it never
 /// reaches, with no corner.
@@ -512,7 +533,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=31, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
+#define RS "RootConstants(num32BitConstants=32, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -556,6 +577,9 @@ cbuffer Set : register(b0) {
     // (VICTORY_AMBIENT_AIR_SOFT) Whether the air's bound is taken between
     // the points and bends in instead of cutting off.
     float air_soft;
+    // (VICTORY_AMBIENT_EDGE) How far, in pixels, a room's edge is blended
+    // (0: the texel's own bit).
+    float edge;
 };
 Texture2D<float> depth : register(t0);
 // The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
@@ -604,12 +628,23 @@ float gain_whole(float4 mean_now) {
     return g;
 }
 
-// The same at a texel of the screen: with inside_only, 1 where the stencil
-// plane does not mark the texel inside a room (an exterior night keeps its
-// light; what a window shows of the outside too).
-float gain_at(float4 mean_now, int2 p) {
-    if (inside_only > 0.0 && (stencil.Load(int3(p, 0)).y & 8u) == 0u) return 1.0;
-    return gain_to_key(mean_now);
+// How much a texel of the screen is inside a room, by the stencil plane (the
+// key with inside_only gives no gain where it is not: an exterior night
+// keeps its light, what a window shows of the outside too): its own bit, or
+// (VICTORY_AMBIENT_EDGE) the share of it and eight texels `edge` pixels
+// around marked so, which the room's light and the light outside it are
+// mixed by. A texel's bit alone makes a hard step wherever the marking
+// stops on a wall.
+float inside_at(int2 p) {
+    if (edge <= 0.0) return (stencil.Load(int3(p, 0)).y & 8u) != 0u ? 1.0 : 0.0;
+    float n = 0.0;
+    for (int k = 0; k < 9; k++) {
+        float a = float(k) * 0.7853982;
+        int2 o = k == 0 ? int2(0, 0) : int2(round(float2(cos(a), sin(a)) * edge));
+        int2 q = clamp(p + o, int2(0, 0), int2(width, height) - 1);
+        n += (stencil.Load(int3(q, 0)).y & 8u) != 0u ? 1.0 : 0.0;
+    }
+    return n / 9.0;
 }
 
 
@@ -912,20 +947,29 @@ void raise(uint3 at : SV_DispatchThreadID) {
         open = saturate(1.0 - strength * 2.0 * sum / N);
     }
     float3 found;
-    // (VICTORY_AMBIENT_OUTSIDE) Outside rooms the estimate, not the constant.
-    bool outdoors = constant > 0.0 && outside_level > 0.0 && has_stencil > 0.0 &&
-        (stencil.Load(int3(p, 0)).y & 8u) == 0u;
+    // How much the texel is inside a room: its stencil bit, or (edge) the
+    // share of the texels around marked so. Without the stencil plane, all.
+    float inside = has_stencil > 0.0 ? inside_at(p) : 1.0;
+    // The key's gain here: with inside_only, none outside rooms (gain_at).
+    float key_here = lerp(1.0, gain_to_key(cells[CELLS]), inside_only > 0.0 ? inside : 1.0);
+    // (VICTORY_AMBIENT_OUTSIDE) Outside rooms the estimate, not the constant;
+    // at a room's edge (edge) some of both.
+    bool outdoors = constant > 0.0 && outside_level > 0.0 && has_stencil > 0.0 && inside < 1.0;
     float share_of_estimate = outdoors ? outside_level : level;
     float least_light = outdoors ? outside_least : least;
-    if (constant > 0.0 && !outdoors) {
+    float3 room_light = 0;
+    if (constant > 0.0 && (!outdoors || inside > 0.0)) {
         found = float3(1.0, 0.98, 0.94) * constant;
         // A share of the light around, where that is more than the constant.
         float4 mean_now = cells[CELLS];
         float3 part = around * mean_now.rgb;
         if (around > 0.0 && mean_now.a > 0.0 && dot(part, LUMA) > dot(found, LUMA)) found = part;
-        found *= open * gain_at(mean_now, p);
-        light[p] = pack(found);
-        return;
+        found *= open * key_here;
+        if (!outdoors) {
+            light[p] = pack(found);
+            return;
+        }
+        room_light = found;
     }
     // Between the four points around, those at its own depth first; which
     // four is dithered a little.
@@ -950,7 +994,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * share_of_estimate * open;
     // Never under the least light asked for (estimate:<share>:<least>).
-    float3 floor_light = float3(1.0, 0.98, 0.94) * least_light * open * gain_at(cells[CELLS], p);
+    float3 floor_light = float3(1.0, 0.98, 0.94) * least_light * open * key_here;
     // (VICTORY_AMBIENT_OUTSIDE) Outside rooms the constant's share of the
     // light around (`constant:<level>:<share>`) is a floor too: by day what
     // the sun does not reach on the boat keeps what the constant gave it.
@@ -979,7 +1023,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
         float day = saturate((dot(cells[CELLS].rgb, LUMA) - day_from) / max(day_to - day_from, 1e-6));
         found = lerp(found, float3(1.0, 0.98, 0.94) * constant * open, day);
     }
-    light[p] = pack(max(was, found));
+    // (At a room's edge, with edge, between the room's light and this.)
+    light[p] = pack(lerp(max(was, found), room_light, outdoors ? inside : 0.0));
 }
 #endif
 "#;
@@ -988,7 +1033,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 6) * 16;
 /// The passes' root constants, in words (the `Set` buffer).
-const WORDS: usize = 31;
+const WORDS: usize = 32;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -1204,6 +1249,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[28] = contrast_most.to_bits();
     words[29] = cut().to_bits();
     words[30] = if air_soft() { 1.0f32 } else { 0.0 }.to_bits();
+    words[31] = edge().to_bits();
     let measure_rooms = ((key > 0.0 && key_room()) || outdoors) && views.stencil.is_some();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
@@ -1499,6 +1545,15 @@ mod tests {
         let slope = (soft_bound(0.1001, cap) - soft_bound(0.1, cap)) / 0.0001;
         assert!((slope - 1.0).abs() < 0.01, "{slope}");
         assert_eq!(soft_bound(1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn edge_settings() {
+        assert_eq!(parse_edge(""), 0.0);
+        assert_eq!(parse_edge("0"), 0.0);
+        assert_eq!(parse_edge("0.5"), 0.0);
+        assert_eq!(parse_edge("4"), 4.0);
+        assert_eq!(parse_edge("40"), 16.0);
     }
 
     #[test]
