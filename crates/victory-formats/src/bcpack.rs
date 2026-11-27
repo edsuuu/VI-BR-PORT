@@ -744,10 +744,26 @@ fn pbits(mode: u16) -> bool {
     matches!(mode, 0 | 1 | 3 | 6 | 7)
 }
 
+/// Channel rotation bits. Only BC7 modes 4 and 5 have a rotation field; in
+/// the other modes bits 4:3 of the control word mean nothing to the decoder,
+/// and reading them as a rotation moved alpha's precision onto a colour
+/// channel (with a shift by the whole width for a mode without alpha).
+/// VICTORY_BC7_ROTATION=0 reads them in every mode, as before (default: on).
+fn rotation(ctrl: u16) -> usize {
+    static EVERY_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let every =
+        *EVERY_MODE.get_or_init(|| std::env::var("VICTORY_BC7_ROTATION").is_ok_and(|v| v == "0"));
+    if every || matches!(ctrl & 7, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    }
+}
+
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
 fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let (mode, rot) = (ctrl & 7, rotation(ctrl));
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -852,7 +868,7 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
     let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    let rot = rotation(ctrl);
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -1339,6 +1355,95 @@ mod tests {
         w.put(1, 1);
         w.put(1, 1);
         assert_eq!(dst, w.v.to_le_bytes());
+    }
+
+    /// Tables whose first BC7 code is `ctrl`.
+    fn tables_with_ctrl(ctrl: u16) -> Tables {
+        // The BC7 codes follow the models and the five rank tables.
+        const CTRL7_AT: usize = MODELS * BUCKETS * 2 + 256 + 64 + 256 + 64 + 64;
+        let mut raw = tables();
+        raw[CTRL7_AT..CTRL7_AT + 2].copy_from_slice(&ctrl.to_le_bytes());
+        let t = Tables::parse(&raw).unwrap();
+        assert_eq!(t.ctrl7[0], ctrl);
+        t
+    }
+
+    #[test]
+    fn bc7_rotation_is_read_only_in_modes_4_and_5() {
+        const WIDTHS: [u8; 16] = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+        let mut record = vec![0u8; 32];
+        let values = [11, 23, 5, 19, 13, 29, 7, 17, 3, 25, 9, 21, 15, 31, 1, 12];
+        for (i, &v) in values.iter().enumerate() {
+            record[4 + i] = zigzag(v);
+        }
+        record[20] = zigzag(6);
+        record[21] = zigzag(14);
+
+        // Without a rotation field, bits 4:3 must not change the block (nor
+        // panic on a shift by the whole width, as modes 0/1/3 did with 1).
+        for (mode, subsets) in [(0u16, 3u16), (1, 2), (2, 3), (3, 2), (6, 1), (7, 2)] {
+            let plain = subsets << 6 | mode;
+            let t = tables_with_ctrl(plain);
+            let src = stream(&t, &WIDTHS, 2, std::slice::from_ref(&record));
+            let mut want = [0u8; 16];
+            decode(7, &src, &mut want, &t).unwrap();
+            for rot in 1..=3u16 {
+                let ctrl = plain | rot << 3;
+                let t = tables_with_ctrl(ctrl);
+                let src = stream(&t, &WIDTHS, 2, std::slice::from_ref(&record));
+                let mut got = [0u8; 16];
+                decode(7, &src, &mut got, &t).unwrap();
+                assert_eq!(got, want, "mode {mode} rotation {rot}");
+                assert_eq!(
+                    bc7_precision(ctrl),
+                    bc7_precision(plain),
+                    "mode {mode} rotation {rot}"
+                );
+            }
+        }
+
+        // Modes 4 and 5 rotate: alpha trades its precision with channel rot - 1.
+        for (mode, bits) in [(4u16, [5u8, 5, 5, 6]), (5, [7, 7, 7, 8])] {
+            for rot in 1..=3usize {
+                let mut want = bits;
+                want.swap(3, rot - 1);
+                assert_eq!(bc7_precision(1 << 6 | (rot as u16) << 3 | mode), want);
+            }
+            // Rotation 1 (red and alpha): the stored red pair has alpha's
+            // width and the stored alpha pair colour's, and the block written
+            // carries the pairs back in channel order.
+            let t = tables_with_ctrl(1 << 6 | 1 << 3 | mode);
+            let mut s = vec![0u8; 32];
+            for (i, v) in [0x21, 0x12, 0x05, 0x06, 0x09, 0x0a, 0x0d, 0x0e]
+                .into_iter()
+                .enumerate()
+            {
+                s[4 + i] = zigzag(v);
+            }
+            let src = stream(&t, &WIDTHS, 2, &[s]);
+            let mut dst = [0u8; 16];
+            decode(7, &src, &mut dst, &t).unwrap();
+            let (colour, alpha) = (u32::from(bits[0]), u32::from(bits[3]));
+            let mut w = Bits::default();
+            w.put(1 << mode, u32::from(mode) + 1);
+            w.put(1, 2);
+            if mode == 4 {
+                w.put(0, 1); // index selection
+            }
+            for (v, n) in [
+                (0x0d, colour),
+                (0x0e, colour),
+                (0x05, colour),
+                (0x06, colour),
+                (0x09, colour),
+                (0x0a, colour),
+                (0x21, alpha),
+                (0x12, alpha),
+            ] {
+                w.put(v, n);
+            }
+            assert_eq!(dst, w.v.to_le_bytes(), "mode {mode}");
+        }
     }
 
     #[test]
