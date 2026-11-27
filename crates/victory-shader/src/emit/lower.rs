@@ -103,7 +103,9 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
 /// and store). Not where a group barrier would wait for lanes that left. Where
 /// two host waves of 32 stand for a console wave (they exchange, which takes
 /// all lanes) the lanes past the count stay and are left out of memory, EXEC's
-/// ballots and the wave's reductions instead (`Lower::partial_active`).
+/// ballots and the wave's reductions instead (`Lower::partial_active`); a
+/// console wave64 program on a host of 32-lane waves is counted only with
+/// `VICTORY_COUNTED_WAVE64=1` ([`counted_wave64`]).
 fn counted_in_threads(parts: &Parts) -> bool {
     let crate::native::StageIo::Cs(cs) = &parts.native.io else {
         return false;
@@ -111,7 +113,19 @@ fn counted_in_threads(parts: &Parts) -> bool {
     cs.threads[0] > 1
         && cs.threads[1..] == [1, 1]
         && crate::spill::is_spilled(parts.native)
+        && (!parts.native.wave64 || host_max_wave() >= 64 || counted_wave64())
         && !parts.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
+}
+
+/// Whether the structure builder's console wave64 programs are counted in threads on a host of
+/// 32-lane waves too (`VICTORY_COUNTED_WAVE64=1`; off by default, which leaves their lanes past
+/// the count running as before). After PR #66 (`f5f1c4c7d` on `teste/bvh`), with which the
+/// builder ran in a frame on 26 Nov; the four programs without group barriers it covers are
+/// `Box32Rehydration`, `Box16Rehydration`, `PrefixSum512` and `PrefixSum256`. Part of the
+/// shader cache's key.
+fn counted_wave64() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COUNTED_WAVE64").is_some_and(|v| v == "1"))
 }
 
 /// [`lower`]; `counted`: the lanes past a dispatch's count of threads leave
