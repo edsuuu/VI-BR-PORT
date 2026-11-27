@@ -90,6 +90,8 @@ pub mod timeline;
 #[cfg(windows)]
 pub mod titlewrite;
 #[cfg(windows)]
+pub mod titletime;
+#[cfg(windows)]
 mod upload;
 #[cfg(windows)]
 mod watch;
