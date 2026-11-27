@@ -554,7 +554,48 @@ struct Lanes {
     refused: u64,
     /// BCPack bytes written and time spent on them.
     bcpack: (u64, std::time::Duration),
+    /// Since the last summary, of the requests the title submitted
+    /// ([`stream_line`]): how long they stood in line from the submit until
+    /// a worker took them, and from the submit until they were done (sum
+    /// and longest of each), and how many were timed.
+    waits: Waits,
     since: Option<std::time::Instant>,
+}
+
+/// See [`Lanes::waits`].
+#[derive(Default)]
+struct Waits {
+    timed: u64,
+    in_line: (std::time::Duration, std::time::Duration),
+    to_done: (std::time::Duration, std::time::Duration),
+}
+
+impl Waits {
+    fn add(&mut self, submitted: std::time::Instant, started: std::time::Instant) {
+        let (in_line, to_done) = (started.saturating_duration_since(submitted), submitted.elapsed());
+        self.timed += 1;
+        self.in_line.0 += in_line;
+        self.in_line.1 = self.in_line.1.max(in_line);
+        self.to_done.0 += to_done;
+        self.to_done.1 = self.to_done.1.max(to_done);
+    }
+
+    fn mean_ms(&self, sum: std::time::Duration) -> f64 {
+        sum.as_secs_f64() * 1e3 / self.timed.max(1) as f64
+    }
+}
+
+/// Whether the streaming summary of every 5 s is a line of the run's log
+/// with the requests' waits and the title's mapping calls in it
+/// (`VICTORY_STREAM_LINE=0`: a debug line without them, as before). The
+/// textures of the opening's first shot come late (run intro-s-luz3: 18,896
+/// texture views whose memory was not mapped yet at the shot's start), and
+/// nothing in a run's log said how fast the title's reads were served or
+/// what its mapping calls cost; the streaming log
+/// (`VICTORY_DSTORAGE_LOG`) says it a request at a time.
+pub(crate) fn stream_line() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_STREAM_LINE").is_none_or(|v| v != "0"))
 }
 
 /// A queue's requests in the scheduler.
@@ -612,6 +653,7 @@ fn scheduler() -> Option<&'static Scheduler> {
                     done: Default::default(),
                     refused: 0,
                     bcpack: Default::default(),
+                    waits: Default::default(),
                     since: None,
                 }),
                 work: Condvar::new(),
@@ -803,9 +845,44 @@ impl Lanes {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
         }
+        if let Some(submitted) = job.note.submitted {
+            self.waits.add(submitted, started);
+        }
         let since = *self.since.get_or_insert(started);
         let elapsed = since.elapsed();
-        if elapsed.as_secs() >= 5 {
+        if elapsed.as_secs() >= 5 && stream_line() {
+            let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
+            let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let secs = elapsed.as_secs_f64();
+            let w = std::mem::take(&mut self.waits);
+            // The mapping calls are the streaming log's when it is on.
+            let mapping = if stream_log::on() { None } else { super::xmem::map_costs_text() };
+            tracing::info!(
+                "the title's streaming in the last {secs:.1} s (VICTORY_STREAM_LINE): {} requests done, {:.0} MB written \
+                 ({:.1} MB/s), {:.0} of them BCPack; workers busy {:.2} on average (reading files {:.2}, BCPack {:.2}) of {}; \
+                 from the title's submit {:.1} ms in line until a worker took one (the longest {:.0}) and {:.1} ms until \
+                 done (the longest {:.0}), of {} timed; {} starts waited for staging room; {waiting} submitted not \
+                 started now; the title's mapping calls: {}",
+                *requests,
+                *bytes as f64 / 1e6,
+                *bytes as f64 / secs / 1e6,
+                self.bcpack.0 as f64 / 1e6,
+                busy.as_secs_f64() / secs,
+                reading / secs,
+                self.bcpack.1.as_secs_f64() / secs,
+                std::thread::available_parallelism().map_or(4, |n| n.get()),
+                w.mean_ms(w.in_line.0),
+                w.in_line.1.as_secs_f64() * 1e3,
+                w.mean_ms(w.to_done.0),
+                w.to_done.1.as_secs_f64() * 1e3,
+                w.timed,
+                std::mem::take(&mut self.refused),
+                mapping.as_deref().unwrap_or("in the streaming log (VICTORY_DSTORAGE_LOG) or none"),
+            );
+            self.done = Default::default();
+            self.bcpack = Default::default();
+            self.since = None;
+        } else if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
             tracing::debug!(
@@ -1077,7 +1154,7 @@ impl Note {
 
     fn submitted(&mut self, request: &Request, early: bool) {
         self.early = early;
-        if trace() > 0 || stream_log::on() {
+        if trace() > 0 || stream_log::on() || stream_line() {
             self.submitted = Some(std::time::Instant::now());
         }
         if trace() > 0 {
@@ -2286,6 +2363,7 @@ mod tests {
             done: Default::default(),
             refused: 0,
             bcpack: Default::default(),
+            waits: Default::default(),
             since: None,
         }
     }

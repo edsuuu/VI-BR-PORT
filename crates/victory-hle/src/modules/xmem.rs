@@ -1009,9 +1009,46 @@ enum Call {
     Commit = 13,
 }
 
-/// Runs `f`, a system call, and counts it while the streaming log is on.
+/// Whether the mapping calls are counted: for the streaming log, or for the
+/// streaming line of every 5 s (`dstorage::stream_line`).
+fn counting() -> bool {
+    super::dstorage::stream_log::on() || super::dstorage::stream_line()
+}
+
+/// [`map_costs`] in words, for the streaming line; `None` if no mapping
+/// call was made since the last asking.
+pub(crate) fn map_costs_text() -> Option<String> {
+    let n: [u64; 15] = std::array::from_fn(|i| MAPPING[i].swap(0, Ordering::Relaxed));
+    let ms = |ns: u64| ns as f64 / 1e6;
+    (n[0] + n[5] > 0).then(|| {
+        format!(
+            "{} calls for {} pages in {:.0} ms (the longest {:.1} ms; {:.0} ms waiting for the lock; {:.0} us a page), \
+             {} copies of mappings in {:.0} ms; system calls: unmap {} in {:.0} ms, split {} in {:.0} ms, map {} in \
+             {:.0} ms, commit {} in {:.0} ms",
+            n[0],
+            n[1],
+            ms(n[2]),
+            ms(n[3]),
+            ms(n[4]),
+            ms(n[2]) * 1e3 / n[1].max(1) as f64,
+            n[5],
+            ms(n[6]),
+            n[7],
+            ms(n[8]),
+            n[9],
+            ms(n[10]),
+            n[11],
+            ms(n[12]),
+            n[13],
+            ms(n[14]),
+        )
+    })
+}
+
+/// Runs `f`, a system call, and counts it while the streaming log or line
+/// is on.
 fn counted<T>(call: Call, f: impl FnOnce() -> T) -> T {
-    if !super::dstorage::stream_log::on() {
+    if !counting() {
         return f();
     }
     let started = std::time::Instant::now();
@@ -1031,7 +1068,7 @@ struct Costed {
 
 impl Costed {
     fn begin(pages: Option<usize>) -> Option<Costed> {
-        super::dstorage::stream_log::on().then(|| Costed { started: std::time::Instant::now(), pages, waited: 0 })
+        counting().then(|| Costed { started: std::time::Instant::now(), pages, waited: 0 })
     }
 }
 
