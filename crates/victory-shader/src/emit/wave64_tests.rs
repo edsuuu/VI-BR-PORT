@@ -1102,3 +1102,237 @@ fn console_waves_of_one_group_meet_on_their_own_in_loops_of_their_own() {
     }
     eprintln!("ran on the hardware device: both console waves' loops, as the console runs them");
 }
+
+/// `native` translated as the title's programs are ([`super::emit`]: every form it tries, in
+/// its order) for a host of 32-lane waves.
+fn emitted(native: &NativeProgram) -> HostShader {
+    let bytes = crate::dxbc::build(&[]);
+    let c = super::Container::parse(&bytes).expect("container");
+    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let out = super::emit(&c, native, &p, &st, &io, &res);
+    lower::TEST_HOST_WAVE.set(was);
+    out.expect("emit")
+}
+
+/// 64 threads, one console wave. Lane t goes round a loop on the scalar s6 with a lane mask
+/// of the lanes left (`s_and_saveexec`, `s_andn2`, `s_cbranch_scc1`), leaving it with v10 = 1
+/// (odd t, at round t >> 4) or v10 = 0 (even t, after round t >> 3); then the lanes with
+/// v10 = 0 take a slot from the front of a list (counter dword 0) and the others from its back
+/// (counter dword 1), each with the allocation idiom, and store t + 1 there (dwords 2..66).
+/// `water_shading:CS_TransmissionVolumetrics_GenerateTiles` (0x288-0x794) in miniature: its
+/// tiles go to the list of the tiled light or of the tiled light with local lights.
+fn two_lists_after_a_loop() -> NativeProgram {
+    native(&two_lists_after_a_loop_words(&[], false))
+}
+
+/// [`two_lists_after_a_loop`]'s code after `prefix`. `slow`: lane t leaves after round t
+/// (even t) and each round waits for a load from memory, as the title's loop does, so that the
+/// lanes of a host wave leave the loop far apart in time.
+fn two_lists_after_a_loop_words(prefix: &[u32], slow: bool) -> Vec<u32> {
+    let mut words = prefix.to_vec();
+    words.push(0x341C_0082); // v_lshlrev_b32 v14, 2, v0
+    words.extend_from_slice(&[
+        0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0: the threads below s0 are live
+        0xBE94_246A, // s_and_saveexec_b64 s[20:21], vcc
+        if slow { 0xBF88_004B } else { 0xBF88_0047 }, // s_cbranch_execz to s_endpgm: an early-out
+        if slow { 0x7E0E_0300 } else { 0x2C0E_0083 }, // v_mov_b32 v7, v0 / v_lshrrev_b32 v7, 3, v0
+        0x3612_0081, // v_and_b32 v9, 1, v0
+        0x2C16_0084, // v_lshrrev_b32 v11, 4, v0
+        0xBE86_0380, // s_mov_b32 s6, 0
+        0xBE82_047E, // s_mov_b64 s[2:3], exec
+        0xBE8C_047E, // s_mov_b64 s[12:13], exec
+        0xBF82_0001, // s_branch body
+        0x87FE_0C00, // head: s_and_b64 exec, s[0:1], s[12:13]
+        0x7E14_0280, // body: v_mov_b32 v10, 0
+        0x7D8C_1606, // v_cmp_ge_u32 vcc, s6, v11
+        0x0214_1280, // v_cndmask_b32 v10, 0, v9, vcc
+    ]);
+    if slow {
+        words.extend_from_slice(&[
+            0xE030_1400,
+            0x8002_0D0E, // buffer_load_dword v13, v14, s[8:11], 0 offen offset:1024 (a 0)
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0x4A14_1B0A, // v_add_nc_u32 v10, v10, v13
+        ]);
+    }
+    words.extend_from_slice(&[
+        0x8106_8106, // s_add_i32 s6, s6, 1
+        0x7D8A_1480, // v_cmp_ne_u32 vcc, 0, v10
+        0xD4C4_0000,
+        0x0002_0E06, // v_cmp_gt_u32 s[0:1], s6, v7
+        0x8880_006A, // s_or_b64 s[0:1], vcc, s[0:1]
+        0xBE80_2400, // s_and_saveexec_b64 s[0:1], s[0:1]
+        0x8A8C_7E0C, // s_andn2_b64 s[12:13], s[12:13], exec
+        if slow { 0xBF85_FFF0 } else { 0xBF85_FFF4 }, // s_cbranch_scc1 head
+        0xBEFE_0402, // s_mov_b64 exec, s[2:3]
+        0x4A10_0081, // v_add_nc_u32 v8, 1, v0
+        0xBE80_047E, // s_mov_b64 s[0:1], exec
+        0x7DA4_1480, // v_cmpx_eq_u32 exec, 0, v10
+        0xBF88_0014, // s_cbranch_execz back
+        0xD765_0005,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v5, -1, 0
+        0xD766_0006,
+        0x0002_0AC1, // v_mbcnt_hi_u32_b32 v6, -1, v5
+        0xBE8E_147E, // s_ff1_i32_b64 s14, exec
+        0xBE84_107E, // s_bcnt1_i32_b64 s4, exec
+        0xBE90_047E, // s_mov_b64 s[16:17], exec
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7D24_0C0E, // v_cmpx_eq_i32 exec, s14, v6
+        0x7E0A_0204, // v_mov_b32 v5, s4
+        0xE0C8_4000,
+        0x8002_0500, // buffer_atomic_add v5, off, s[8:11], 0 glc
+        0xBEFE_0410, // s_mov_b64 exec, s[16:17]
+        0xD765_0006,
+        0x0001_007E, // v_mbcnt_lo_u32_b32 v6, exec_lo, 0
+        0xD766_0006,
+        0x0002_0C7F, // v_mbcnt_hi_u32_b32 v6, exec_hi, v6
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E06_0505, // v_readfirstlane_b32 s3, v5
+        0x4A18_0C03, // v_add_nc_u32 v12, s3, v6: front slot
+        0x8AFE_7E00, // back: s_andn2_b64 exec, s[0:1], exec
+        0xBF88_0015, // s_cbranch_execz end
+        0xD765_0005,
+        0x0001_00C1, // v_mbcnt_lo_u32_b32 v5, -1, 0
+        0xD766_0006,
+        0x0002_0AC1, // v_mbcnt_hi_u32_b32 v6, -1, v5
+        0xBE8E_147E, // s_ff1_i32_b64 s14, exec
+        0xBE84_107E, // s_bcnt1_i32_b64 s4, exec
+        0xBE90_047E, // s_mov_b64 s[16:17], exec
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x7D24_0C0E, // v_cmpx_eq_i32 exec, s14, v6
+        0x7E0A_0204, // v_mov_b32 v5, s4
+        0xE0C8_4004,
+        0x8002_0500, // buffer_atomic_add v5, off, s[8:11], 0 offset:4 glc
+        0xBEFE_0410, // s_mov_b64 exec, s[16:17]
+        0xD765_0006,
+        0x0001_007E, // v_mbcnt_lo_u32_b32 v6, exec_lo, 0
+        0xD766_0006,
+        0x0002_0C7F, // v_mbcnt_hi_u32_b32 v6, exec_hi, v6
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0x7E06_0505, // v_readfirstlane_b32 s3, v5
+        0x4A0A_0C03, // v_add_nc_u32 v5, s3, v6
+        0x4C18_0ABF, // v_sub_nc_u32 v12, 63, v5: back slot
+        0xBEFE_0400, // end: s_mov_b64 exec, s[0:1]
+        0x3418_1882, // v_lshlrev_b32 v12, 2, v12
+        0xE070_1008,
+        0x8002_080C, // buffer_store_dword v8, v12, s[8:11], 0 offen offset:8
+    ]);
+    words
+}
+
+/// Runs [`two_lists_after_a_loop`] (or a program of its shape) translated by [`super::emit`] 20
+/// times for each count of live threads; the runs in which some live lane did not get exactly
+/// one slot, or None without a card that takes it.
+fn lost_slots(native: &NativeProgram) -> Option<usize> {
+    lost_slots_of(&emitted(native))
+}
+
+/// [`lost_slots`] of a translation made already.
+fn lost_slots_of(shader: &HostShader) -> Option<usize> {
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return None;
+    };
+    let (root, pso) = match host.compute_pipeline(shader) {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("the hardware device does not take this program: {e}; not run");
+            return None;
+        }
+    };
+    let mut bad = 0;
+    for live in [64u32, 40, 17] {
+        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        for u in &shader.user_data {
+            if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
+                ud[u.index as usize] = live;
+            }
+        }
+        for k in 0..20 {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud.clone()))],
+                        views: &[View::RawUav(320)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+            let out = &out[0][..66];
+            let (front, back) = (out[0] as usize, out[1] as usize);
+            let mut got: Vec<u32> = out[2..2 + front.min(64)].to_vec();
+            got.extend_from_slice(&out[66 - back.min(64)..66]);
+            got.sort_unstable();
+            let want: Vec<u32> = (1..=live).collect();
+            let even = live.div_ceil(2) as usize;
+            if (front, back) != (even, live as usize - even) || got != want {
+                bad += 1;
+                eprintln!("{live} live, run {k}: front {front} back {back}: {:?}", &out[2..]);
+            }
+        }
+    }
+    Some(bad)
+}
+
+#[test]
+fn every_lane_takes_a_slot_of_its_list_after_a_loop_on_a_lane_mask() {
+    let native = two_lists_after_a_loop();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let names: Vec<&str> = p.blocks.iter().flat_map(|b| &b.insts).map(|i| i.name()).collect();
+    for name in ["s_and_b64", "v_cndmask_b32", "s_and_saveexec_b64", "s_andn2_b64", "s_cbranch_scc1", "v_sub_nc_u32"] {
+        assert!(names.contains(&name), "{name} in {names:?}");
+    }
+    assert_eq!(names.iter().filter(|n| **n == "buffer_atomic_add").count(), 2);
+    let Some(bad) = lost_slots(&native) else { return };
+    assert_eq!(bad, 0, "runs in which some lane lost its slot");
+    eprintln!("ran on the hardware device: one slot a live lane, in 60 runs");
+}
+
+/// The lanes of an 8 x 8 group leave the loop many rounds apart, each round waiting for
+/// memory. With the loop's iteration limit leaving the program at the back edge the code after
+/// the loop is not where a host wave's lanes must meet again, and lanes that left early may run
+/// the allocation idiom without the others: the title's program lost a sixth of its tiles that
+/// way on the RTX 4060 Ti (replay of a recorded frame). This miniature has not been seen to lose
+/// a slot on that card either way (the count is printed); the test checks that
+/// `VICTORY_LOOP_LIMIT_EXIT=1` moves the limit to the loop's exit and that every lane then gets
+/// its slot.
+#[test]
+fn a_loops_iteration_limit_leaves_through_its_exit_so_the_wave_meets_after_it() {
+    let mut native = native(&two_lists_after_a_loop_words(
+        &[
+            0xD746_0000,
+            0x0401_0701, // v_lshl_add_u32 v0, v1, 3, v0: the flat index
+        ],
+        true,
+    ));
+    native.io = StageIo::Cs(ComputeIo {
+        rsrc2: 5 << 1 | 1 << 11, // 5 user SGPRs, thread ids x and y in v0, v1
+        threads: [8, 8, 1],
+    });
+    let with = |on: bool| {
+        let was = lower::TEST_LOOP_LIMIT_EXIT.replace(Some(on));
+        let shader = emitted(&native);
+        lower::TEST_LOOP_LIMIT_EXIT.set(was);
+        shader
+    };
+    let (old, new) = (with(false), with(true));
+    assert_ne!(old.dxil, new.dxil, "the limit moves to the loop's exit");
+    if let Some(bad) = lost_slots_of(&old) {
+        eprintln!("the limit at the back edge: {bad} of 60 runs lost slots");
+    }
+    let Some(bad) = lost_slots_of(&new) else { return };
+    assert_eq!(bad, 0, "runs in which some lane lost its slot");
+    eprintln!("ran on the hardware device: one slot a live lane, the limit at the loop's exit");
+}
