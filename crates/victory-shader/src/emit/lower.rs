@@ -1590,9 +1590,18 @@ impl<'a> Lower<'a> {
                             })
                         });
                         let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
-                        if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
-                            lds_meet = Some((all.clone(), meet));
-                            lds_ok = true;
+                        if !lds_ok {
+                            // Opt-in static alias/lane-privacy analysis (`VICTORY_LDS_ANALYZE=1`);
+                            // off by default so `lds_meetings` keeps existing output identical.
+                            let meet = if super::lds::enabled() {
+                                super::lds::analyze(p, x.st, x.io, x.res, cs, &all).ok()
+                            } else {
+                                lds_meetings(p, x.st, &all)
+                            };
+                            if let Some(meet) = meet {
+                                lds_meet = Some((all.clone(), meet));
+                                lds_ok = true;
+                            }
                         }
                         if !lds_ok {
                             // (the blocks whose LDS accesses not every lane runs: with the
@@ -1644,10 +1653,16 @@ impl<'a> Lower<'a> {
                         why.push("LDS in a group over 32");
                         match all_lane_blocks(x.st) {
                             None => why.push("an indirect exit"),
-                            Some(all) if lds_meetings(p, x.st, &all).is_none() => {
-                                why.push("an LDS read and write in one lane-branch region")
+                            Some(all) => {
+                                let ok = if super::lds::enabled() {
+                                    super::lds::analyze(p, x.st, x.io, x.res, cs, &all).is_ok()
+                                } else {
+                                    lds_meetings(p, x.st, &all).is_some()
+                                };
+                                if !ok {
+                                    why.push("an LDS read and write in one lane-branch region");
+                                }
                             }
-                            Some(_) => {}
                         }
                     }
                     why.sort_unstable();

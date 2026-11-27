@@ -37,6 +37,19 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+fn mix_switch(
+    bytes: &mut Vec<u8>,
+    name: &str,
+    read: impl FnOnce(&str) -> Option<std::ffi::OsString>,
+) {
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.push(b'=');
+    if let Some(value) = read(name) {
+        bytes.extend_from_slice(value.as_encoded_bytes());
+    }
+    bytes.push(0);
+}
+
 /// What identifies a translation beside its container: the translator
 /// (the BLAKE3 of its sources, `build.rs`), the settings it runs with, and
 /// what it was told of the host. Not our executable: a rebuild of anything
@@ -81,15 +94,13 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            // Opt-in Wave32 LDS hazard analysis and write-only compatibility switch.
+            "VICTORY_LDS_ANALYZE",
+            "VICTORY_LDS_WRITE_ONLY_OK",
             // Whether the ray-tracing node test always misses.
             "VICTORY_RT_MISS",
         ] {
-            bytes.extend_from_slice(name.as_bytes());
-            bytes.push(b'=');
-            if let Some(value) = std::env::var_os(name) {
-                bytes.extend_from_slice(value.as_encoded_bytes());
-            }
-            bytes.push(0);
+            mix_switch(&mut bytes, name, |n| std::env::var_os(n));
         }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
@@ -476,5 +487,26 @@ mod tests {
         assert_eq!(decode(&bytes[..bytes.len() - 1]), None);
         assert_eq!(decode(&[bytes.as_slice(), &[0]].concat()), None);
         assert_eq!(decode(b"VSH0"), None);
+    }
+
+    #[test]
+    fn lds_switches_change_translation_key() {
+        let hash_with = |analyze: Option<&str>, write_only: Option<&str>| {
+            let mut bytes = Vec::new();
+            for name in ["VICTORY_LDS_ANALYZE", "VICTORY_LDS_WRITE_ONLY_OK"] {
+                mix_switch(&mut bytes, name, |n| match n {
+                    "VICTORY_LDS_ANALYZE" => analyze.map(std::ffi::OsString::from),
+                    "VICTORY_LDS_WRITE_ONLY_OK" => write_only.map(std::ffi::OsString::from),
+                    _ => None,
+                });
+            }
+            *blake3::hash(&bytes).as_bytes()
+        };
+        let k_default = hash_with(None, None);
+        let k_analyze = hash_with(Some("1"), None);
+        let k_both = hash_with(Some("1"), Some("1"));
+        assert_ne!(k_default, k_analyze);
+        assert_ne!(k_analyze, k_both);
+        assert_ne!(k_default, k_both);
     }
 }
