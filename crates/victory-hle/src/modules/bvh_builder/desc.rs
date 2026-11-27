@@ -330,6 +330,55 @@ impl Geometry {
         }
     }
 
+    /// The title memory a build reads for it: (what, address, bytes) of the
+    /// vertices, indices, transform or boxes it names.
+    pub fn spans(&self) -> Vec<(&'static str, u64, u64)> {
+        let mut out = Vec::new();
+        match *self {
+            Geometry::Triangles {
+                transform,
+                index_format,
+                index_count,
+                vertex_count,
+                index_buffer,
+                vertex_buffer,
+                vertex_stride,
+                ..
+            } => {
+                if vertex_buffer != 0 {
+                    out.push((
+                        "vertices",
+                        vertex_buffer,
+                        vertex_stride * u64::from(vertex_count),
+                    ));
+                }
+                let index_size = match index_format {
+                    57 => 2,
+                    42 => 4,
+                    _ => 0,
+                };
+                if index_buffer != 0 && index_size != 0 {
+                    out.push(("indices", index_buffer, index_size * u64::from(index_count)));
+                }
+                if transform != 0 {
+                    out.push(("transform", transform, 48));
+                }
+            }
+            Geometry::Aabbs {
+                count,
+                start,
+                stride,
+                ..
+            } => {
+                if start != 0 {
+                    out.push(("boxes", start, stride * count));
+                }
+            }
+            Geometry::Other { .. } => {}
+        }
+        out
+    }
+
     /// Boxes it holds (0 for triangles).
     pub fn aabbs(&self) -> u64 {
         match *self {
@@ -584,6 +633,11 @@ mod tests {
         );
         assert!(text.contains("index R16_UINT x300 at 0xb000"), "{text}");
         assert!(text.contains("no transform"), "{text}");
+        assert_eq!(
+            g[0].spans(),
+            [("vertices", 0xa000, 12 * 120), ("indices", 0xb000, 600)]
+        );
+        assert_eq!(g[1].spans(), [("vertices", 0xc000, 12 * 120)]);
 
         let mut pointers = Vec::new();
         put64(&mut pointers, 0x5000 + GEOMETRY as u64);

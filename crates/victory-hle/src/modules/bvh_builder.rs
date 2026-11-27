@@ -327,6 +327,12 @@ fn note_build(call: u64, entry: u32, of: u32, d: &BuildDesc, tail: &str) {
                 "array of pointers"
             }
         );
+        match rtcalls::in_title_buffer(i.descs, u64::from(i.count) * INSTANCE as u64) {
+            Some((start, bytes)) => {
+                let _ = write!(text, "; in a title buffer at {start:#x} ({bytes} bytes)");
+            }
+            None => text.push_str("; outside title buffers"),
+        }
         if i.layout == desc::ARRAY {
             let n = (i.count as usize).min(PEEKED);
             match Process.bytes(i.descs, n * INSTANCE) {
@@ -357,6 +363,21 @@ fn note_build(call: u64, entry: u32, of: u32, d: &BuildDesc, tail: &str) {
         );
         for (k, g) in geometries.iter().take(LISTED).enumerate() {
             let _ = write!(text, "\n  geometry {k}: {}", g.describe());
+            // Where a host build would read it from: a title buffer's copy,
+            // or pages of the by-address memory.
+            for (what, at, len) in g.spans() {
+                match rtcalls::in_title_buffer(at, len) {
+                    Some((start, bytes)) => {
+                        let _ = write!(
+                            text,
+                            "; {what} in a title buffer at {start:#x} ({bytes} bytes)"
+                        );
+                    }
+                    None => {
+                        let _ = write!(text, "; {what} outside title buffers");
+                    }
+                }
+            }
         }
         if geometries.len() > LISTED {
             let _ = write!(text, "\n  ... {} more", geometries.len() - LISTED);
