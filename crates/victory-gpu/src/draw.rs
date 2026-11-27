@@ -2467,7 +2467,6 @@ impl State {
         }
         let mut tally = crate::bake::Sources { found: source_count as u32, cut, ..Default::default() };
         let mut past = crate::bake::PastLine::default();
-        let mut wait = crate::bake::Wait::new(crate::bake::wait_budget());
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -2741,17 +2740,16 @@ impl State {
             // A texture the bake ahead samples whose first upload an earlier
             // pass sent on the copy queue of its own (`VICTORY_UPLOAD_AHEAD`):
             // its slot is made from it above, and the bake would sample it
-            // before the copy has run. The bake waits for that one upload, a
-            // bounded time in all (`crate::bake::wait_budget`).
-            if source {
-                let asked = std::time::Instant::now();
-                let outcome = crate::texture::ahead::wait_for(resource, wait.left());
-                wait.note(outcome, if outcome.is_some() { asked.elapsed() } else { std::time::Duration::ZERO });
-            }
+            // before the copy has run. Its host copy holds nothing known yet
+            // (`texture::unchanged` says no), so it is uploaded below, and the
+            // list waits there for the copy on its way, a second at most
+            // (`texture::ahead::listed`): counted, and the time it took.
+            let on_its_way = source && crate::texture::ahead::on_its_way(resource);
             // A texture that has a staging buffer now is one draws read
             // through a table: they upload it, and check it at every
             // submission that samples it. (Not a texture the bake ahead
-            // samples: it reads it by index, after this list's uploads.)
+            // samples: it reads it by index, after this list's uploads. One
+            // on its way has the staging buffer of that upload.)
             let tabled = !source && crate::texture::is_staged(resource);
             // The host copy holds these very bytes: nothing to upload.
             let first = match (&placed, &view) {
@@ -2810,7 +2808,12 @@ impl State {
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
+                let asked = std::time::Instant::now();
                 readable(list, sampled.kind, view);
+                if on_its_way {
+                    tally.on_their_way += 1;
+                    tally.waited_us += asked.elapsed().as_micros() as u64;
+                }
                 crate::texture::PICKING.set(None);
             }
             if shows_other && let Some(handle) = heap.handle(index) {
@@ -2907,7 +2910,7 @@ impl State {
         // (A source the loop did not get to: none, since they come first and
         // no bound ends the loop before them; counted all the same.)
         tally.not_reached = source_count.saturating_sub(all - left.0) as u32;
-        let missing = tally.missing(&wait);
+        let missing = tally.missing();
         // What a bake samples and does not find is baked wrong for the run
         // (blocks of noise on a character's clothes in one launch of seven):
         // the log says when its pass did not bring every due slot up to date.
@@ -2938,8 +2941,8 @@ impl State {
             }
         }
         if admit {
-            let n = crate::bake::count(&tally, &past, &wait);
-            if n <= 64 || n.is_power_of_two() || missing > 0 || wait.waited > 0 {
+            let n = crate::bake::count(&tally, &past);
+            if n <= 64 || n.is_power_of_two() || missing > 0 || tally.on_their_way > 0 {
                 let so = |i: usize| crate::bake::COUNTS[i].load(Ordering::Relaxed);
                 tracing::info!(
                     frame,
@@ -2951,9 +2954,8 @@ impl State {
                     read_in_part = tally.cut,
                     uploaded = tally.uploaded,
                     same = tally.same,
-                    uploads_waited_for = wait.waited,
-                    waits_ran_out = wait.ran_out,
-                    wait_ms = wait.spent().as_secs_f64() * 1e3,
+                    on_their_way = tally.on_their_way,
+                    their_uploads_ms = tally.waited_us as f64 / 1e3,
                     alone,
                     missing,
                     bakes_so = n,
@@ -2961,8 +2963,8 @@ impl State {
                     past_the_line_so = so(2),
                     past_the_line_mb_so = so(3) >> 20,
                     refused_so = so(4),
-                    waits_ran_out_so = so(7),
-                    wait_ms_so = so(8) as f64 / 1e3,
+                    on_their_way_so = so(6),
+                    their_uploads_ms_so = so(7) as f64 / 1e3,
                     "the textures a bake draw samples, given to it past the room line (VICTORY_BAKE_ADMIT=1)"
                 );
             }

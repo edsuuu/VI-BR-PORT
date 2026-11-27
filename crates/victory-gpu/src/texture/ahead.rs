@@ -156,30 +156,11 @@ pub(crate) fn listed(copy: &HostTexture) {
     }
 }
 
-/// Waits, `most` at the longest, for the upload of `resource`'s host copy that
-/// is on its way here, if one is (`crate::bake::wait_budget`: a decoration
-/// bake about to sample it). `None`: none is on its way (none was asked for,
-/// it has run, or the lists upload it); `Some(true)`: it has run;
-/// `Some(false)`: the time ran out first. Only this one upload is waited for,
-/// not the others on their way; nothing is held while waiting but the
-/// condition's own lock, which the wait lets go.
-pub(crate) fn wait_for(resource: This, most: std::time::Duration) -> Option<bool> {
-    let copy = crate::resource::made_copy(resource)?;
-    if copy.ahead.load(Relaxed) != PENDING {
-        return None;
-    }
-    let began = std::time::Instant::now();
-    let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
-    if !way.iter().any(|(serial, _)| *serial == copy.serial) {
-        return None;
-    }
-    while way.iter().any(|(serial, _)| *serial == copy.serial) {
-        let Some(left) = most.checked_sub(began.elapsed()).filter(|left| !left.is_zero()) else {
-            return Some(false);
-        };
-        way = LANDED.wait_timeout(way, left.min(std::time::Duration::from_millis(10))).unwrap_or_else(|e| e.into_inner()).0;
-    }
-    Some(true)
+/// Whether the upload of `resource`'s host copy is on its way here: a list
+/// that records an upload of it now waits for that one ([`listed`]), a second
+/// at most (`crate::bake`: a decoration bake about to sample it counts these).
+pub(crate) fn on_its_way(resource: This) -> bool {
+    crate::resource::made_copy(resource).is_some_and(|copy| copy.ahead.load(Relaxed) == PENDING)
 }
 
 /// The copy queue and its threads, made on first use.
@@ -360,43 +341,6 @@ pub(crate) fn fresh() -> AtomicU8 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A bake waits for its source's upload on its way ([`wait_for`]): one not
-    /// sent yet makes it run out of its time, and returns then; once it is
-    /// sent, the wait ends when it has run; after that there is nothing to
-    /// wait for.
-    #[test]
-    fn a_bake_waits_for_its_sources_upload_a_bounded_time() {
-        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
-        if crate::host::host().is_none() {
-            return;
-        }
-        // 128x128 BC7, eight levels.
-        let desc = [3u32, 0, 0, 0, 128, 0, 128, 0x8_0001, 98, 1, 0, 0x105, 0, 0];
-        let whole = crate::resource::placed_bytes(&desc).unwrap() as usize;
-        // SAFETY: memory of our own that stays.
-        let at = unsafe { VirtualAlloc(std::ptr::null(), whole, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
-        // SAFETY: as above.
-        unsafe { (0..whole).for_each(|i| at.add(i).write((i * 7) as u8)) };
-        let texture = crate::resource::texture_at(at as u64, &desc).unwrap();
-        crate::resource::want_level(texture, 0);
-        let copy = crate::resource::host_copy(texture).unwrap();
-        if !crate::pool::fresh(&copy.texture) {
-            return;
-        }
-        assert_eq!(wait_for(texture, std::time::Duration::from_millis(40)), None);
-        let Some(Taken::New(job)) = claim(texture, 0, u64::MAX) else { panic!("not taken") };
-        // Not sent: on its way, and never there in the time given.
-        let began = std::time::Instant::now();
-        assert_eq!(wait_for(texture, std::time::Duration::from_millis(40)), Some(false));
-        let took = began.elapsed();
-        assert!(took >= std::time::Duration::from_millis(40) && took < std::time::Duration::from_secs(2), "{took:?}");
-        assert!(!there(texture));
-        send(&job);
-        assert_eq!(wait_for(texture, std::time::Duration::from_secs(20)), Some(true));
-        assert!(there(texture));
-        assert_eq!(wait_for(texture, std::time::Duration::from_secs(20)), None);
-    }
 
     /// The texels of a placed texture arrive by the copy queue, all levels of
     /// them, and what waits for them is called then; a second asking finds the
