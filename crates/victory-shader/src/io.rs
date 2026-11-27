@@ -196,7 +196,43 @@ pub struct Io {
 /// stages whose stage data is not read and on constructs not covered yet.
 pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
     let unsupported = |offset, what| ShaderError::Unsupported { offset, what };
+    // A linked program has no stage data: what it would list is derived
+    // from the code (`crate::linked`).
+    let linked = match (&native.io, native.stage) {
+        (StageIo::Linked(l), HwStage::Ps) => Some((crate::linked::ps_inputs(p, l)?, Vec::new())),
+        (StageIo::Linked(_), HwStage::Vs) => {
+            let outputs: Vec<crate::native::VsOutput> =
+                crate::linked::vs_outputs(p).into_iter().map(|o| o.0).collect();
+            Some((Vec::new(), outputs))
+        }
+        _ => None,
+    };
     let (loaded, ps_inputs, params) = match (&native.io, native.stage) {
+        (StageIo::Linked(l), HwStage::Ps) => {
+            let loaded = ps_vgprs(l.input_ena)
+                .into_iter()
+                .map(|(r, i)| (Reg::V(r), i))
+                .collect();
+            let (inputs, _) = linked.as_ref().expect("derived above");
+            (loaded, &inputs[..], &[][..])
+        }
+        // The vertex id is in v0 as for any hardware vertex shader; the
+        // attributes are where the fetch rewrite put them.
+        (StageIo::Linked(l), HwStage::Vs) => {
+            let mut loaded = vec![
+                (Reg::V(0), Input::VertexId),
+                (Reg::V(2), Input::PrimitiveId),
+                (Reg::V(3), Input::InstanceId),
+            ];
+            for row in 0..l.inputs.len() as u8 {
+                for channel in 0..4 {
+                    let input = Input::Attribute { row, channel };
+                    loaded.push((Reg::V(crate::linked::attribute_vgpr(row, channel)), input));
+                }
+            }
+            let (_, outputs) = linked.as_ref().expect("derived above");
+            (loaded, &[][..], &outputs[..])
+        }
         (
             StageIo::Ps {
                 inputs, input_addr, ..

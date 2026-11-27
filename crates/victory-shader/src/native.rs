@@ -132,6 +132,41 @@ const PACKET_RSRC1: usize = 0x14;
 const PACKET_RSRC2: usize = 0x18;
 const FSPX_RECORDS: usize = 0x18;
 const FSPX_RECORD: usize = 32;
+/// The part of a container we make around a linked program.
+const LINKED_MAGIC: &[u8; 4] = b"VLNK";
+const LINKED_VERSION: u32 = 1;
+const LINKED_TAG: u32 = 2;
+const LINKED_RECORDS: usize = 0x10;
+/// The low 15 bits of the dword that counts a linked program's records.
+const LINKED_MARK: u32 = 0x440;
+/// Dwords a linked code block has past what its metadata counts.
+const LINKED_CODE_EXTRA: usize = 10;
+/// Where a register image says where its last section is.
+const REGS_SECTION: usize = 0x28;
+/// What that offset counts from.
+const REGS_SECTION_BASE: usize = 0x1c;
+/// The last section's place in the images of vertex plus pixel pipelines.
+const REGS_LAST: usize = 0x138;
+/// Its dwords before the pixel input controls, and after them.
+const REGS_LAST_HEAD: usize = 14;
+const REGS_LAST_TAIL: usize = 3;
+const REGS_VS_RSRC1: usize = 0x38;
+const REGS_PS_RSRC1: usize = 0x4c;
+const REGS_PS_INPUT_ENA: usize = 0x58;
+const REGS_PS_IN_CONTROL: usize = 0x5c;
+const REGS_COL_FORMAT: usize = 0x70;
+const REGS_COLOR_CONTROL: usize = 0x7c;
+const REGS_VS_OUT_CONFIG: usize = 0x84;
+const REGS_DEPTH_CONTROL: usize = 0xb8;
+const REGS_STENCIL_REF_MASK: usize = 0xc0;
+const REGS_BLEND: usize = 0xd0;
+const LAYOUT_TARGET_FORMATS: usize = 0x10;
+const LAYOUT_SAMPLE_MASK: usize = 0x1c;
+const LAYOUT_DEPTH_FORMAT: usize = 0x24;
+const LAYOUT_ELEMENTS_SIZE: usize = 0x38;
+const LAYOUT_ELEMENT_COUNT: usize = 0x4c;
+const LAYOUT_ELEMENTS: usize = 0x50;
+const MAX_INPUT_ELEMENTS: u32 = 32;
 /// Unpacked blobs are a few KiB; refuse to allocate for absurd sizes.
 const MAX_UNPACKED: u64 = 16 << 20;
 
@@ -280,6 +315,50 @@ pub enum StageIo {
     },
     Cs(ComputeIo),
     Ms(MeshIo),
+    /// A linked vertex or pixel program ([`linked_program`]): no stage data,
+    /// its I/O is derived from the code (`crate::linked`).
+    Linked(LinkedIo),
+}
+
+/// What a linked program's I/O is derived with besides its code: pipeline
+/// state the title passes beside it ([`GraphicsRegs`], [`InputLayout`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LinkedIo {
+    /// Vertex: the pipeline's input elements. The code fetches its vertices
+    /// itself; each of its loads is one of these, by slot and byte offset.
+    pub inputs: Vec<InputElement>,
+    /// Pixel: `SPI_PS_INPUT_ENA`, which system values arrive in VGPRs.
+    pub input_ena: u32,
+    /// Pixel: `SPI_SHADER_COL_FORMAT`, 4 bits per render target: what the
+    /// code's exports are specialised to (4: two 16-bit floats per dword).
+    pub col_format: u32,
+    /// Pixel: `SPI_PS_INPUT_CNTL_<k>` of attribute k (`v_interp` `attr<k>`):
+    /// the vertex program's parameter it reads in bits 0-4, and how.
+    pub input_cntl: Vec<u32>,
+    /// The stage's `SPI_SHADER_PGM_RSRC2`: its count of user SGPRs in bits
+    /// 1-5 ([`LinkedIo::user_sgprs`]).
+    pub rsrc2: u32,
+}
+
+impl LinkedIo {
+    /// User SGPRs the hardware loads before the system ones (a pixel
+    /// program's primitive mask comes next).
+    pub fn user_sgprs(&self) -> u8 {
+        (self.rsrc2 >> 1 & 0x1F) as u8
+    }
+}
+
+/// One element of a pipeline's input layout, as D3D12 describes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputElement {
+    pub name: String,
+    pub index: u32,
+    /// DXGI format, as the title numbers it.
+    pub format: u32,
+    pub slot: u32,
+    pub offset: u32,
+    pub per_instance: bool,
+    pub step_rate: u32,
 }
 
 /// A mesh program's outputs and limits. It runs as one hardware NGG stage:
@@ -422,10 +501,14 @@ pub struct UsedResource {
 }
 
 /// The native programs in a `DXIL` part's data, or in an `ACCC` part's
-/// ([`fspx_program`]); empty for the PC layout.
+/// ([`fspx_program`], or a linked program we wrapped ourselves:
+/// [`linked_container`]); empty for the PC layout.
 pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
     if part.starts_with(b"FSPX") {
         return Ok(vec![fspx_program(part)?]);
+    }
+    if part.starts_with(LINKED_MAGIC) {
+        return Ok(vec![linked_part(part)?]);
     }
     if part.get(XDAT_OFFSET..XDAT_OFFSET + 4) != Some(b"XDAT") {
         return Ok(Vec::new());
@@ -460,17 +543,13 @@ pub fn native_programs(part: &[u8]) -> Result<Vec<NativeProgram>, ShaderError> {
 ///         +0x18 COMPUTE_PGM_RSRC2
 /// kind 1  pipeline metadata (a hash); kind 6 the GFX10 code
 /// kind 7  program metadata: u32 0x403, u32 size - 0x14, u32 code dwords,
-///         u64 0, u8 0x40, u8 first user-data dword, u8 count of 0x41
-///         records, u8 0; then 32-byte records from +0x18, each a u32 tag:
-///   0x41  a resource the code reads: u8 resource type (as FSSM's used
-///         entries), u8 root type, u16 0, u32 table offset (dwords), u32
-///         register, u32 view dimension (1 buffer, 4 2D, 0 root view),
-///         u8 descriptor dwords, u8 user-data dword, u8 root slot, u8 0,
-///         u32 -1, u32 0
-///   0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
-///         u8 resource kind (DXIL's), u8 0, u32 register
-///   0x43  the shader hash (16 B); the last record
+///         u64 0, u32 0x440 in its low 15 bits and the count of records
+///         above them; then 32-byte records from +0x18 ([`resource_records`])
 /// ```
+///
+/// (The count was read as "u8 0x40, u8 first user-data dword, u8 count of
+/// 0x41 records" until the linked programs' metadata showed what it counts:
+/// every record, in all 9 blocks compared.)
 pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     if u32_at(part, 4)? != FSPX_VERSION {
         return Err(Malformed("unknown FSPX version"));
@@ -501,19 +580,51 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
     let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
     let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
+    let (layout, used) = resource_records(meta.get(FSPX_RECORDS..).unwrap_or(&[]))?;
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: u32_at(packet, PACKET_RSRC2)?,
+            threads: [threads(0)?, threads(1)?, threads(2)?],
+        }),
+        code: code.to_vec(),
+    })
+}
+
+/// The root parameters and used resources that the 32-byte records of a
+/// program's metadata list: the records of an `FSPX` part's kind 7
+/// ([`fspx_program`]) and of a linked program ([`linked_program`]) alike.
+/// Each starts with a u32 tag:
+///
+/// ```text
+/// 0x41  a resource the code reads: u8 resource type (as FSSM's used
+///       entries), u8 root type, u16 0, u32 table offset (dwords), u32
+///       register, u32 (see below), u8 descriptor dwords, u8 user-data
+///       dword, u8 root slot, u8 0, u32 -1, u32 0
+/// 0x42  a view declaration: u32 0, u8 1, u8 class (0 SRV, 1 UAV),
+///       u8 resource kind (DXIL's), u8 0, u32 register
+/// 0x43  the shader hash (16 B); the last record
+/// ```
+///
+/// The u32 after the register was read as a view dimension (1 buffer, 4 2D,
+/// 0 root view). In the linked programs it is 4 for a texture and looks like
+/// the stride for a buffer (0x80, 0x40; 0x88, 0x44, 0x5c in the compute
+/// ones).
+/// shortcut: it is not taken as the stride (`stride` stays 0, as before),
+/// until a program that indexes such a buffer shows which reading is right.
+fn resource_records(records: &[u8]) -> Result<(Vec<RootParam>, Vec<UsedResource>), ShaderError> {
     let mut layout: Vec<RootParam> = Vec::new();
     let mut used = Vec::new();
-    for e in meta
-        .get(FSPX_RECORDS..)
-        .unwrap_or(&[])
-        .as_chunks::<FSPX_RECORD>()
-        .0
-    {
+    for e in records.as_chunks::<FSPX_RECORD>().0 {
         match e[0] {
             0x41 => {}
             0x42 => continue,
             0x43 => break,
-            _ => return Err(Malformed("unknown FSPX metadata record")),
+            _ => return Err(Malformed("unknown program metadata record")),
         }
         let root = RootType::from_raw(e[5].into());
         let u = UsedResource {
@@ -537,7 +648,16 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             RootType::Descriptor => 2,
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
-            _ => return Err(Malformed("an FSPX resource of an unknown root type")),
+            // Root constants (the linked pixel programs' `b500`, indices
+            // into the sampler heap). The record does not say how many: its
+            // descriptor-dwords byte is 4 where the stage's user SGPRs
+            // leave room for two, and two are read.
+            // shortcut: only the first dword is the parameter's here; a
+            // program that reads another finds an SGPR nothing fills and is
+            // refused. (`linked_part`, which knows the stage's user SGPRs,
+            // widens it.)
+            RootType::Constants => 1,
+            _ => return Err(Malformed("a metadata resource of an unknown root type")),
         };
         if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
             layout.push(RootParam {
@@ -551,18 +671,441 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }
         used.push(u);
     }
+    Ok((layout, used))
+}
+
+/// The 128-bit hash the console compiler stores in the operand fields of a
+/// program's two leading `v_nop`s (three dwords each, the third a literal):
+/// dwords 0, 2, 3 and 5, the upper halves of dwords 0 and 3 taken from the
+/// dword after each around its bit 8. The metadata's 0x43 record holds the
+/// same four dwords.
+fn code_hash(code: &[u8]) -> Result<[u32; 4], ShaderError> {
+    let w = |i: usize| u32_at(code, 4 * i);
+    let split = |low: u32, next: u32| low & 0xFFFF | (next & 0xFF) << 16 | (next >> 9 & 0xFF) << 24;
+    Ok([split(w(0)?, w(1)?), w(2)?, split(w(3)?, w(4)?), w(5)?])
+}
+
+/// A vertex or pixel program as device method 0x1c8 gets it: the code as
+/// the hardware runs it (linked: the vertex fetch inlined, the pixel exports
+/// specialised to their render targets' formats) and its metadata, without
+/// a container or stage data. `rsrc1` is the stage's
+/// `SPI_SHADER_PGM_RSRC1` and `wave64` its wave size, both from the
+/// pipeline's registers ([`GraphicsRegs`]). Layout as observed:
+///
+/// ```text
+/// code  two v_nop holding the program's hash, the code up to s_endpgm,
+///       ten s_code_end, a trailer of 5 dwords, padding
+/// meta  +0x00 u32 2, +0x04 u32 size - 0x0c, +0x08 u32 code dwords - 10,
+///       +0x0c u32 0x440 in its low 15 bits and the count of records above
+///       them; then 32-byte records from +0x10 ([`resource_records`])
+/// ```
+///
+/// Everything stated is checked, and that code and metadata are one
+/// program's (the hash): a block that is something else is an error, not a
+/// program. The result's I/O is [`StageIo::Linked`] with nothing in it: the
+/// caller adds what the pipeline says ([`LinkedIo`]).
+pub fn linked_program(
+    stage: HwStage,
+    code: &[u8],
+    meta: &[u8],
+    rsrc1: u32,
+    wave64: bool,
+) -> Result<NativeProgram, ShaderError> {
+    if !matches!(stage, HwStage::Vs | HwStage::Ps) {
+        return Err(Malformed("a linked program of another stage"));
+    }
+    if u32_at(meta, 0)? != LINKED_TAG {
+        return Err(Malformed("unknown linked metadata"));
+    }
+    if u32_at(meta, 4)? as usize + 0xc != meta.len() {
+        return Err(Malformed("linked metadata size disagrees"));
+    }
+    if (u32_at(meta, 8)? as usize + LINKED_CODE_EXTRA) * 4 != code.len() {
+        return Err(Malformed("linked code size disagrees"));
+    }
+    let count = u32_at(meta, 0xc)?;
+    if count & 0x7FFF != LINKED_MARK {
+        return Err(Malformed("unknown linked metadata"));
+    }
+    let count = (count >> 15) as usize;
+    if LINKED_RECORDS + FSPX_RECORD * count != meta.len() {
+        return Err(Malformed("linked metadata record count disagrees"));
+    }
+    let records = &meta[LINKED_RECORDS..];
+    let hash = match records.as_chunks::<FSPX_RECORD>().0.last() {
+        Some(e) if e[0] == 0x43 => [le32(e, 4), le32(e, 8), le32(e, 12), le32(e, 16)],
+        _ => return Err(Malformed("linked metadata without a hash")),
+    };
+    if code_hash(code)? != hash {
+        return Err(Malformed("linked code and metadata of different programs"));
+    }
+    let (layout, used) = resource_records(records)?;
+    // VGPRs in granules of 4 (wave64) or 8 (wave32).
+    let granules = (rsrc1 & 0x3F) + 1;
     Ok(NativeProgram {
-        stage: HwStage::Cs,
+        stage,
         wave64,
-        vgprs,
+        vgprs: (granules * if wave64 { 4 } else { 8 }).min(256) as u16,
         layout,
         used,
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: u32_at(packet, PACKET_RSRC2)?,
-            threads: [threads(0)?, threads(1)?, threads(2)?],
-        }),
+        io: StageIo::Linked(LinkedIo::default()),
         code: code.to_vec(),
     })
+}
+
+/// A linked program as a container of our own making, so that it goes
+/// wherever the title's containers go (the shader table, the translation
+/// cache, [`native_programs`]): one `ACCC` part, native code in place of
+/// `DXIL`, that holds what [`linked_program`] is given and `io`.
+///
+/// ```text
+/// "VLNK" u32 version (1), u32 stage (0 vertex, 1 pixel), u32 wave64,
+///        u32 rsrc1, u32 rsrc2, u32 SPI_PS_INPUT_ENA,
+///        u32 SPI_SHADER_COL_FORMAT, u32 input control count, u32 input
+///        element count, u32 code bytes, u32 metadata bytes; then the input
+///        controls, the elements (as in the title's layout block,
+///        [`InputLayout`]), the code, the metadata
+/// ```
+///
+/// A program whose metadata declares a sampler no record places (a 0x42
+/// record of class 3) picks it from the sampler heap, by an index in a root
+/// constant: its layout gets the heap, whose base the code reads from the
+/// stage's last user SGPR.
+/// shortcut: that the last user-data dword is the sampler heap's base is
+/// read off the code of the eight pixel programs seen that do this (they
+/// load 16 bytes at `s11 + (constant << 4)` with 12 user SGPRs, one of
+/// them for each of two constants), not off anything that says so.
+///
+/// Fails where [`linked_program`] does, and where the part would not give
+/// its program back: a container is only made of a program that is one.
+pub fn linked_container(
+    stage: HwStage,
+    code: &[u8],
+    meta: &[u8],
+    rsrc1: u32,
+    wave64: bool,
+    io: &LinkedIo,
+) -> Result<Vec<u8>, ShaderError> {
+    let mut part = LINKED_MAGIC.to_vec();
+    let head = [
+        LINKED_VERSION,
+        u32::from(stage == HwStage::Ps),
+        u32::from(wave64),
+        rsrc1,
+        io.rsrc2,
+        io.input_ena,
+        io.col_format,
+        io.input_cntl.len() as u32,
+        io.inputs.len() as u32,
+        code.len() as u32,
+        meta.len() as u32,
+    ];
+    for v in head.iter().chain(&io.input_cntl) {
+        part.extend(v.to_le_bytes());
+    }
+    for e in &io.inputs {
+        part.extend((e.name.len() as u32 + 1).to_le_bytes());
+        part.extend(e.name.as_bytes());
+        part.push(0);
+        let fields = [e.index, e.format, e.slot, e.offset, u32::from(e.per_instance), e.step_rate];
+        part.extend(fields.iter().flat_map(|v| v.to_le_bytes()));
+    }
+    part.extend(code);
+    part.extend(meta);
+    linked_part(&part)?;
+    Ok(crate::dxbc::build(&[(crate::FourCC::ACCC, &part)]))
+}
+
+/// The program of a [`linked_container`]'s part.
+fn linked_part(part: &[u8]) -> Result<NativeProgram, ShaderError> {
+    const SHORT: ShaderError = Malformed("linked part out of bounds");
+    let mut rest = part.get(4..).ok_or(SHORT)?;
+    let mut take = |n: usize| -> Result<&[u8], ShaderError> {
+        let (taken, after) = rest.split_at_checked(n).ok_or(SHORT)?;
+        rest = after;
+        Ok(taken)
+    };
+    let head: Vec<u32> = take(44)?.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+    let [version, stage, wave64, rsrc1, rsrc2, input_ena, col_format, cntl, elements, code, meta] = head[..] else {
+        return Err(SHORT);
+    };
+    if version != LINKED_VERSION || stage > 1 || wave64 > 1 {
+        return Err(Malformed("unknown linked part"));
+    }
+    if cntl > MAX_SEMANTICS || elements > MAX_INPUT_ELEMENTS {
+        return Err(Malformed("implausible linked part"));
+    }
+    let input_cntl = take(4 * cntl as usize)?.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+    let mut inputs = Vec::new();
+    for _ in 0..elements {
+        inputs.push(input_element(&mut take)?);
+    }
+    let (code, meta) = (take(code as usize)?, take(meta as usize)?);
+    let stage = if stage == 1 { HwStage::Ps } else { HwStage::Vs };
+    let mut program = linked_program(stage, code, meta, rsrc1, wave64 == 1)?;
+    let io = LinkedIo {
+        inputs,
+        input_ena,
+        col_format,
+        input_cntl,
+        rsrc2,
+    };
+    // (`linked_program` has checked the metadata's size)
+    let records = meta[LINKED_RECORDS..].as_chunks::<FSPX_RECORD>().0;
+    let placed = |register: u32| records.iter().any(|e| e[0] == 0x41 && e[4] == 1 && le32(e, 12) == register);
+    if records.iter().any(|e| e[0] == 0x42 && e[9] == 3 && !placed(le32(e, 12))) {
+        let last = io.user_sgprs().checked_sub(1).ok_or(Malformed("a heap sampler without user data"))?;
+        if program.layout.iter().any(|p| u32::from(p.user_data) + p.sgprs > u32::from(last)) {
+            return Err(Malformed("a heap sampler without room for its heap"));
+        }
+        program.layout.push(RootParam {
+            root: RootType::SamplerHeap,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: last,
+            // No parameter of the title's root signature.
+            slot: u8::MAX,
+        });
+    }
+    // Root constants run up to the next parameter, or to the end of the
+    // user SGPRs: their record does not say how many there are
+    // ([`resource_records`]), and one program reads two (both of them
+    // sampler indices, in s9 and s10 before the heap's base in s11).
+    let starts: Vec<u8> = program.layout.iter().map(|p| p.user_data).collect();
+    for p in program.layout.iter_mut().filter(|p| p.root == RootType::Constants) {
+        let next = starts.iter().copied().filter(|&s| s > p.user_data).min();
+        let end = next.unwrap_or(io.user_sgprs());
+        if end > p.user_data {
+            p.sgprs = u32::from(end - p.user_data);
+        }
+    }
+    program.io = StageIo::Linked(io);
+    Ok(program)
+}
+
+/// One input element as the title's layout block and our linked part hold
+/// it, unaligned: u32 name length with its NUL, the name, u32 semantic
+/// index, u32 format, u32 slot, u32 byte offset, u32 class (1 per
+/// instance), u32 step rate.
+fn input_element<'a>(
+    take: &mut impl FnMut(usize) -> Result<&'a [u8], ShaderError>,
+) -> Result<InputElement, ShaderError> {
+    let len = le32(take(4)?, 0) as usize;
+    let name = match take(len)?.split_last() {
+        Some((0, name)) if name.iter().all(|b| b.is_ascii_graphic()) => name,
+        _ => return Err(Malformed("an input element's name")),
+    };
+    let name = String::from_utf8_lossy(name).into_owned();
+    let f = take(24)?;
+    let class = le32(f, 16);
+    if class > 1 {
+        return Err(Malformed("an input element's class"));
+    }
+    Ok(InputElement {
+        name,
+        index: le32(f, 0),
+        format: le32(f, 4),
+        slot: le32(f, 8),
+        offset: le32(f, 12),
+        per_instance: class == 1,
+        step_rate: le32(f, 20),
+    })
+}
+
+/// The register image device method 0x1c8 gets with a pipeline's programs.
+/// Offsets as observed in the 16 descriptions a run dumped; the ones marked
+/// guess track nothing else we can see.
+///
+/// ```text
+/// +0x28 u16 offset (from +0x1c) and u16 size of the image's last section,
+///       which ends the image
+/// +0x38 SPI_SHADER_PGM_RSRC1_VS, +0x3c RSRC2_VS
+/// +0x4c SPI_SHADER_PGM_RSRC1_PS, +0x50 RSRC2_PS (0 without a pixel program)
+/// +0x58 SPI_PS_INPUT_ENA (guess: 2, and i/j are in v0/v1)
+/// +0x5c SPI_PS_IN_CONTROL (NUM_INTERP is the vertex program's parameter
+///       count; bit 15 PS_W32_EN)
+/// +0x70 SPI_SHADER_COL_FORMAT (4: FP16_ABGR; 0 without a pixel program)
+/// +0x7c CB_COLOR_CONTROL
+/// +0x84 SPI_VS_OUT_CONFIG
+/// +0xb8 DB_DEPTH_CONTROL, +0xbc DB_STENCIL_CONTROL (guess: they decode as
+///       such in every image: depth off and "always" where only colour is
+///       drawn, depth on and written in the one without a pixel program)
+/// +0xc0 DB_STENCILREFMASK, +0xc4 DB_STENCILREFMASK_BF (guess)
+/// +0xd0 CB_BLEND0_CONTROL to CB_BLEND7_CONTROL
+/// last  14 dwords, then SPI_PS_INPUT_CNTL_0 to _<NUM_INTERP - 1>, padded to
+///       an even count, then 3 dwords
+/// ```
+///
+/// The last section is at +0x138 in the images of vertex plus pixel
+/// pipelines, which are 0x17c bytes without interpolants, 0x184 with two,
+/// 0x18c with three. An image that has it elsewhere (one of 0x200 bytes was
+/// seen, of a pipeline with another geometry stage in place of the vertex
+/// program) has other registers before it, so none of these offsets hold:
+/// it is refused.
+///
+/// Rasterizer state and the vertex stage's wave size are not identified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphicsRegs {
+    pub vs_rsrc1: u32,
+    pub vs_rsrc2: u32,
+    pub ps_rsrc1: u32,
+    pub ps_rsrc2: u32,
+    pub ps_input_ena: u32,
+    pub ps_in_control: u32,
+    pub col_format: u32,
+    pub cb_color_control: u32,
+    pub vs_out_config: u32,
+    pub db_depth_control: u32,
+    pub db_stencil_control: u32,
+    /// Front, then back.
+    pub db_stencil_ref_mask: [u32; 2],
+    pub blend: [u32; 8],
+    /// `SPI_PS_INPUT_CNTL_<k>`, one per interpolated parameter.
+    pub ps_input_cntl: Vec<u32>,
+}
+
+impl GraphicsRegs {
+    pub fn parse(image: &[u8]) -> Result<Self, ShaderError> {
+        let at = |at: usize| u32_at(image, at);
+        let section = at(REGS_SECTION)?;
+        let (start, size) = (
+            REGS_SECTION_BASE + (section & 0xFFFF) as usize,
+            (section >> 16) as usize,
+        );
+        if start != REGS_LAST {
+            return Err(Malformed("a register image of another layout"));
+        }
+        if start + size != image.len() {
+            return Err(Malformed("register image size disagrees"));
+        }
+        let ps_in_control = at(REGS_PS_IN_CONTROL)?;
+        let interps = (ps_in_control & 0x3F) as usize;
+        if size != 4 * (REGS_LAST_HEAD + interps.next_multiple_of(2) + REGS_LAST_TAIL) {
+            return Err(Malformed("register image interpolant count disagrees"));
+        }
+        let mut blend = [0; 8];
+        for (i, b) in blend.iter_mut().enumerate() {
+            *b = at(REGS_BLEND + 4 * i)?;
+        }
+        Ok(GraphicsRegs {
+            vs_rsrc1: at(REGS_VS_RSRC1)?,
+            vs_rsrc2: at(REGS_VS_RSRC1 + 4)?,
+            ps_rsrc1: at(REGS_PS_RSRC1)?,
+            ps_rsrc2: at(REGS_PS_RSRC1 + 4)?,
+            ps_input_ena: at(REGS_PS_INPUT_ENA)?,
+            ps_in_control,
+            col_format: at(REGS_COL_FORMAT)?,
+            cb_color_control: at(REGS_COLOR_CONTROL)?,
+            vs_out_config: at(REGS_VS_OUT_CONFIG)?,
+            db_depth_control: at(REGS_DEPTH_CONTROL)?,
+            db_stencil_control: at(REGS_DEPTH_CONTROL + 4)?,
+            db_stencil_ref_mask: [at(REGS_STENCIL_REF_MASK)?, at(REGS_STENCIL_REF_MASK + 4)?],
+            blend,
+            ps_input_cntl: (0..interps)
+                .map(|k| at(REGS_LAST + 4 * (REGS_LAST_HEAD + k)))
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
+    /// Whether the pixel stage runs 64 lanes a wave (`PS_W32_EN` clear).
+    pub fn ps_wave64(&self) -> bool {
+        self.ps_in_control >> 15 & 1 == 0
+    }
+
+    /// What the pixel program's I/O is derived with.
+    pub fn pixel_io(&self) -> LinkedIo {
+        LinkedIo {
+            inputs: Vec::new(),
+            input_ena: self.ps_input_ena,
+            col_format: self.col_format,
+            input_cntl: self.ps_input_cntl.clone(),
+            rsrc2: self.ps_rsrc2,
+        }
+    }
+
+    /// What the vertex program's I/O is derived with: `layout`'s elements.
+    pub fn vertex_io(&self, layout: &InputLayout) -> LinkedIo {
+        LinkedIo {
+            inputs: layout.elements.clone(),
+            rsrc2: self.vs_rsrc2,
+            ..LinkedIo::default()
+        }
+    }
+
+    /// Parameters the pixel stage interpolates (`NUM_INTERP`).
+    pub fn num_interp(&self) -> u32 {
+        self.ps_in_control & 0x3F
+    }
+}
+
+/// The block of formats and input layout device method 0x1c8 gets with a
+/// pipeline's programs (0x50 bytes and the elements, padded to 4). As
+/// observed; the fields marked guess are constant or nearly so in the 16
+/// descriptions seen:
+///
+/// ```text
+/// +0x00 u32 a hash or id
+/// +0x10 u8 x8 render target formats (one description has five targets and
+///       five bytes set)
+/// +0x1c u32 -1: the sample mask (guess)
+/// +0x24 u8 depth format, u8 render target count, u8 topology type (3
+///       triangles, 19 the console's rectangles)
+/// +0x38 u32 size of what follows +0x4c, before padding
+/// +0x4c u32 element count, then per element, unaligned: u32 name length
+///       with its NUL, the name, u32 semantic index, u32 format, u32 slot,
+///       u32 byte offset, u32 class (1 per instance), u32 step rate
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputLayout {
+    pub id: u32,
+    /// DXGI formats, as the title numbers them.
+    pub target_formats: [u8; 8],
+    pub sample_mask: u32,
+    pub depth_format: u8,
+    pub targets: u8,
+    /// D3D12's primitive topology type, with the console's own (19, 32).
+    pub topology: u8,
+    pub elements: Vec<InputElement>,
+}
+
+impl InputLayout {
+    pub fn parse(block: &[u8]) -> Result<Self, ShaderError> {
+        const SHORT: ShaderError = Malformed("input layout out of bounds");
+        let head = block.get(..LAYOUT_ELEMENTS).ok_or(SHORT)?;
+        let end = u32_at(head, LAYOUT_ELEMENTS_SIZE)? as usize + LAYOUT_ELEMENT_COUNT;
+        if end < LAYOUT_ELEMENTS || end.next_multiple_of(4) != block.len() {
+            return Err(Malformed("input layout size disagrees"));
+        }
+        let count = u32_at(head, LAYOUT_ELEMENT_COUNT)?;
+        if count > MAX_INPUT_ELEMENTS {
+            return Err(Malformed("implausible input element count"));
+        }
+        let mut rest = &block[LAYOUT_ELEMENTS..end];
+        let mut take = |n: usize| -> Result<&[u8], ShaderError> {
+            let (taken, after) = rest.split_at_checked(n).ok_or(SHORT)?;
+            rest = after;
+            Ok(taken)
+        };
+        let mut elements = Vec::new();
+        for _ in 0..count {
+            elements.push(input_element(&mut take)?);
+        }
+        if !rest.is_empty() {
+            return Err(Malformed("input layout size disagrees"));
+        }
+        Ok(InputLayout {
+            id: u32_at(head, 0)?,
+            target_formats: head[LAYOUT_TARGET_FORMATS..LAYOUT_TARGET_FORMATS + 8]
+                .try_into()
+                .expect("8 bytes"),
+            sample_mask: u32_at(head, LAYOUT_SAMPLE_MASK)?,
+            depth_format: head[LAYOUT_DEPTH_FORMAT],
+            targets: head[LAYOUT_DEPTH_FORMAT + 1],
+            topology: head[LAYOUT_DEPTH_FORMAT + 2],
+            elements,
+        })
+    }
 }
 
 fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
@@ -858,9 +1401,368 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
     data.get(start..start.checked_add(usize::try_from(len).ok()?)?)
 }
 
+/// What a run with `VICTORY_PSO_DUMP` wrote of device method 0x1c8's
+/// descriptions, when the worktree has it (`.agente/pso-dump`): the tests
+/// on the title's own blocks read them from there and pass without them,
+/// since no game data is kept in the repository.
+#[cfg(test)]
+pub(crate) mod dumped {
+    use std::path::PathBuf;
+
+    fn dir() -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.agente/pso-dump"))
+    }
+
+    /// The block description `description` ("00001") names at `word`.
+    pub(crate) fn block(description: &str, word: u32) -> Option<Vec<u8>> {
+        let prefix = format!("1c8-{description}-w{word}-");
+        let entry = std::fs::read_dir(dir()).ok()?.flatten().find(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(&prefix) && name.ends_with(".bin")
+        })?;
+        std::fs::read(entry.path()).ok()
+    }
+
+    /// Every description dumped, in order.
+    pub(crate) fn descriptions() -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir())
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                Some(name.strip_prefix("1c8-")?.strip_suffix(".txt")?.to_owned())
+            })
+            .collect();
+        out.sort();
+        out
+    }
+}
+
+/// Linked programs made of a few instructions, in the form device method
+/// 0x1c8 gets them: for the tests here and of the translation.
+#[cfg(test)]
+pub(crate) mod fixture {
+    use super::{FSPX_RECORD, LINKED_CODE_EXTRA, LINKED_MARK, LINKED_RECORDS, LINKED_TAG};
+
+    pub(crate) const HASH: [u32; 4] = [0xD21D_A4DF, 0x1234_5678, 0x91FE_D799, 0x9ABC_DEF0];
+
+    pub(crate) fn words(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// A linked code block: the two `v_nop`s holding `hash`, `body`,
+    /// `s_endpgm`, and the ten dwords the metadata does not count.
+    pub(crate) fn linked_code(hash: [u32; 4], body: &[u32]) -> Vec<u8> {
+        let nop = |h: u32, literal: u32| {
+            [0xD580_0000 | h & 0xFFFF, 0x03FE_0100 | h >> 16 & 0xFF | (h >> 24) << 9, literal]
+        };
+        let mut code = nop(hash[0], hash[1]).to_vec();
+        code.extend(nop(hash[2], hash[3]));
+        code.extend(body);
+        code.push(0xBF81_0000);
+        code.extend([0xBF9F_0000; LINKED_CODE_EXTRA]);
+        words(&code)
+    }
+
+    /// A resource record: an SRV of `dwords` at `offset` dwords of the table
+    /// in user-data dword 8 (root slot 0).
+    pub(crate) fn table_record(register: u32, offset: u32, dwords: u8) -> [u8; FSPX_RECORD] {
+        let mut e = [0; FSPX_RECORD];
+        e[0] = 0x41;
+        e[5] = 3;
+        e[8..12].copy_from_slice(&offset.to_le_bytes());
+        e[12..16].copy_from_slice(&register.to_le_bytes());
+        e[20..23].copy_from_slice(&[dwords, 8, 0]);
+        e
+    }
+
+    /// Linked metadata for `code` with `records` and the hash record.
+    pub(crate) fn linked_meta(code: &[u8], records: &[[u8; FSPX_RECORD]], hash: [u32; 4]) -> Vec<u8> {
+        let size = LINKED_RECORDS + FSPX_RECORD * (records.len() + 1);
+        let mut meta = words(&[
+            LINKED_TAG,
+            size as u32 - 0xc,
+            (code.len() / 4 - LINKED_CODE_EXTRA) as u32,
+            LINKED_MARK | (records.len() as u32 + 1) << 15,
+        ]);
+        for r in records {
+            meta.extend_from_slice(r);
+        }
+        meta.extend(words(&[0x43, hash[0], hash[1], hash[2], hash[3], 0, 0, 0]));
+        meta
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixture::{HASH, linked_code, linked_meta, table_record, words};
     use super::*;
+
+    #[test]
+    fn linked_programs_are_checked_against_their_metadata() {
+        // s_mov_b32 s9, 0 before the end.
+        let code = linked_code(HASH, &[0xBE89_0380]);
+        let records = [table_record(13, 0, 4), table_record(0, 0x10, 8)];
+        let meta = linked_meta(&code, &records, HASH);
+        let p = linked_program(HwStage::Ps, &code, &meta, 3, true).unwrap();
+        assert_eq!((p.stage, p.wave64, p.vgprs), (HwStage::Ps, true, 16));
+        assert_eq!(p.io, StageIo::Linked(LinkedIo::default()));
+        assert_eq!(p.code, code);
+        assert_eq!(
+            p.layout,
+            [RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 13,
+                user_data: 8,
+                slot: 0
+            }]
+        );
+        let used: Vec<_> = p.used.iter().map(|u| (u.lower_bound, u.table_offset_dwords, u.dwords)).collect();
+        assert_eq!(used, [(13, 0, 4), (0, 0x10, 8)]);
+        // Granules of 8 VGPRs in 32-lane waves.
+        assert_eq!(linked_program(HwStage::Vs, &code, &meta, 5, false).unwrap().vgprs, 48);
+
+        let refused = |code: &[u8], meta: &[u8]| linked_program(HwStage::Vs, code, meta, 5, false).is_err();
+        assert!(linked_program(HwStage::Cs, &code, &meta, 5, false).is_err(), "stage");
+        let other = linked_code([HASH[0] ^ 0x0100_0000, HASH[1], HASH[2], HASH[3]], &[0xBE89_0380]);
+        assert!(refused(&other, &meta), "another program's code");
+        assert!(refused(&code[..code.len() - 4], &meta), "code size");
+        assert!(refused(&code, &meta[..meta.len() - FSPX_RECORD]), "metadata size");
+        for (at, what) in [(0, "tag"), (4, "size"), (8, "code dwords"), (0xc, "mark"), (0xe, "count")] {
+            let mut bad = meta.clone();
+            bad[at] ^= 1;
+            assert!(refused(&code, &bad), "{what}");
+        }
+        // The hash record must be the last one.
+        let mut unhashed = meta.clone();
+        let last = unhashed.len() - FSPX_RECORD;
+        unhashed[last] = 0x42;
+        assert!(refused(&code, &unhashed), "no hash");
+    }
+
+    #[test]
+    fn linked_containers_give_their_program_back() {
+        let code = linked_code(HASH, &[0xBE89_0380]);
+        let meta = linked_meta(&code, &[table_record(13, 0, 4)], HASH);
+        let io = LinkedIo {
+            inputs: vec![InputElement {
+                name: "COLOR".into(),
+                index: 1,
+                format: 30,
+                slot: 2,
+                offset: 8,
+                per_instance: true,
+                step_rate: 1,
+            }],
+            input_ena: 2,
+            col_format: 4,
+            input_cntl: vec![0, 0x401],
+            rsrc2: 0x14,
+        };
+        // A sampler the metadata declares and no record places comes from
+        // the sampler heap, whose base is the last of the 12 user SGPRs.
+        let mut constant = table_record(500, 0, 4);
+        constant[4..6].copy_from_slice(&[2, 0]);
+        constant[21..23].copy_from_slice(&[9, 1]);
+        let mut sampler = [0u8; FSPX_RECORD];
+        sampler[0] = 0x42;
+        sampler[8..11].copy_from_slice(&[2, 3, 14]);
+        let picked = linked_meta(&code, &[table_record(2, 0, 8), constant, sampler], HASH);
+        let heap = LinkedIo {
+            rsrc2: 0x18,
+            ..io.clone()
+        };
+        let container = linked_container(HwStage::Ps, &code, &picked, 3, true, &heap).unwrap();
+        let c = crate::Container::parse(&container).unwrap();
+        let p = &native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap()[0];
+        let layout: Vec<_> = p.layout.iter().map(|p| (p.root, p.user_data, p.sgprs)).collect();
+        // (the constants run up to it)
+        assert_eq!(
+            layout,
+            [(RootType::Table, 8, 1), (RootType::Constants, 9, 2), (RootType::SamplerHeap, 11, 1)]
+        );
+        // With ten user SGPRs the constant would lie where the heap's base is.
+        assert!(linked_container(HwStage::Ps, &code, &picked, 3, true, &io).is_err());
+        // Nor is a container made of blocks that are not one program.
+        assert!(linked_container(HwStage::Ps, &code[4..], &meta, 3, true, &io).is_err());
+
+        for (stage, wave64) in [(HwStage::Vs, false), (HwStage::Ps, true)] {
+            let container = linked_container(stage, &code, &meta, 3, wave64, &io).unwrap();
+            let c = crate::Container::parse(&container).unwrap();
+            let part = c.part(crate::FourCC::ACCC).unwrap();
+            let mut expected = linked_program(stage, &code, &meta, 3, wave64).unwrap();
+            expected.io = StageIo::Linked(io.clone());
+            assert_eq!(native_programs(part.data).unwrap(), [expected]);
+            // What the part holds is checked as the blocks were.
+            let mut other = part.data.to_vec();
+            let hash = other.len() - FSPX_RECORD + 4;
+            other[hash] ^= 1;
+            assert!(native_programs(&other).is_err(), "hash");
+            assert!(native_programs(&part.data[..part.data.len() - 4]).is_err(), "size");
+        }
+    }
+
+    /// A register image of a vertex plus pixel pipeline with `cntl` as its
+    /// pixel input controls.
+    fn register_image(cntl: &[u32]) -> Vec<u8> {
+        let size = 4 * (REGS_LAST_HEAD + cntl.len().next_multiple_of(2) + REGS_LAST_TAIL);
+        let mut image = vec![0u8; REGS_LAST + size];
+        let mut put = |at: usize, v: u32| image[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        put(REGS_SECTION, ((REGS_LAST - REGS_SECTION_BASE) | size << 16) as u32);
+        put(REGS_VS_RSRC1, 0x082C_0345);
+        put(REGS_PS_RSRC1, 0x022C_C343);
+        put(REGS_PS_RSRC1 + 4, 0x14);
+        put(REGS_PS_INPUT_ENA, 2);
+        put(REGS_PS_IN_CONTROL, cntl.len() as u32);
+        put(REGS_COL_FORMAT, 4);
+        put(REGS_DEPTH_CONTROL, 0x0070_07F0);
+        put(REGS_BLEND + 4, 0xE504_0504);
+        for (k, &c) in cntl.iter().enumerate() {
+            put(REGS_LAST + 4 * (REGS_LAST_HEAD + k), c);
+        }
+        image
+    }
+
+    #[test]
+    fn register_images_give_the_stage_registers_and_input_controls() {
+        for cntl in [&[][..], &[0, 1], &[0, 1, 0x402]] {
+            let image = register_image(cntl);
+            let r = GraphicsRegs::parse(&image).unwrap();
+            assert_eq!(r.ps_input_cntl, cntl);
+            assert_eq!((r.vs_rsrc1, r.ps_rsrc1, r.ps_rsrc2), (0x082C_0345, 0x022C_C343, 0x14));
+            assert_eq!((r.ps_input_ena, r.col_format, r.db_depth_control), (2, 4, 0x0070_07F0));
+            assert_eq!(r.blend[..2], [0, 0xE504_0504]);
+            assert!(r.ps_wave64());
+            assert_eq!(r.num_interp() as usize, cntl.len());
+        }
+        // 0x17c bytes without interpolants, 0x184 with two, 0x18c with three.
+        let sizes = [0, 2, 3].map(|n| register_image(&vec![0; n]).len());
+        assert_eq!(sizes, [0x17c, 0x184, 0x18c]);
+
+        let image = register_image(&[0, 1]);
+        let mut wide = image.clone();
+        wide[REGS_PS_IN_CONTROL + 1] = 0x80;
+        assert!(!GraphicsRegs::parse(&wide).unwrap().ps_wave64());
+        let mut more = image.clone();
+        more[REGS_PS_IN_CONTROL] = 5;
+        assert!(GraphicsRegs::parse(&more).is_err(), "interpolant count");
+        let mut elsewhere = image.clone();
+        elsewhere[REGS_SECTION] += 4;
+        assert!(GraphicsRegs::parse(&elsewhere).is_err(), "another layout");
+        assert!(GraphicsRegs::parse(&image[..image.len() - 4]).is_err(), "size");
+        assert!(GraphicsRegs::parse(&[0; 16]).is_err());
+    }
+
+    /// A formats and input layout block with `elements` as (name, semantic
+    /// index, format, byte offset), one render target and triangles.
+    fn layout_block(elements: &[(&str, u32, u32, u32)]) -> Vec<u8> {
+        let mut block = vec![0u8; LAYOUT_ELEMENTS];
+        block[LAYOUT_TARGET_FORMATS] = 28;
+        block[LAYOUT_SAMPLE_MASK..][..4].copy_from_slice(&[0xFF; 4]);
+        block[LAYOUT_DEPTH_FORMAT..][..3].copy_from_slice(&[55, 1, 3]);
+        block[LAYOUT_ELEMENT_COUNT] = elements.len() as u8;
+        for &(name, index, format, offset) in elements {
+            block.extend((name.len() as u32 + 1).to_le_bytes());
+            block.extend(name.as_bytes());
+            block.push(0);
+            block.extend(words(&[index, format, 0, offset, 0, 0]));
+        }
+        let size = (block.len() - LAYOUT_ELEMENT_COUNT) as u32;
+        block[LAYOUT_ELEMENTS_SIZE..][..4].copy_from_slice(&size.to_le_bytes());
+        block.resize(block.len().next_multiple_of(4), 0);
+        block
+    }
+
+    #[test]
+    fn layout_blocks_give_formats_and_unaligned_elements() {
+        let block = layout_block(&[("POSITION", 0, 16, 0), ("COLOR", 1, 30, 8)]);
+        // 37 and 34 bytes of elements: one byte of padding.
+        assert_eq!(block.len(), LAYOUT_ELEMENTS + 72);
+        let l = InputLayout::parse(&block).unwrap();
+        assert_eq!((l.target_formats[0], l.depth_format, l.targets, l.topology), (28, 55, 1, 3));
+        assert_eq!(l.sample_mask, u32::MAX);
+        let element = |name: &str, index, format, offset| InputElement {
+            name: name.into(),
+            index,
+            format,
+            slot: 0,
+            offset,
+            per_instance: false,
+            step_rate: 0,
+        };
+        assert_eq!(l.elements, [element("POSITION", 0, 16, 0), element("COLOR", 1, 30, 8)]);
+        assert!(InputLayout::parse(&layout_block(&[])).unwrap().elements.is_empty());
+
+        assert!(InputLayout::parse(&block[..block.len() - 4]).is_err(), "size");
+        let mut count = block.clone();
+        count[LAYOUT_ELEMENT_COUNT] = 3;
+        assert!(InputLayout::parse(&count).is_err(), "count");
+        let mut name = block.clone();
+        name[LAYOUT_ELEMENTS] = 4;
+        assert!(InputLayout::parse(&name).is_err(), "name length");
+        assert!(InputLayout::parse(&[0; 8]).is_err());
+    }
+
+    /// Every description a run dumped (`.agente/pso-dump`): its blocks are
+    /// what the parsers say they are, or it is of the one shape they refuse.
+    #[test]
+    fn dumped_descriptions_parse() {
+        for d in dumped::descriptions() {
+            let (Some(image), Some(block)) = (dumped::block(&d, 1), dumped::block(&d, 3)) else {
+                continue;
+            };
+            let layout = InputLayout::parse(&block).unwrap_or_else(|e| panic!("{d}: layout: {e}"));
+            // One format byte per render target (one description has five).
+            let set = layout.target_formats.iter().take_while(|&&f| f != 0).count();
+            assert_eq!(set, usize::from(layout.targets), "{d}: {:?}", layout.target_formats);
+            assert!(layout.target_formats[set..].iter().all(|&f| f == 0), "{d}");
+            let vs = dumped::block(&d, 9).zip(dumped::block(&d, 11));
+            let Some((vs_code, vs_meta)) = vs else {
+                // No vertex program: another geometry stage's registers come
+                // first in the image.
+                assert!(GraphicsRegs::parse(&image).is_err(), "{d}");
+                continue;
+            };
+            let regs = GraphicsRegs::parse(&image).unwrap_or_else(|e| panic!("{d}: registers: {e}"));
+            let vs = linked_program(HwStage::Vs, &vs_code, &vs_meta, regs.vs_rsrc1, false)
+                .unwrap_or_else(|e| panic!("{d}: vertex program: {e}"));
+            assert!(matches!(vs.io, StageIo::Linked(_)));
+            match dumped::block(&d, 5).zip(dumped::block(&d, 7)) {
+                Some((code, meta)) => {
+                    let ps = linked_program(HwStage::Ps, &code, &meta, regs.ps_rsrc1, regs.ps_wave64())
+                        .unwrap_or_else(|e| panic!("{d}: pixel program: {e}"));
+                    assert_eq!(ps.stage, HwStage::Ps);
+                    // The blocks are not interchangeable: the hash tells.
+                    assert!(linked_program(HwStage::Ps, &code, &vs_meta, regs.ps_rsrc1, true).is_err());
+                    // Each interpolant reads the parameter of its own
+                    // number; some are flat (bit 10), nothing else is set.
+                    let own = regs.ps_input_cntl.iter().enumerate().all(|(k, &c)| c & !0x400 == k as u32);
+                    assert!(own, "{d}: {:x?}", regs.ps_input_cntl);
+                }
+                None => {
+                    assert_eq!((regs.ps_rsrc1, regs.col_format, regs.num_interp()), (0, 0, 0), "{d}");
+                    assert_eq!(layout.targets, 0, "{d}");
+                }
+            }
+        }
+    }
+
+    /// The first description's layout: the three elements its vertex
+    /// program loads.
+    #[test]
+    fn dumped_layout_has_the_fetched_elements() {
+        let Some(block) = dumped::block("00001", 3) else {
+            return;
+        };
+        let l = InputLayout::parse(&block).unwrap();
+        let elements: Vec<_> = l.elements.iter().map(|e| (e.name.as_str(), e.format, e.slot, e.offset)).collect();
+        assert_eq!(elements, [("POSITION", 6, 0, 0), ("COLOR", 28, 0, 12), ("TEXCOORD", 16, 0, 16)]);
+        assert_eq!((l.targets, l.target_formats[0], l.topology), (1, 28, 3));
+    }
 
     const VS_CODE: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
     const PS_CODE: [u8; 4] = [9, 10, 11, 12];

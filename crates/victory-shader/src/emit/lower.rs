@@ -12636,7 +12636,17 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        if e.compressed {
+        // Two 16-bit values per dword: only a linked pixel program's colours
+        // to a target its registers say takes 16-bit floats (FP16_ABGR), each
+        // channel a half of its dword's low or high 16 bits. (A container's
+        // program is patched to export whole dwords.)
+        let fp16_pairs = e.compressed
+            && matches!(
+                (&self.x.native.io, e.target),
+                (StageIo::Linked(l), Target::Color(n))
+                    if matches!(l.col_format >> (4 * n) & 0xF, 0 | crate::linked::COL_FP16)
+            );
+        if e.compressed && !fp16_pairs {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
@@ -12768,7 +12778,8 @@ impl<'a> Lower<'a> {
                 Target::Primitive => return Err("a primitive export"),
             };
             if let Some((id, col)) = found {
-                stores.push((id, col, value, None));
+                // (channel 2k in the low half of dword k, 2k + 1 in the high)
+                stores.push((id, col, value, fp16_pairs.then_some(ch % 2 == 1)));
             }
         }
         fn elements<'l>(l: &'l mut Lower, primitive: bool) -> &'l mut Vec<SigElement> {

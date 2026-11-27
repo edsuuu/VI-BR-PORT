@@ -91,6 +91,7 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lds;
+mod linked;
 mod lower;
 mod own_bits;
 #[cfg(all(test, windows))]
@@ -1217,8 +1218,12 @@ fn emit_program(
         }
     };
     let pixel = native.stage == HwStage::Ps;
-    let mut inputs = sig(FourCC::ISG1)?;
-    let mut outputs = sig(FourCC::OSG1)?;
+    // A linked program has no container: its signatures follow from its
+    // code and the pipeline's state.
+    let (mut inputs, mut outputs) = match &native.io {
+        crate::native::StageIo::Linked(l) => linked::signatures(native.stage, l, p)?,
+        _ => (sig(FourCC::ISG1)?, sig(FourCC::OSG1)?),
+    };
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say.
     let interpolated = if pixel { &mut inputs } else { &mut outputs };

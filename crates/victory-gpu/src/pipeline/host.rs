@@ -339,6 +339,147 @@ impl GraphicsState {
         }
     }
 
+    /// The state of a pipeline of device method 0x1c8, from the register
+    /// image and the block of formats and input layout the title passes with
+    /// its linked programs (`victory_shader::native`): the console's own
+    /// registers in place of D3D12's descriptions. `Err` names what the
+    /// host has no equal for, or what the registers do not say.
+    ///
+    /// Blend state is `CB_BLEND<n>_CONTROL` and `CB_COLOR_CONTROL`; a
+    /// target the pixel program does not export to
+    /// (`SPI_SHADER_COL_FORMAT`) is not written. Depth and stencil are
+    /// `DB_DEPTH_CONTROL`, `DB_STENCIL_CONTROL` and `DB_STENCILREFMASK`,
+    /// whose places in the image are a guess that decodes sensibly in every
+    /// image seen (`GraphicsRegs`).
+    /// shortcut: the image's rasterizer registers are not identified:
+    /// nothing is culled, and fill, bias and clipping are D3D12's defaults.
+    /// (The pipelines seen draw the interface and full-screen rectangles; a
+    /// pipeline that relied on culling draws its back faces too.)
+    pub(crate) fn linked(
+        regs: &victory_shader::GraphicsRegs,
+        layout: &victory_shader::InputLayout,
+    ) -> Result<GraphicsState, &'static str> {
+        let mut g = GraphicsState::default();
+        // `CB_COLOR_CONTROL`: mode 0 writes no colour, 1 draws; ROP3 0xcc
+        // copies the source.
+        let colour = match (regs.cb_color_control >> 4 & 7, regs.cb_color_control >> 16 & 0xFF) {
+            (0, _) => false,
+            (1, 0xCC) => true,
+            _ => return Err("a colour mode or raster operation that is no plain drawing"),
+        };
+        g.blend.IndependentBlendEnable = true.into();
+        for (i, target) in g.blend.RenderTarget.iter_mut().enumerate() {
+            let exported = regs.col_format >> (4 * i) & 0xF != 0;
+            if !(colour && exported) {
+                target.RenderTargetWriteMask = 0;
+            }
+            // SRCBLEND 0-4, COMB_FCN 5-7, DESTBLEND 8-12, the same for alpha
+            // from bit 16, SEPARATE_ALPHA_BLEND 29, ENABLE 30.
+            let c = regs.blend[i];
+            if c >> 30 & 1 == 0 {
+                continue;
+            }
+            let (src, dest, op) = (blend_factor(c & 0x1F)?, blend_factor(c >> 8 & 0x1F)?, blend_op(c >> 5 & 7)?);
+            let separate = c >> 29 & 1 != 0;
+            let (a_src, a_dest, a_op) = if separate {
+                (blend_factor(c >> 16 & 0x1F)?, blend_factor(c >> 24 & 0x1F)?, blend_op(c >> 21 & 7)?)
+            } else {
+                (src, dest, op)
+            };
+            target.BlendEnable = true.into();
+            (target.SrcBlend, target.DestBlend, target.BlendOp) = (src, dest, op);
+            // (alpha's factor of a colour is its alpha: D3D12 has no other)
+            (target.SrcBlendAlpha, target.DestBlendAlpha, target.BlendOpAlpha) = (alpha_factor(a_src), alpha_factor(a_dest), a_op);
+        }
+        g.sample_mask = layout.sample_mask;
+        g.rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+
+        // `DB_DEPTH_CONTROL`: STENCIL_ENABLE 0, Z_ENABLE 1, Z_WRITE_ENABLE 2,
+        // DEPTH_BOUNDS_ENABLE 3, ZFUNC 4-6, BACKFACE_ENABLE 7, STENCILFUNC
+        // 8-10, STENCILFUNC_BF 20-22. The compare functions are D3D12's less one.
+        let d = regs.db_depth_control;
+        let func = |n: u32| D3D12_COMPARISON_FUNC((n & 7) as i32 + 1);
+        g.depth.DepthEnable = (d >> 1 & 1 != 0).into();
+        g.depth.DepthWriteMask = if d >> 2 & 1 != 0 {
+            D3D12_DEPTH_WRITE_MASK_ALL
+        } else {
+            D3D12_DEPTH_WRITE_MASK_ZERO
+        };
+        g.depth.DepthFunc = func(d >> 4);
+        g.depth_bounds = d >> 3 & 1 != 0;
+        if d & 1 != 0 {
+            // `DB_STENCILREFMASK`: mask 8-15, write mask 16-23, the value the
+            // adding operations add 24-31. `DB_STENCIL_CONTROL`: fail, pass,
+            // depth-fail, 4 bits each, then the back face's.
+            let [front, back] = regs.db_stencil_ref_mask;
+            let one = |masks: u32| masks >> 24 == 1;
+            let face = |f: u32, ops: u32, adds_one: bool| -> Result<D3D12_DEPTH_STENCILOP_DESC, &'static str> {
+                Ok(D3D12_DEPTH_STENCILOP_DESC {
+                    StencilFailOp: stencil_op(ops & 0xF, adds_one)?,
+                    StencilPassOp: stencil_op(ops >> 4 & 0xF, adds_one)?,
+                    StencilDepthFailOp: stencil_op(ops >> 8 & 0xF, adds_one)?,
+                    StencilFunc: func(f),
+                })
+            };
+            g.depth.StencilEnable = true.into();
+            g.depth.FrontFace = face(d >> 8, regs.db_stencil_control, one(front))?;
+            g.depth.BackFace = if d >> 7 & 1 != 0 {
+                if (front ^ back) & 0x00FF_FF00 != 0 {
+                    return Err("stencil masks that differ between the faces");
+                }
+                face(d >> 20, regs.db_stencil_control >> 12, one(back))?
+            } else {
+                g.depth.FrontFace
+            };
+            g.depth.StencilReadMask = (front >> 8) as u8;
+            g.depth.StencilWriteMask = (front >> 16) as u8;
+        }
+
+        g.names = layout
+            .elements
+            .iter()
+            .map(|e| CString::new(e.name.as_str()))
+            .collect::<Result<_, _>>()
+            .map_err(|_| "an input element's name")?;
+        if layout.elements.iter().any(|e| e.slot >= 32) {
+            return Err("an input slot the host has not");
+        }
+        g.inputs = layout
+            .elements
+            .iter()
+            .zip(&g.names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                SemanticIndex: e.index,
+                Format: DXGI_FORMAT(crate::resource::pc_format(e.format) as i32),
+                InputSlot: e.slot,
+                AlignedByteOffset: e.offset,
+                InputSlotClass: if e.per_instance {
+                    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+                } else {
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
+                },
+                InstanceDataStepRate: e.step_rate,
+            })
+            .collect();
+        // Points, lines, triangles, and the console's rectangles.
+        if !matches!(i32::from(layout.topology), 1..=3 | RECTANGLES) {
+            return Err("a primitive topology type not seen from this method");
+        }
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(layout.topology.into());
+        let targets = usize::from(layout.targets);
+        if targets > 8 {
+            return Err("more render targets than there are");
+        }
+        g.targets.NumRenderTargets = targets as u32;
+        for (to, &format) in g.targets.RTFormats.iter_mut().zip(&layout.target_formats[..targets]) {
+            let format = crate::resource::pc_format(format.into());
+            to.0 = crate::resource::target_format(format) as i32;
+        }
+        g.depth_format = DXGI_FORMAT(crate::resource::pc_format(layout.depth_format.into()) as i32);
+        Ok(g)
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -424,6 +565,77 @@ impl GraphicsState {
             })
             .collect()
     }
+}
+
+/// A blend factor of `CB_BLEND<n>_CONTROL` as D3D12's. The console's
+/// 11 and 12 (both sources' alpha) have none.
+fn blend_factor(raw: u32) -> Result<D3D12_BLEND, &'static str> {
+    Ok(match raw {
+        0 => D3D12_BLEND_ZERO,
+        1 => D3D12_BLEND_ONE,
+        2 => D3D12_BLEND_SRC_COLOR,
+        3 => D3D12_BLEND_INV_SRC_COLOR,
+        4 => D3D12_BLEND_SRC_ALPHA,
+        5 => D3D12_BLEND_INV_SRC_ALPHA,
+        6 => D3D12_BLEND_DEST_ALPHA,
+        7 => D3D12_BLEND_INV_DEST_ALPHA,
+        8 => D3D12_BLEND_DEST_COLOR,
+        9 => D3D12_BLEND_INV_DEST_COLOR,
+        10 => D3D12_BLEND_SRC_ALPHA_SAT,
+        13 => D3D12_BLEND_BLEND_FACTOR,
+        14 => D3D12_BLEND_INV_BLEND_FACTOR,
+        15 => D3D12_BLEND_SRC1_COLOR,
+        16 => D3D12_BLEND_INV_SRC1_COLOR,
+        17 => D3D12_BLEND_SRC1_ALPHA,
+        18 => D3D12_BLEND_INV_SRC1_ALPHA,
+        19 => D3D12_BLEND_ALPHA_FACTOR,
+        20 => D3D12_BLEND_INV_ALPHA_FACTOR,
+        _ => return Err("a blend factor the host has not"),
+    })
+}
+
+/// The factor that scales alpha as `factor` scales colour: D3D12 takes no
+/// colour factor for the alpha channel.
+fn alpha_factor(factor: D3D12_BLEND) -> D3D12_BLEND {
+    match factor {
+        D3D12_BLEND_SRC_COLOR => D3D12_BLEND_SRC_ALPHA,
+        D3D12_BLEND_INV_SRC_COLOR => D3D12_BLEND_INV_SRC_ALPHA,
+        D3D12_BLEND_DEST_COLOR => D3D12_BLEND_DEST_ALPHA,
+        D3D12_BLEND_INV_DEST_COLOR => D3D12_BLEND_INV_DEST_ALPHA,
+        D3D12_BLEND_SRC1_COLOR => D3D12_BLEND_SRC1_ALPHA,
+        D3D12_BLEND_INV_SRC1_COLOR => D3D12_BLEND_INV_SRC1_ALPHA,
+        other => other,
+    }
+}
+
+/// A combine function of `CB_BLEND<n>_CONTROL` as D3D12's.
+fn blend_op(raw: u32) -> Result<D3D12_BLEND_OP, &'static str> {
+    Ok(match raw {
+        0 => D3D12_BLEND_OP_ADD,
+        1 => D3D12_BLEND_OP_SUBTRACT,
+        2 => D3D12_BLEND_OP_MIN,
+        3 => D3D12_BLEND_OP_MAX,
+        4 => D3D12_BLEND_OP_REV_SUBTRACT,
+        _ => return Err("a blend function the host has not"),
+    })
+}
+
+/// A stencil operation of `DB_STENCIL_CONTROL` as D3D12's. The console's
+/// adding operations add a value of their own, the host's one
+/// (`adds_one`: the value is 1); it also sets all bits, replaces with that
+/// value, and combines bitwise, which the host does not.
+fn stencil_op(raw: u32, adds_one: bool) -> Result<D3D12_STENCIL_OP, &'static str> {
+    Ok(match raw {
+        0 => D3D12_STENCIL_OP_KEEP,
+        1 => D3D12_STENCIL_OP_ZERO,
+        3 => D3D12_STENCIL_OP_REPLACE,
+        5 if adds_one => D3D12_STENCIL_OP_INCR_SAT,
+        6 if adds_one => D3D12_STENCIL_OP_DECR_SAT,
+        7 => D3D12_STENCIL_OP_INVERT,
+        8 if adds_one => D3D12_STENCIL_OP_INCR,
+        9 if adds_one => D3D12_STENCIL_OP_DECR,
+        _ => return Err("a stencil operation the host has not"),
+    })
 }
 
 /// One input element: vertex buffer slot, byte offset, format.
