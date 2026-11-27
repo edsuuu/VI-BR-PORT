@@ -28,6 +28,7 @@
   "prep.opens_by_itself": "O jogo abre sozinho quando terminar.",
   "prep.progress.name": "Preparação do jogo",
   "prep.cancel": "Cancelar",
+  "prep.back": "Voltar",
   "prep.step.build": "Compilar",
   "prep.step.shaders": "Traduzir os shaders",
   "prep.step.warm": "Aquecer os pipelines",
