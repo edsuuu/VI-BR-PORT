@@ -263,6 +263,19 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// frame and the next ([`builder_rests`]); it turned the builder off for the
 /// rest of the run at first.
 ///
+/// The first look makes every builder pipeline not made yet on the spot,
+/// on the title's thread, so a pipeline is either made or refused there
+/// and the decision holds until the title creates another. With
+/// `VICTORY_BVH_RETRY=1` nothing is made or waited for at a dispatch: a
+/// pipeline the workers are still making keeps the builder off for now,
+/// and it is looked at again at the next builder dispatch; once all are
+/// made it runs from the next frame, so no frame runs only the later of its
+/// stages. One refused keeps it off as without the switch. (Unset: as
+/// before, the first look decides.)
+///
+/// The decision is published where anything may read it without taking
+/// the lock or making a pipeline ([`builder_known_off`]).
+///
 /// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
 /// the whole builder and the host side of title memory by address
 /// (`memory.rs`) working on a card; nothing reads the structures before
@@ -276,15 +289,234 @@ struct Builder {
     off: usize,
     /// No stage runs before this frame.
     rests: u64,
+    /// The last decision ([`UNDECIDED`], [`RUNS`] or [`OFF`]).
+    state: u8,
+    /// The pipelines without a host pipeline at the last look that turned
+    /// it off (their shader hashes), and whether they were only not made
+    /// yet (`VICTORY_BVH_RETRY=1`).
+    missing: Vec<String>,
+    waiting: bool,
 }
 
 #[cfg(windows)]
-static BUILDER: Mutex<Builder> = Mutex::new(Builder {
-    pipelines: Vec::new(),
-    whole: false,
-    off: 0,
-    rests: 0,
-});
+static BUILDER: Mutex<Builder> = Mutex::new(Builder::new());
+
+/// No builder dispatch has been looked at yet.
+#[cfg(windows)]
+const UNDECIDED: u8 = 0;
+/// The builder runs: every one of its pipelines has a host pipeline.
+#[cfg(windows)]
+const RUNS: u8 = 1;
+/// The builder is off: one of its pipelines has none (yet).
+#[cfg(windows)]
+const OFF: u8 = 2;
+
+/// [`Builder::state`], published at each decision for readers that must
+/// neither take the lock nor make anything (the passes that only serve
+/// rays, [`skips_rt_skin`]).
+#[cfg(windows)]
+static BUILDER_STATE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(UNDECIDED);
+
+/// What a builder pipeline is at a look ([`Builder::look`]).
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Made {
+    Yes,
+    Refused,
+    NotYet,
+}
+
+#[cfg(windows)]
+impl Builder {
+    const fn new() -> Builder {
+        Builder {
+            pipelines: Vec::new(),
+            whole: false,
+            off: 0,
+            rests: 0,
+            state: UNDECIDED,
+            missing: Vec::new(),
+            waiting: false,
+        }
+    }
+
+    /// At a builder dispatch in frame `frame`: whether the builder runs.
+    /// `status` says what one of `pipelines` is (making it first, without
+    /// [`retry`]); `hashes` names it in the log.
+    fn look(
+        &mut self,
+        frame: u64,
+        retry: bool,
+        mut status: impl FnMut(&Arc<make::Pending>) -> Made,
+        hashes: impl Fn(&make::Pending) -> String,
+    ) -> bool {
+        if self.off == self.pipelines.len() || frame < self.rests {
+            return false;
+        }
+        if self.whole {
+            return true;
+        }
+        let mut refused = Vec::new();
+        let mut not_yet = Vec::new();
+        for p in &self.pipelines {
+            match status(p) {
+                Made::Yes => {}
+                Made::Refused => refused.push(hashes(p)),
+                Made::NotYet => not_yet.push(hashes(p)),
+            }
+        }
+        let of = self.pipelines.len();
+        if !refused.is_empty() || (!not_yet.is_empty() && !retry) {
+            self.off = of;
+            self.state = OFF;
+            self.waiting = false;
+            refused.extend(not_yet);
+            tracing::warn!(
+                missing = refused.len(),
+                of,
+                which = ?refused,
+                "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
+            );
+            self.missing = refused;
+            return false;
+        }
+        if !not_yet.is_empty() {
+            // Looked at again at the next dispatch: said when the count changes.
+            if !self.waiting || self.missing.len() != not_yet.len() {
+                tracing::info!(
+                    being_made = not_yet.len(),
+                    of,
+                    which = ?not_yet,
+                    "the ray-tracing structure builder waits: some of its programs are still being made (VICTORY_BVH_RETRY=1)"
+                );
+            }
+            self.state = OFF;
+            self.waiting = true;
+            self.missing = not_yet;
+            return false;
+        }
+        self.off = 0;
+        self.whole = true;
+        self.state = RUNS;
+        self.missing.clear();
+        if std::mem::take(&mut self.waiting) {
+            // Not from the middle of a frame whose first stages were dropped.
+            self.rests = frame + 1;
+            tracing::info!(
+                pipelines = of,
+                from_frame = self.rests,
+                "the ray-tracing structure builder runs from the next frame: all of its programs have host pipelines now"
+            );
+            return false;
+        }
+        tracing::info!(
+            pipelines = of,
+            "the ray-tracing structure builder runs: all of its programs have host pipelines"
+        );
+        true
+    }
+}
+
+#[cfg(all(test, windows))]
+mod builder_tests {
+    use super::*;
+
+    /// A builder of `n` pipelines, and what each is at the next look.
+    fn builder(n: usize) -> (Builder, Vec<Arc<make::Pending>>) {
+        let mut b = Builder::new();
+        b.pipelines = (0..n).map(|_| Arc::new(make::Pending::new(Vec::new(), None))).collect();
+        let pipelines = b.pipelines.clone();
+        (b, pipelines)
+    }
+
+    fn look(b: &mut Builder, pipelines: &[Arc<make::Pending>], frame: u64, retry: bool, made: &[Made]) -> bool {
+        b.look(
+            frame,
+            retry,
+            |p| made[pipelines.iter().position(|q| Arc::ptr_eq(p, q)).unwrap()],
+            |_| "hash".to_owned(),
+        )
+    }
+
+    /// With the retry, a pipeline the workers make late keeps the builder
+    /// off only until it is there, and the builder starts at a frame's start.
+    #[test]
+    fn a_late_pipeline_turns_the_builder_on_at_the_next_frame() {
+        use Made::*;
+        let (mut b, p) = builder(3);
+        assert!(!look(&mut b, &p, 10, true, &[Yes, NotYet, Yes]));
+        assert_eq!((b.state, b.waiting, b.missing.len()), (OFF, true, 1));
+        assert!(!look(&mut b, &p, 10, true, &[Yes, NotYet, Yes]));
+        // Made in the middle of frame 10: not before frame 11.
+        assert!(!look(&mut b, &p, 10, true, &[Yes, Yes, Yes]));
+        assert_eq!((b.state, b.waiting), (RUNS, false));
+        assert!(!look(&mut b, &p, 10, true, &[Yes, Yes, Yes]));
+        assert!(look(&mut b, &p, 11, true, &[Yes, Yes, Yes]));
+        assert!(look(&mut b, &p, 12, true, &[Yes, Yes, Yes]));
+    }
+
+    /// Without the retry the first look decides (what it saw was made on
+    /// the spot) until the title creates another builder pipeline.
+    #[test]
+    fn without_the_retry_the_first_look_decides() {
+        use Made::*;
+        let (mut b, mut p) = builder(2);
+        assert!(!look(&mut b, &p, 5, false, &[Yes, Refused]));
+        assert_eq!((b.state, b.off), (OFF, 2));
+        assert!(!look(&mut b, &p, 6, false, &[Yes, Yes]));
+        b.pipelines.push(Arc::new(make::Pending::new(Vec::new(), None)));
+        p = b.pipelines.clone();
+        assert!(look(&mut b, &p, 7, false, &[Yes, Yes, Yes]));
+        assert_eq!(b.state, RUNS);
+        // A builder that runs from its first look runs in that frame.
+        let (mut b, p) = builder(2);
+        assert!(look(&mut b, &p, 3, false, &[Yes, Yes]));
+    }
+
+    /// One refused keeps it off with the retry too; so does a pipeline
+    /// still being made next to one refused.
+    #[test]
+    fn a_refused_pipeline_keeps_the_builder_off() {
+        use Made::*;
+        let (mut b, p) = builder(3);
+        assert!(!look(&mut b, &p, 1, true, &[Refused, NotYet, Yes]));
+        assert_eq!((b.state, b.waiting, b.missing.len()), (OFF, false, 2));
+        assert!(!look(&mut b, &p, 2, true, &[Refused, Yes, Yes]));
+        assert_eq!(b.off, 3);
+    }
+
+    /// No builder pipeline: nothing to run, nothing decided.
+    #[test]
+    fn no_pipeline_no_decision() {
+        let (mut b, p) = builder(0);
+        assert!(!look(&mut b, &p, 1, true, &[]));
+        assert_eq!(b.state, UNDECIDED);
+    }
+}
+
+/// `VICTORY_BVH_RETRY=1`: a builder pipeline still being made keeps the
+/// builder off only until it is made ([`Builder`]). Unset: as before.
+#[cfg(windows)]
+fn retry() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_RETRY").is_some_and(|v| v == "1"))
+}
+
+/// Whether the title's own ray tracing is asked for: its structure builder
+/// may run (`VICTORY_BVH_BUILDER=1`).
+#[cfg(windows)]
+fn builder_asked() -> bool {
+    static ASKED: OnceLock<bool> = OnceLock::new();
+    *ASKED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
+}
+
+/// Whether the last look at a builder dispatch turned the builder off (or
+/// keeps it off while its programs are made). Nothing is made, locked or
+/// decided here; false before the first look.
+#[cfg(windows)]
+pub(crate) fn builder_known_off() -> bool {
+    BUILDER_STATE.load(std::sync::atomic::Ordering::Relaxed) == OFF
+}
 
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
@@ -475,35 +707,41 @@ pub(crate) fn builder_rests(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_asked() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off == b.pipelines.len() || crate::frame::current() < b.rests {
-        return false;
-    }
-    if b.whole {
-        return true;
-    }
-    let missing: Vec<String> = b.pipelines.iter().filter(|p| !make::now(p)).map(|p| make::hashes(p)).collect();
-    if !missing.is_empty() {
-        b.off = b.pipelines.len();
-        tracing::warn!(
-            missing = missing.len(),
-            of = b.pipelines.len(),
-            which = ?missing,
-            "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
-        );
-        return false;
-    }
-    b.off = 0;
-    tracing::info!(
-        pipelines = b.pipelines.len(),
-        "the ray-tracing structure builder runs: all of its programs have host pipelines"
+    let retry = retry();
+    let runs = b.look(
+        crate::frame::current(),
+        retry,
+        |p| {
+            // Without the retry, made on the spot (or waited for): never "not yet".
+            let made = if retry { make::made(p) } else { Some(make::now(p)) };
+            match made {
+                Some(true) => Made::Yes,
+                Some(false) => Made::Refused,
+                None => Made::NotYet,
+            }
+        },
+        make::hashes,
     );
-    b.whole = true;
-    true
+    publish(&b);
+    runs
+}
+
+/// Publishes the builder's decision ([`BUILDER_STATE`]), and says when it
+/// changes.
+#[cfg(windows)]
+fn publish(b: &Builder) {
+    let was = BUILDER_STATE.swap(b.state, std::sync::atomic::Ordering::Relaxed);
+    if was != b.state && was != UNDECIDED {
+        tracing::info!(
+            was = if was == RUNS { "runs" } else { "off" },
+            now = if b.state == RUNS { "runs" } else { "off" },
+            "the ray-tracing structure builder's decision changed"
+        );
+    }
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,

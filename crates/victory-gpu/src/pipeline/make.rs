@@ -232,6 +232,14 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.made.get().is_some_and(|made| made.is_some())
 }
 
+/// What became of `p` so far, with nothing made, queued or waited for:
+/// `Some(true)` it has a host pipeline, `Some(false)` it has none for good
+/// (a shader that does not translate, or the host refused it), `None` it
+/// is not made yet.
+pub(crate) fn made(p: &Pending) -> Option<bool> {
+    p.made.get().map(|made| made.is_some())
+}
+
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it),
 /// and every compute pipeline: its first dispatch waits for it, and a frame
