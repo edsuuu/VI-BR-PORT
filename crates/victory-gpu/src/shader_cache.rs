@@ -83,8 +83,6 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
-            // Whether pixel programs declare the console's early depth test.
-            "VICTORY_EARLY_DEPTH",
             // Whether the ray-tracing node test always misses.
             "VICTORY_RT_MISS",
         ] {

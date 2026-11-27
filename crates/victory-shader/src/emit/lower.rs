@@ -1258,52 +1258,6 @@ thread_local! {
     pub(super) static TEST_F16_NEAREST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// Whether a pixel program runs its depth and stencil tests before the
-/// shader on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12:
-/// HLSL `[earlydepthstencil]`), so the host is told too (ShaderFlags
-/// ForceEarlyDepthStencil). Without it the host tests after the shader, and
-/// a program that writes unordered views writes them for pixels the depth
-/// test then rejects. The title's glass prepass (`PS_AlphaPrepass`,
-/// `DB_SHADER_CONTROL` 0x1450) keeps the nearest glass depth and its motion
-/// with atomics in a view; `PS_AlphaVelocityDepthResolve` then writes those
-/// into the scene's depth and motion vectors. With late tests the glass
-/// behind the character in the prison cell was written at her head and the
-/// fringe of her hair as well (replay of the cell, 27 Nov), and the passes
-/// after it took those pixels for glass: the pane's distortion and wire mesh
-/// lay over her hair. Not for a program that exports depth, stencil or
-/// coverage (bits 0-2 and 8, or such an output), which cannot test before
-/// it runs. This was ported once (40d2b1b0b) and lost when the tree of
-/// vibr/1126 replaced the old one.
-pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
-    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
-    const EXPORTS: u32 = 0b111 | 1 << 8;
-    let StageIo::Ps { db_shader_control, .. } = io else {
-        return false;
-    };
-    // SV_Depth, SV_Coverage, SV_DepthGreaterEqual, SV_DepthLessEqual,
-    // SV_StencilRef.
-    db_shader_control & DEPTH_BEFORE_SHADER != 0
-        && db_shader_control & EXPORTS == 0
-        && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
-}
-
-/// `VICTORY_EARLY_DEPTH=0`: no pixel program declares early depth
-/// ([`early_depth`]); default on.
-fn early_depth_on() -> bool {
-    #[cfg(test)]
-    if let Some(on) = TEST_EARLY_DEPTH.get() {
-        return on;
-    }
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
-}
-
-#[cfg(test)]
-thread_local! {
-    /// A test's choice for [`early_depth_on`], for its thread only.
-    pub(super) static TEST_EARLY_DEPTH: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-}
-
 /// `VICTORY_WAVE_OWN_BITS=0`: a wave OR where not every lane runs is refused as before
 /// ([`super::own_bits`]).
 fn own_bits_on() -> bool {
@@ -1582,9 +1536,6 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
-        if early_depth_on() && early_depth(&x.native.io, &x.outputs) {
-            s.flags |= flags::EARLY_DEPTH;
-        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
