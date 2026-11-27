@@ -489,9 +489,10 @@ thread_local! {
     static PAIRED_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Runs `f` (a translation) with the paired form ([`emit_paired`]) tried for this program, as
-/// `VICTORY_WAVE_PAIRED=1` has it for every program: for the programs named in
-/// `VICTORY_WAVE_PAIRED_FOR` ([`paired_named`]).
+/// Runs `f` (a translation) with the paired form ([`emit_paired`]) tried for this program before
+/// any other form, exact ones included: for the programs named in `VICTORY_WAVE_PAIRED_FOR`
+/// ([`paired_named`]). (`VICTORY_WAVE_PAIRED=1` tries it for every program, but only after the
+/// exact forms.)
 pub fn with_paired_first<R>(on: bool, f: impl FnOnce() -> R) -> R {
     let was = PAIRED_FIRST.replace(on);
     let r = f();
@@ -615,6 +616,19 @@ pub fn emit(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        // A program named in `VICTORY_WAVE_PAIRED_FOR` ([`with_paired_first`]) tries the paired
+        // form before any other: the forms the chain counts as exact may still be the wrong
+        // ones for it (the water's tile list, `CS_TransmissionVolumetrics_GenerateTiles`, ends
+        // in one whose exchanges where not every lane runs a run cannot see).
+        if PAIRED_FIRST.get() {
+            let again = emit_paired(c, native, p, st);
+            lower::take_needs();
+            lower::take_meets();
+            report("paired, named", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -871,10 +885,10 @@ pub fn emit(
                 }
                 // The paired form ([`emit_paired`]): exact, without barriers inside branches,
                 // each host lane doing the work of two. Only when asked for
-                // (`VICTORY_WAVE_PAIRED=1`, or the program named in `VICTORY_WAVE_PAIRED_FOR`):
+                // (`VICTORY_WAVE_PAIRED=1`; a program named in `VICTORY_WAVE_PAIRED_FOR` tried it first):
                 // here, past every exact form the program had before, so a program it takes
                 // is one that would have ended wave-wide, approximate or refused.
-                if paired_on() {
+                if paired_on() && !PAIRED_FIRST.get() {
                     let again = emit_paired(c, native, p, st);
                     lower::take_needs();
                     lower::take_meets();
