@@ -203,12 +203,25 @@ the saved file: initialize, tools/list, a set, an enable, a disable, the rules b
 options, a refused id, a refused value, an option not on this branch, arguments outside a
 schema, a malformed line, a batch, the dry run and both resets. It also checks that stdout
 has no BOM and nothing but protocol lines, and that the server wrote no file but the settings.
-The server runs on the same PowerShell as the check:
+The server runs on the same PowerShell as the check, or on the one `-Shell` names:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\launcher\Test-Mcp.ps1
 pwsh -NoProfile -File scripts\launcher\Test-Mcp.ps1
+pwsh -NoProfile -File scripts\launcher\Test-Mcp.ps1 -Shell powershell.exe   # a 5.1 server, checked from 7
 ```
+
+## Checking the whole launcher
+
+Nothing here opens a window or starts the game:
+
+```powershell
+scripts\launcher.ps1 -Check                                     # the self-check
+scripts\launcher\Test-Mcp.ps1                                   # the MCP server's self-check
+scripts\launcher.ps1 -Snapshot play.png -View play -Language en # each view (play, preparing, more), in each language
+```
+
+Run the first two under both `powershell` and `pwsh`.
 
 ## Files
 
@@ -246,7 +259,9 @@ traduz os shaders e aquece os pipelines só quando precisa, e abre o jogo pelo
 mudam, pela janela ou pelo servidor MCP; o padrão de todas dá exatamente o que o `play.ps1`
 usa sem parâmetros (`scripts\launcher.ps1 -Check` confere). Opções cujo código está em outro
 branch (DLSS, quadros gerados, Reflex, luz de dia e de noite) aparecem desativadas e nunca são
-enviadas. Pela linha de comando: `-Get`, `-Set ray_tracing=on`, `-Reset`, `-PrintEnv`,
+enviadas. No painel de opções ficam o link para a página do fork no GitHub e a versão
+(`v<versão> (<commit>)`); ao abrir, o pôr do sol aparece num fade a partir da cor da noite.
+Pela linha de comando: `-Get`, `-Set ray_tracing=on`, `-Reset`, `-PrintEnv`,
 `-Version`.
 
 O servidor MCP (`scripts\launcher-mcp.ps1`) deixa um cliente MCP listar as opções, ligar e
