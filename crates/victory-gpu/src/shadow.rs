@@ -689,7 +689,7 @@ fn card_dirty_from(sent_as: u64, listed: bool) -> Vec<(Arc<Shadow>, Vec<(usize, 
         out.sort_by_key(|(shadow, _)| shadow.start);
         // The copies that are gone leave the list of all now and then.
         static CALLS: AtomicU64 = AtomicU64::new(0);
-        if CALLS.fetch_add(1, Ordering::Relaxed) % 1024 == 0 {
+        if CALLS.fetch_add(1, Ordering::Relaxed).is_multiple_of(1024) {
             carded.retain(|weak| weak.strong_count() > 0);
         }
         return out;
