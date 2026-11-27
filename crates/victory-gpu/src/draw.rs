@@ -292,6 +292,18 @@ pub(crate) fn in_place_indirect_line(frames: f64) {
     );
 }
 
+/// `VICTORY_INDIRECT_TRUST=1` (an experiment, off): indirect executions of
+/// one record without a count buffer read the title's record as it is, with
+/// no pass of ours before them. What it measures: every clamp is a compute
+/// dispatch of ours between waits for the card, in the middle of the
+/// title's draws (158 passes a frame walking in the prison, 464 with the
+/// in-place records clamped alone). What it gives up: the guard against a
+/// record nothing wrote (`crate::indirect`), which then runs as it is.
+fn trusts_records() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_TRUST").is_some_and(|v| v == "1"))
+}
+
 /// Whether indirect executions of one record are clamped in batches
 /// (`crate::indirect::batch`; `VICTORY_INDIRECT_BATCH=0`: each on its own,
 /// or in windows ([`windows`])).
@@ -3947,8 +3959,10 @@ impl State {
             }
             self.window = None;
         }
+        // The record as it is (`trusts_records`).
+        let trusted = trusts_records() && max == 1 && count.is_none();
         // One record without a count: clamped in a batch (`batches`).
-        let batch = if !alone && batches() > 0 && max == 1 && count.is_none() {
+        let batch = if !trusted && !alone && batches() > 0 && max == 1 && count.is_none() {
             args.refresh(list, arguments, len);
             self.batched(list, &args, arguments, kind)
         } else {
@@ -3964,6 +3978,7 @@ impl State {
         const WINDOW_USE: usize = usize::MAX - 0x77;
         let offset = args.offset(arguments);
         let windowed = windows()
+            && !trusted
             && !ordered
             && kind != DISPATCH
             && max == 1
@@ -3983,6 +3998,10 @@ impl State {
             .map(|w| (w.scratch.clone(), offset - w.base));
         let (bounded, at) = match batch.or(hit) {
             Some(hit) => hit,
+            None if trusted => {
+                args.refresh(list, arguments, len);
+                (args.buffer.clone(), offset)
+            }
             None => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
