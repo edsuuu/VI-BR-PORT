@@ -2685,6 +2685,8 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        list.note_after(|| format!("after {}", p.name));
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
@@ -3032,6 +3034,10 @@ impl State {
                     }
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                        list.note_after(|| format!("after {}", p.name));
+                    }
                     self.drew(crate::pipeline::host_pipeline(self.pipeline as This));
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
@@ -3972,6 +3978,8 @@ impl State {
                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
             )
         };
+        #[cfg(feature = "diagnostics")]
+        list.note_after(|| format!("after {}", p.name));
         if kind == MESH {
             self.mesh_scissor(list, false);
         }
