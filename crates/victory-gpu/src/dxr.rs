@@ -257,10 +257,33 @@ pub(crate) mod build {
                 if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
                     return None;
                 }
-                if super::log_tier(&device) < super::TIER_1_1 {
+                let tier = super::log_tier(&device);
+                if tier < super::TIER_1_1 {
                     return None;
                 }
-                let card = String::from_utf16_lossy(&desc.Description).trim_end_matches('\0').to_owned();
+                // The highest shader model the driver takes (6.9 adds a hit
+                // triangle's vertex positions to ray queries); a runtime
+                // that does not know a model refuses the question.
+                let shader_model = (0x60..=0x69u32)
+                    .rev()
+                    .find_map(|m| {
+                        let mut sm = D3D12_FEATURE_DATA_SHADER_MODEL {
+                            HighestShaderModel: windows::Win32::Graphics::Direct3D12::D3D_SHADER_MODEL(m as i32),
+                        };
+                        device
+                            .CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, (&raw mut sm).cast(), size_of_val(&sm) as u32)
+                            .is_ok()
+                            .then_some(sm.HighestShaderModel.0 as u32)
+                    })
+                    .unwrap_or(0);
+                let card = format!(
+                    "{}, ray tracing tier {}.{}, shader model {}.{}",
+                    String::from_utf16_lossy(&desc.Description).trim_end_matches('\0'),
+                    tier / 10,
+                    tier % 10,
+                    shader_model >> 4,
+                    shader_model & 15
+                );
                 let device: ID3D12Device5 = device.cast().ok()?;
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
