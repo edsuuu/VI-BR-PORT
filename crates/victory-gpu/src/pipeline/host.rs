@@ -33,6 +33,10 @@ pub(crate) struct GraphicsState {
     pub(crate) targets: D3D12_RT_FORMAT_ARRAY,
     pub(super) depth_format: DXGI_FORMAT,
     pub(super) samples: DXGI_SAMPLE_DESC,
+    /// The targets (a bit each) the title made in R9G9B9E5, which have a
+    /// stand-in format here ([`crate::resource::target_format`]). Not part
+    /// of the pipeline's name: the formats in `targets` already are.
+    pub(super) e5_targets: u8,
 }
 
 /// The vertex programs of the title's deferred light volumes: instanced
@@ -182,6 +186,7 @@ impl Default for GraphicsState {
                 Count: 1,
                 Quality: 0,
             },
+            e5_targets: 0,
         }
     }
 }
@@ -243,6 +248,26 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
         }
     }
     host
+}
+
+/// The targets among `targets` (a bit each) whose blending reads the
+/// destination's alpha (DEST_ALPHA, INV_DEST_ALPHA, SRC_ALPHA_SAT in any of
+/// the four factors). On the title's R9G9B9E5 targets the console reads 1.0
+/// there; the 16-bit float stand-in reads what a shader last wrote, the
+/// R11G11B10 one 1.0 ([`crate::resource::target_format`]).
+fn destination_alpha(blend: &D3D12_BLEND_DESC, targets: u8) -> u8 {
+    let reads = |f: D3D12_BLEND| {
+        matches!(f, D3D12_BLEND_DEST_ALPHA | D3D12_BLEND_INV_DEST_ALPHA | D3D12_BLEND_SRC_ALPHA_SAT)
+    };
+    let per_target = blend.IndependentBlendEnable.as_bool();
+    (0..8)
+        .filter(|&i| targets & (1 << i) != 0)
+        .filter(|&i| {
+            let t = &blend.RenderTarget[if per_target { i } else { 0 }];
+            t.BlendEnable.as_bool()
+                && [t.SrcBlend, t.DestBlend, t.SrcBlendAlpha, t.DestBlendAlpha].into_iter().any(reads)
+        })
+        .fold(0, |m, i| m | 1 << i)
 }
 
 impl GraphicsState {
@@ -323,7 +348,11 @@ impl GraphicsState {
                 }
                 15 => {
                     self.targets = data.cast::<D3D12_RT_FORMAT_ARRAY>().read_unaligned();
-                    for f in &mut self.targets.RTFormats {
+                    self.e5_targets = 0;
+                    for (i, f) in self.targets.RTFormats.iter_mut().enumerate() {
+                        if crate::resource::pc_format(f.0 as u32) == 67 {
+                            self.e5_targets |= 1 << i;
+                        }
                         f.0 = crate::resource::target_format(crate::resource::pc_format(
                             f.0 as u32,
                         )) as i32;
@@ -760,6 +789,23 @@ impl HostPipeline {
             false
         };
         let state = g.describe();
+        // Pipelines whose blending reads the alpha of an R9G9B9E5 target:
+        // the only place, besides a shader sampling it, where the two
+        // stand-ins differ in more than precision. Counted, the first few
+        // named.
+        let reads = destination_alpha(&g.blend, g.e5_targets);
+        if reads != 0 {
+            static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seen = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if seen <= 4 || seen.is_power_of_two() {
+                tracing::info!(
+                    targets = format_args!("{reads:#04x}"),
+                    pipelines = seen,
+                    ?shaders,
+                    "a pipeline blends with the destination's alpha on an R9G9B9E5 target (the console reads 1.0 there)"
+                );
+            }
+        }
         if mesh.is_some() {
             // "triangles": the stream names its topology since it did not
             // load from the library without one (see `mesh_pipeline`); a
@@ -1302,6 +1348,25 @@ mod tests {
             t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
         }
         b
+    }
+
+    /// Only R9G9B9E5 targets that blend with a factor of the destination's
+    /// alpha are named.
+    #[test]
+    fn destination_alpha_blends_on_e5_targets_are_found() {
+        let mut b = blending(true);
+        assert_eq!(destination_alpha(&b, 0xff), 0);
+        b.RenderTarget[1].DestBlend = D3D12_BLEND_INV_DEST_ALPHA;
+        b.RenderTarget[2].SrcBlendAlpha = D3D12_BLEND_DEST_ALPHA;
+        b.RenderTarget[3].SrcBlend = D3D12_BLEND_SRC_ALPHA_SAT;
+        b.RenderTarget[3].BlendEnable = false.into();
+        assert_eq!(destination_alpha(&b, 0xff), 0b110);
+        assert_eq!(destination_alpha(&b, 0b100), 0b100);
+        assert_eq!(destination_alpha(&b, 0), 0);
+        // One description for every target: the first one's.
+        b.IndependentBlendEnable = false.into();
+        b.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_DEST_ALPHA;
+        assert_eq!(destination_alpha(&b, 0b1010), 0b1010);
     }
 
     #[test]
