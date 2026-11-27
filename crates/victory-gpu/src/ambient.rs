@@ -197,6 +197,30 @@ fn lamps() -> f32 {
     })
 }
 
+/// `VICTORY_AMBIENT_KEY=<mean>:<most gain>`: the constant light (of
+/// `constant:`, and the least light of `estimate:`) is raised by the ratio
+/// of `<mean>` to the slow mean of what visible surfaces send out, when that
+/// is lower, by at most `<most gain>` (default 8). Unset: no raising.
+///
+/// Why: the title's exposure in the prison's halls is pinned at its upper
+/// bound (EV -5.5, the same in the lit corridor, the cell and the common
+/// room: `PS_CalculateExposure`, its average luminance 41 in the corridor
+/// and 5.7 in the common room, capture prisao-d-alvos2), so a room that gets
+/// less light than the console's traced light would give it stays that much
+/// darker on screen. The corridor, right with the constant 0.1, has a mean of
+/// about 0.19 in the kept radiance; the common room 0.075.
+fn key() -> [f32; 2] {
+    static SET: OnceLock<[f32; 2]> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default();
+        let mut parts = set.split(':').map(|v| v.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0));
+        match (parts.next().flatten(), parts.next().flatten()) {
+            (Some(key), most) => [key, most.unwrap_or(8.0)],
+            _ => [0.0, 1.0],
+        }
+    })
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -213,7 +237,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=17, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -223,7 +247,8 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float around;
-    float lamps; float full; float least;
+    float lamps; float full; float least; float key;
+    float most_gain;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -232,6 +257,15 @@ RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+
+// How much the constant light is raised so that a scene whose surfaces send
+// out less than `key` on the mean (the slow mean of the kept radiance) gets
+// closer to it: the ratio, from 1 up to `most_gain` (no key: 1). The light
+// itself raises the mean, so the gain settles below the ratio it starts at.
+float gain_to_key(float4 mean_now) {
+    if (key <= 0.0 || mean_now.a <= 0.0) return 1.0;
+    return clamp(key / max(dot(mean_now.rgb, LUMA), 1e-4), 1.0, max(most_gain, 1.0));
+}
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
@@ -399,7 +433,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
         float4 mean_now = cells[CELLS];
         float3 part = around * mean_now.rgb;
         if (around > 0.0 && mean_now.a > 0.0 && dot(part, LUMA) > dot(found, LUMA)) found = part;
-        found *= open;
+        found *= open * gain_to_key(mean_now);
         light[p] = pack(found);
         return;
     }
@@ -426,7 +460,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     // Never under the least light asked for (estimate:<share>:<least>).
-    float3 floor_light = float3(1.0, 0.98, 0.94) * least * open;
+    float3 floor_light = float3(1.0, 0.98, 0.94) * least * open * gain_to_key(cells[CELLS]);
     if (dot(found, LUMA) < dot(floor_light, LUMA)) found = floor_light;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
@@ -570,7 +604,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 17];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -585,6 +619,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     // The estimate's least light rides in the share's place (the constant
     // form's, which the estimate does not use).
     words[14] = if constant == 0.0 { around } else { 0.0 }.to_bits();
+    let [key, most_gain] = key();
+    words[15] = key.to_bits();
+    words[16] = most_gain.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -592,7 +629,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -636,7 +673,7 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
-    let mut words = [0u32; 15];
+    let mut words = [0u32; 17];
     words[0] = word;
     words[6] = views.size[0];
     words[7] = views.size[1];
@@ -648,7 +685,7 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 17, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
