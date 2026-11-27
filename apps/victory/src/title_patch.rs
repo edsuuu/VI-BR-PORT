@@ -42,11 +42,55 @@ const SCALE: &str = "41 56 56 57 53 48 83 EC 28 44 89 CB 4C 89 C6 48 89 D7 49 89
 /// [`SCALE`].
 const SCALE_SPAN: usize = 0x68;
 
+/// What DLSS (`VICTORY_DLSS`, `victory_gpu::streamline`) means for the two
+/// patches: it rides the title's FidelityFX path, which DLSS then takes
+/// over. Asked for and loaded: a mode named in the switch sets that path's
+/// render scale unless `VICTORY_FFX_SCALE` names one (quality is the
+/// path's own 2/3, nothing to patch), and `VICTORY_UPSCALER=6` is said to
+/// leave DLSS nothing to take. Asked for and not loaded: the title's own
+/// upscaler is kept (as `VICTORY_UPSCALER=6`) unless a picker is named, so
+/// the run is not black on Series S, whose picker takes FidelityFX.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DlssAsk {
+    pub asked: bool,
+    pub loaded: bool,
+    /// The render scale of the mode the switch names.
+    pub scale: Option<f32>,
+}
+
+/// [`DlssAsk`] applied to the picker (`kind`) and scale requests, as
+/// [`requested`] reads them; with what to say.
+fn with_dlss(
+    kind: Option<Option<u32>>,
+    scale: Option<Option<f32>>,
+    dlss: DlssAsk,
+) -> (Option<Option<u32>>, Option<Option<f32>>, Option<&'static str>) {
+    const OWN: u32 = 6;
+    if !dlss.asked {
+        return (kind, scale, None);
+    }
+    if !dlss.loaded {
+        return match kind {
+            None => (Some(Some(OWN)), scale, Some("VIctory: DLSS asked for and not loaded: the title's own upscaler is kept (as VICTORY_UPSCALER=6)")),
+            Some(_) => (kind, scale, None),
+        };
+    }
+    let note = (kind == Some(Some(OWN))).then_some(
+        "VIctory: VICTORY_UPSCALER=6 keeps the title's own upscaler: DLSS has no FidelityFX upscaling to take and never runs",
+    );
+    let mode_scale = dlss.scale.filter(|s| (s - 2.0 / 3.0).abs() > 1e-3);
+    let scale = match scale {
+        None => mode_scale.map(Some),
+        asked => asked,
+    };
+    (kind, scale, note)
+}
+
 /// Applies the patches the environment asks for. Runs before the title's
 /// code and before any diagnostics thread starts. An error stops the launch:
 /// a write that went in but whose page protection or instruction cache could
 /// not be settled, or only the scale taking of the two.
-pub(crate) fn apply(image: &LoadedImage) -> Result<()> {
+pub(crate) fn apply(image: &LoadedImage, dlss: DlssAsk) -> Result<()> {
     let kind = requested(
         "VICTORY_UPSCALER",
         "<kind> (decimal, 7 for FidelityFX)",
@@ -55,6 +99,10 @@ pub(crate) fn apply(image: &LoadedImage) -> Result<()> {
     let scale = requested("VICTORY_FFX_SCALE", "<scale in (0, 1]>", |s| {
         s.parse::<f32>().ok().filter(|s| *s > 0.0 && *s <= 1.0)
     });
+    let (kind, scale, note) = with_dlss(kind, scale, dlss);
+    if let Some(note) = note {
+        eprintln!("{note}");
+    }
     // Everything asked for is found before anything is written.
     let picker = kind.map(|kind| kind.and_then(|kind| picker_patch(image, kind)));
     let scale = scale.map(|scale| scale.and_then(|scale| scale_patch(image, scale)));
@@ -279,6 +327,28 @@ fn patch_scale(code: &mut [u8], scale: f32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// DLSS rides the FidelityFX path: a named mode sets its scale unless
+    /// one is named, the title's own upscaler is kept when DLSS is not
+    /// loaded, and nothing changes without the switch.
+    #[test]
+    fn dlss_requests_follow_the_switch() {
+        let off = DlssAsk { asked: false, loaded: false, scale: Some(0.5) };
+        assert_eq!(with_dlss(None, None, off), (None, None, None));
+        let loaded = DlssAsk { asked: true, loaded: true, scale: Some(0.5) };
+        assert_eq!(with_dlss(None, None, loaded), (None, Some(Some(0.5)), None));
+        assert_eq!(with_dlss(None, Some(Some(0.6)), loaded).1, Some(Some(0.6)));
+        assert!(with_dlss(Some(Some(6)), None, loaded).2.is_some());
+        let quality = DlssAsk { scale: Some(2.0 / 3.0), ..loaded };
+        assert_eq!(with_dlss(None, None, quality).1, None);
+        let auto = DlssAsk { scale: None, ..loaded };
+        assert_eq!(with_dlss(None, None, auto).1, None);
+        let missing = DlssAsk { loaded: false, ..loaded };
+        let (kind, scale, note) = with_dlss(None, None, missing);
+        assert_eq!((kind, scale), (Some(Some(6)), None));
+        assert!(note.is_some());
+        assert_eq!(with_dlss(Some(Some(7)), None, missing).0, Some(Some(7)));
+    }
 
     /// `pattern` with its open bytes filled with `fill`.
     fn instance(pattern: &str, fill: u8) -> Vec<u8> {

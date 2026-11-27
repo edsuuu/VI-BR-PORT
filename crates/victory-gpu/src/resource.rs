@@ -2618,6 +2618,16 @@ pub(crate) fn host_resource<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+/// Whether `this` is a title resource this runtime made (its method
+/// table is ours): a pointer a title library passes is checked so before it
+/// is read as one.
+#[cfg(windows)]
+pub(crate) fn is_resource(this: This) -> bool {
+    let mut table = [0; size_of::<usize>()];
+    crate::host::read_into(this.cast(), &mut table)
+        && usize::from_ne_bytes(table) == RESOURCE_FUNCTIONS.0.as_ptr() as usize
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
