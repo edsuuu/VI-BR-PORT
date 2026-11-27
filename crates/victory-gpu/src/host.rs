@@ -4179,11 +4179,13 @@ fn late_line(frames: f64) {
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, read, in_parts, missed] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; {:.2} MB of title memory read for them, {in_parts:.0} pages read in their \
+             written parts only (VICTORY_UNDER_PARTS=1), {missed:.1} whose parts left out a changed byte (VICTORY_UNDER_PARTS_CHECK=1)",
+            bytes / (1 << 20) as f64,
+            read / (1 << 20) as f64
         );
     }
 }
