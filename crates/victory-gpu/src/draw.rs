@@ -114,6 +114,28 @@ fn bake_exact() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_EXACT").is_none_or(|v| v != "0"))
 }
 
+/// How long a draw of the title's bake waits for the texture uploads that are
+/// on their way on the copy queue of their own (`crate::texture::ahead`,
+/// `VICTORY_UPLOAD_AHEAD`): `VICTORY_BAKE_SETTLE_MS`, 500; 0: it does not
+/// wait, as before.
+///
+/// A texture an earlier pass sent up that way is no longer due, so the pass
+/// ahead of a bake does not see it, and its slot goes on showing what it
+/// showed before (another texture, or nothing) until the copy has run and
+/// the slot is made from it. In the world's first frames thousands are on
+/// their way at any moment. A bake that picked one of those slots stamped
+/// another texture onto a character's clothes for the rest of the run: a few
+/// coloured squares on the shorts of the opening's first shot in three
+/// launches of seven, the whole shorts in one (runs intro-s-bk1 to bk6,
+/// intro-s-luz3). No pass had left a due slot in any of them.
+fn bake_settle() -> Option<std::time::Duration> {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let ms = *MS.get_or_init(|| {
+        std::env::var("VICTORY_BAKE_SETTLE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(500)
+    });
+    (ms > 0).then(|| std::time::Duration::from_millis(ms))
+}
+
 /// Whether a texture found changed with nothing to tell of it is looked at
 /// again in the next frame (`VICTORY_RECHECK_SOON=0`: after four, as
 /// before).
@@ -2120,6 +2142,39 @@ impl State {
                     draws_so = n,
                     "a bake draw gets no texture pass: the frame's bakes have used their time (VICTORY_BAKE_TEXTURES_MS)"
                 );
+            }
+        }
+        // The uploads on their way on the copy queue of their own land first,
+        // and their slots are made from them ([`bake_settle`]).
+        if bake && let Some(most) = bake_settle() {
+            let began = std::time::Instant::now();
+            let (uploads, all) = crate::texture::ahead::settle(most);
+            if uploads > 0 {
+                let heap =
+                    self.heaps.iter().filter(|&&h| h != 0).map(|&h| crate::descriptor::heap(h as This)).find(|h| !h.samplers());
+                let flipped = heap.as_ref().and_then(|heap| heap.host()).map_or(0, |host| host.texture_slots_flip());
+                // Since the start: bake draws that waited, the uploads they
+                // waited for, the microseconds, the waits that ran out.
+                static WAITED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+                let n = WAITED[0].fetch_add(1, Ordering::Relaxed) + 1;
+                let so_far = WAITED[1].fetch_add(uploads as u64, Ordering::Relaxed) + uploads as u64;
+                let us = began.elapsed().as_micros() as u64;
+                let all_us = WAITED[2].fetch_add(us, Ordering::Relaxed) + us;
+                let ran_out = WAITED[3].fetch_add(u64::from(!all), Ordering::Relaxed) + u64::from(!all);
+                if n <= 16 || n.is_power_of_two() || !all {
+                    tracing::info!(
+                        frame,
+                        uploads,
+                        ms = us as f64 / 1e3,
+                        slots_made = flipped,
+                        all_ran = all,
+                        draws_so = n,
+                        uploads_so = so_far,
+                        ms_so = all_us as f64 / 1e3,
+                        ran_out_so = ran_out,
+                        "a bake draw waited for the uploads on their way on the copy queue (VICTORY_BAKE_SETTLE_MS=0: not)"
+                    );
+                }
             }
         }
         let budget = if bake && left > 0 {

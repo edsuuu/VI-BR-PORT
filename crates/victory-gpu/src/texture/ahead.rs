@@ -156,6 +156,25 @@ pub(crate) fn listed(copy: &HostTexture) {
     }
 }
 
+/// Waits, `most` at the longest, until the uploads that were on their way
+/// when it was called have run (those asked for later are not waited for:
+/// while a scene streams in there is always one). How many there were, and
+/// whether all of them ran.
+pub(crate) fn settle(most: std::time::Duration) -> (usize, bool) {
+    let began = std::time::Instant::now();
+    let before = |way: &Vec<(u64, Arc<Job>)>| way.iter().filter(|(_, job)| job.asked <= began).count();
+    let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());
+    let there = before(&way);
+    while before(&way) > 0 {
+        let Some(left) = most.checked_sub(began.elapsed()) else {
+            return (there, false);
+        };
+        let slice = left.min(std::time::Duration::from_millis(20));
+        way = LANDED.wait_timeout(way, slice).unwrap_or_else(|e| e.into_inner()).0;
+    }
+    (there, true)
+}
+
 /// The copy queue and its threads, made on first use.
 fn workers() -> Option<&'static ID3D12CommandQueue> {
     /// Free-threaded.
