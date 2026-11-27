@@ -82,8 +82,9 @@ runs of one build differ by.
   was called full while 1.6 GB of it sat kept for render targets that never used it
   ([7e818069](https://github.com/edsuuu/VI-BR-PORT/commit/7e8180697)), and a slot whose swap was lost is made again from its new view
   ([7b0084ab](https://github.com/edsuuu/VI-BR-PORT/commit/7b0084abc)).
-- Blocks of noise on clothes: with thin lists the decoration bake's upload pass ran out of the
-  title's order; the list that binds a bake pipeline is translated at the title's call
+- Blocks of noise on clothes, less often (not gone: about one launch in three still has coloured
+  squares on a character's clothes or tattoos): with thin lists the decoration bake's upload pass ran
+  out of the title's order; the list that binds a bake pipeline is translated at the title's call
   ([c354528b](https://github.com/edsuuu/VI-BR-PORT/commit/c354528b0)).
 - The prison's common room is readable: the constant stand-in for indirect light is raised in
   rooms darker than a key, measured on the rooms on screen only ([7656395d](https://github.com/edsuuu/VI-BR-PORT/commit/7656395dd),

@@ -62,26 +62,39 @@ caminhada por script; são rodadas de 26/11):
 Os gráficos são gerados dos logs; este repositório não guarda capturas do jogo
 ([docs/asset-policy.md](docs/asset-policy.md)).
 
-**Estabilidade:** nenhuma queda nem perda da placa com esta configuração nas rodadas de
-26 e 27/11 (mais de cem rodadas de 4 a 12 minutos). Sessões longas ainda não foram
-medidas.
+**Estabilidade:** nenhuma perda da placa com esta configuração nas rodadas de 26 e 27/11
+(mais de cem rodadas de 4 a 12 minutos), e uma queda do próprio jogo, aos quatro minutos
+de uma rodada de 27/11, de causa ainda não encontrada. Sessões longas não foram medidas.
 
-**Problemas conhecidos de imagem:** as cenas noturnas da abertura saem mais escuras que no
-console (o substituto da luz indireta por raios); num quadro ocasional as paredes somem ou
-a luz interna apaga; 35 programas de luz, sombra e neblina ainda são traduzidos de forma
-aproximada em placas de 32 lanes; o trecho do barco ainda não foi conferido quadro a
-quadro (em 26/11 o barco saía sem luz e o mar mostrava retângulos pretos perto do
-horizonte). Corrigido desde 26/11: a sala comum da prisão (ficava escura debaixo da
-neblina; agora dá para ver), o braço tatuado do guarda (texturas eram recusadas por falta
-de uma memória da placa que estava livre), o vidro das janelas, blocos de ruído nas
-roupas.
+**Problemas conhecidos de imagem:**
+
+- **Decorações assadas nos personagens saem erradas em algumas execuções**: quadrados
+  coloridos na roupa (o short do homem no primeiro plano da abertura) ou na pele tatuada
+  (os braços do guarda na prisão). O jogo assa essas texturas uma vez, a partir de
+  texturas escolhidas por índice, e em algumas execuções uma das fontes ainda não está na
+  placa. Cerca de uma execução em três com as listas finas, menos sem elas
+  (`-More @{VICTORY_THIN='0'}`, com uns 2 fps a menos na prisão e no barco).
+- **As texturas ficam moles no primeiro meio minuto de uma cena**: o jogo traz primeiro os
+  níveis pequenos de cada textura e os grandes conforme o streaming anda, e o streaming
+  dele roda mais devagar sob a camada do que no console (na abertura, mais de dez mil
+  views de textura ainda esperam a memória aos 25 segundos).
+- As cenas noturnas da abertura são iluminadas por um substituto da luz indireta por
+  raios (uma constante com um piso), mais chapadas que no console.
+- Num quadro ocasional as paredes somem ou a luz interna apaga.
+- 35 programas de luz, sombra e neblina ainda são traduzidos de forma aproximada em placas
+  de 32 lanes.
+
+Corrigido desde 26/11: a sala comum da prisão (ficava escura debaixo da neblina; agora dá
+para ver), texturas recusadas por falta de uma memória da placa que estava livre, o vidro
+das janelas, o barco sem luz e os retângulos pretos no mar.
 
 ## O que este fork acrescenta
 
 - **Listas finas na NVIDIA** (`VICTORY_THIN=1`): a chamada de lista só anota os
   argumentos e oito threads da camada traduzem ao lado do jogo. O passe que assa as
   decorações nas roupas é traduzido na própria chamada do jogo, na ordem do jogo
-  (`VICTORY_THIN_BAKE`); fora de ordem ele deixava blocos de ruído nas roupas.
+  (`VICTORY_THIN_BAKE`); fora de ordem ele deixava blocos de ruído nas roupas na maioria
+  das execuções (em algumas ainda deixa: veja os problemas conhecidos).
 - **Comparações na placa que leem menos** (`VICTORY_CARD_COMPARE_EVERY=30`): uma faixa de
   buffer do jogo que um shader pode ter escrito é lida inteira uma vez a cada 30
   submissões, e entre elas só os pedaços que mudaram há pouco (a abertura lia 2,4 GB de

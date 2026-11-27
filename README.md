@@ -60,25 +60,39 @@ scripted walk; these are runs of 26 Nov):
 The charts are drawn from the logs; this repository keeps no pictures of the game
 ([docs/asset-policy.md](docs/asset-policy.md)).
 
-**Stability:** no crash and no device removal with these settings in the runs of 26 and
-27 Nov (more than a hundred runs of 4 to 12 minutes). Long sessions have not been measured
-yet.
+**Stability:** no device removal with these settings in the runs of 26 and 27 Nov (more
+than a hundred runs of 4 to 12 minutes), and one crash of the title itself, four minutes
+into a run on 27 Nov, whose cause is not found yet. Long sessions have not been measured.
 
-**Known picture problems:** the opening's night scenes are darker than on the console (the
-stand-in for the ray-traced indirect light); in an occasional frame the walls vanish or the
-interior light goes out; 35 programs of lighting, shadows and fog are still translated
-approximately on 32-lane cards; the boat ride has not been checked frame by frame (on
-26 Nov the boat came out unlit and the sea showed black rectangles near the horizon).
+**Known picture problems:**
+
+- **Decorations baked onto characters come out wrong in some launches**: coloured squares
+  on clothes (the man's shorts in the opening's first shot) or on tattooed skin (the
+  guard's arms in the prison). The title bakes them once, from textures it picks by index,
+  and in some launches a source is not on the card yet. About one launch in three with
+  thin lists, fewer without (`-More @{VICTORY_THIN='0'}`, at about 2 fps less in the
+  prison and on the boat).
+- **Textures are soft in the first half minute of a scene**: the title brings a texture's
+  small levels first and the large ones as it streams, and its streaming runs slower under
+  the layer than on the console (in the opening, more than ten thousand texture views
+  still wait for their memory 25 seconds in).
+- The opening's night scenes are lit by a stand-in for the ray-traced indirect light (a
+  constant with a floor), flatter than on the console.
+- In an occasional frame the walls vanish or the interior light goes out.
+- 35 programs of lighting, shadows and fog are still translated approximately on 32-lane
+  cards.
+
 Fixed since 26 Nov: the prison's common room (it was dark under the fog; it is readable
-now), the guard's tattooed arm (textures were refused for want of card memory that was in
-fact free), the window glass, blocks of noise baked into clothes.
+now), textures refused for want of card memory that was in fact free, the window glass,
+the unlit boat and the black rectangles on the sea.
 
 ## What this fork adds
 
 - **Thin lists on NVIDIA** (`VICTORY_THIN=1`): a list call writes its arguments down and
   eight threads of the layer translate them beside the title. The pass that bakes
   decorations onto clothes is translated at the title's own call, in the title's order
-  (`VICTORY_THIN_BAKE`); out of order it left blocks of noise on clothes.
+  (`VICTORY_THIN_BAKE`); out of order it left blocks of noise on clothes in most launches
+  (it still does in some: see the known problems).
 - **Compares on the card that read less** (`VICTORY_CARD_COMPARE_EVERY=30`): a range of a
   title buffer a shader may have written is read whole once in 30 submissions and only its
   lately changed pieces between (the opening read 2.4 GB of buffers a frame to find some
