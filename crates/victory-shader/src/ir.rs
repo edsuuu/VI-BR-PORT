@@ -937,10 +937,6 @@ fn removable_branches(p: &Program, deep: bool) -> Vec<(usize, usize, bool)> {
                 return None;
             }
         }
-        // no loop in it that runs on for ever with every lane out
-        if keeps_lane_loops() && lane_loop(p, target, &inside) {
-            return None;
-        }
         // the join sees no scalar the region changed
         let join = &p.blocks[target];
         for phi in &join.phis {
@@ -983,81 +979,6 @@ fn removable_branches(p: &Program, deep: bool) -> Vec<(usize, usize, bool)> {
         }
     }
     out
-}
-
-/// Whether a skip whose region holds a loop [`lane_loop`] finds is kept (on by default;
-/// `VICTORY_WAVE_SKIP_LOOPS=0`: such a skip is left out as before).
-fn keeps_lane_loops() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_SKIP_LOOPS").is_none_or(|v| v != "0"))
-}
-
-/// Whether the region `inside` of a skip (to `target`) holds a loop that, walked with every
-/// lane out, never ends: a branch on whether some lane is left (`execz`, `vccz`, SCC of a mask
-/// operation, [`lane_scc`]) whose way for "no lane" leads back to it inside the region. The
-/// console never runs such a loop with EXEC clear, as it takes the skip then; a form without
-/// the skip walks the region with EXEC clear for a console wave none of whose lanes was left
-/// for it, and the loop goes round until the translation's iteration limit, which ends the
-/// program before its last stores (`water_shading:CS_TransmissionVolumetrics_Tiled`: a slice
-/// loop of the lane holding the tile's nearest depth, whose exit is the SCC of
-/// `s_and_saveexec`; whole 8x8 tiles of the water's light were left unwritten where that lane
-/// had gone, the dark patches on the sea of the boat capture of 27 Nov).
-fn lane_loop(p: &Program, target: usize, inside: &[bool]) -> bool {
-    for (x, block) in p.blocks.iter().enumerate().filter(|&(x, _)| inside[x]) {
-        let Exit::Branch { taken, not_taken } = block.exit else { continue };
-        let Some(last) = block.insts.last() else { continue };
-        let none = match last.name() {
-            "s_cbranch_execz" | "s_cbranch_vccz" => taken,
-            "s_cbranch_execnz" | "s_cbranch_vccnz" => not_taken,
-            "s_cbranch_scc0" | "s_cbranch_scc1" => {
-                match last.read(Reg::Scc) {
-                    Some(v) if lane_scc(p, v, &mut Vec::new()) => {}
-                    _ => continue,
-                }
-                if last.name() == "s_cbranch_scc0" { taken } else { not_taken }
-            }
-            _ => continue,
-        };
-        // back to the branch that way, inside the region
-        let mut seen = vec![false; p.blocks.len()];
-        let mut stack = vec![none];
-        while let Some(y) = stack.pop() {
-            if y == x {
-                return true;
-            }
-            if y == target || !inside[y] || seen[y] {
-                continue;
-            }
-            seen[y] = true;
-            stack.extend(p.blocks[y].exit.successors());
-        }
-    }
-    false
-}
-
-/// Whether SCC value `v` says whether some lane is set: written by a mask operation (one that
-/// saves or reads EXEC, or a 64-bit logic operation in a program of 64-lane waves), or a join
-/// one of whose ways brings such a value.
-fn lane_scc(p: &Program, v: Value, seen: &mut Vec<Value>) -> bool {
-    if seen.contains(&v) {
-        return false;
-    }
-    seen.push(v);
-    for block in &p.blocks {
-        if let Some(phi) = block.phis.iter().find(|phi| phi.value == v) {
-            return phi.args.iter().any(|&a| lane_scc(p, a, seen));
-        }
-        if let Some(inst) = block.insts.iter().find(|i| i.write(Reg::Scc) == Some(v)) {
-            let name = inst.name();
-            let logic = ["s_and_", "s_or_", "s_xor_", "s_andn2_", "s_orn2_", "s_nand_", "s_nor_", "s_xnor_", "s_not_"]
-                .iter()
-                .any(|op| name.starts_with(op));
-            return name.contains("saveexec")
-                || inst.reads.iter().any(|r| matches!(r.0, Reg::S(EXEC) | Reg::S(127)))
-                || p.wave64 && logic && name.ends_with("_b64");
-        }
-    }
-    false
 }
 
 /// The value `v` is a copy of, followed to the end of `copy`'s chains.
