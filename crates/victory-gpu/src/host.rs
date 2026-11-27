@@ -10816,6 +10816,11 @@ impl Host {
             if let Some(Some((buffer, footprint))) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
+            // The frame recorder's frame ends here too (it was told only of presents of one
+            // plane, so a Series S run was never captured): the first plane, the world, is
+            // the picture it keeps.
+            #[cfg(feature = "diagnostics")]
+            crate::replay::record::present(first, D3D12_RESOURCE_STATES(first_state as i32));
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
         }
