@@ -570,6 +570,12 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
         return;
     }
     let _called = crate::timeline::span("the title's ExecuteCommandLists");
+    // Reflex: the newest frame's first submission to a queue that draws
+    // ends its simulation (a copy or compute queue's is not the frame's).
+    #[cfg(windows)]
+    if !this.is_null() && queue(this).kind == 0 {
+        crate::streamline::title_submits();
+    }
     #[cfg(windows)]
     let _timed = crate::titletime::submit_call();
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -966,6 +972,10 @@ extern "system" fn present(
         release_held(forces());
     }
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // Reflex: this present is bound to the newest frame here, in the
+    // title's order (our present of it may come later, on the line's thread).
+    #[cfg(windows)]
+    crate::streamline::title_presents();
     // The room kept for render targets, and its line.
     #[cfg(windows)]
     crate::resource::targets_presented(frame);
