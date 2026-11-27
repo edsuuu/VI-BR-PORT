@@ -51,6 +51,20 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     }
 }
 
+/// Runs `f` (a translation of `container`'s programs) with the forms a run gives that
+/// container (`VICTORY_WAVE_WIDE_FOR`, `VICTORY_LOOP_LIMIT_EXIT_FOR`).
+pub fn with_named_forms<R>(container: &[u8], f: impl FnOnce() -> R) -> R {
+    #[cfg(windows)]
+    {
+        victory_gpu::shader_cache::with_named_forms(container, f)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = container;
+        f()
+    }
+}
+
 /// The fork's offline warm-up (`victory translate --warm`), by
 /// [`precompile`]: whether it was translated now.
 pub fn warm_shader(container: &[u8]) -> Result<bool, String> {

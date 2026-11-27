@@ -481,7 +481,8 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
             s.spawn(|| {
                 while let Some((stage, hash)) = all.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let Ok(bytes) = std::fs::read(kept.join(format!("{hash}.cdxil"))) else { continue };
-                    match victory_shader::emit::translate(&bytes) {
+                    // (with the forms the `VICTORY_*_FOR` lists name, as a run has them)
+                    match victory_hle::modules::d3d12x::with_named_forms(&bytes, || victory_shader::emit::translate(&bytes)) {
                         Ok(t) => {
                             if std::fs::write(into.join(format!("{hash}.dxil")), &t.dxil).is_ok() {
                                 done.fetch_add(1, Ordering::Relaxed);

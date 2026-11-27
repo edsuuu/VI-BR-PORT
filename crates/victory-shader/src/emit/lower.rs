@@ -449,7 +449,24 @@ fn loop_limit_exit() -> bool {
         return on;
     }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_LIMIT_EXIT").is_some_and(|v| v == "1"))
+    LIMIT_EXIT_HERE.get() || *ON.get_or_init(|| std::env::var_os("VICTORY_LOOP_LIMIT_EXIT").is_some_and(|v| v == "1"))
+}
+
+thread_local! {
+    /// [`loop_limit_exit`] for the program being translated alone ([`with_loop_limit_exit`]).
+    static LIMIT_EXIT_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with [`loop_limit_exit`] on for this program, as
+/// `VICTORY_LOOP_LIMIT_EXIT=1` has it for every program. That changes 148 programs of the
+/// title, 9 tiled shadow programs among them; the water's tiles need only
+/// `CS_TransmissionVolumetrics_GenerateTiles`, so the caller can name the programs one by one
+/// (`VICTORY_LOOP_LIMIT_EXIT_FOR`).
+pub(super) fn with_loop_limit_exit<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = LIMIT_EXIT_HERE.replace(on);
+    let r = f();
+    LIMIT_EXIT_HERE.set(was);
+    r
 }
 
 #[cfg(test)]

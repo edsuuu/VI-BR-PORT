@@ -74,6 +74,7 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_SKIP_LOOPS",
             "VICTORY_WAVE_PAIRS",
             "VICTORY_LOOP_LIMIT_EXIT",
+            "VICTORY_LOOP_LIMIT_EXIT_FOR",
             "VICTORY_WAVE_GROUP_COUNTER",
             "VICTORY_WAVE_EARLY_OUTS_EXCHANGE",
             "VICTORY_WAVE_ATOMICS",
@@ -127,13 +128,21 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| {
-        victory_shader::emit::with_wide_first(wide_first(c), || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
-    };
+    let translate = |c: &[u8]| with_named_forms(c, || victory_shader::emit::translate(c)).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
         None => translate(container),
     }
+}
+
+/// Runs `f` (a translation of `container`'s programs) with the forms the `VICTORY_*_FOR` lists
+/// name for that container ([`wide_first`], [`LIMIT_EXIT_FOR`]): a run, and offline
+/// `victory translate --list` and `victory replay --retranslate`.
+pub fn with_named_forms<R>(container: &[u8], f: impl FnOnce() -> R) -> R {
+    let limit_exit = named_in("VICTORY_LOOP_LIMIT_EXIT_FOR", &LIMIT_EXIT_FOR, container);
+    victory_shader::emit::with_wide_first(wide_first(container), || {
+        victory_shader::emit::with_loop_limit_exit(limit_exit, f)
+    })
 }
 
 /// Whether `container` is one of the programs named in `VICTORY_WAVE_WIDE_FOR` (hashes as the
@@ -141,8 +150,21 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 /// form before the approximate ones (`victory_shader::emit::with_wide_first`).
 fn wide_first(container: &[u8]) -> bool {
     static FOR: OnceLock<Vec<String>> = OnceLock::new();
-    let named = FOR.get_or_init(|| {
-        std::env::var("VICTORY_WAVE_WIDE_FOR")
+    named_in("VICTORY_WAVE_WIDE_FOR", &FOR, container)
+}
+
+/// The programs named in `VICTORY_LOOP_LIMIT_EXIT_FOR` (as in `VICTORY_WAVE_WIDE_FOR`): a loop's
+/// iteration limit leaves through the loop's exits in those alone
+/// (`victory_shader::emit::with_loop_limit_exit`; `VICTORY_LOOP_LIMIT_EXIT=1` for all of them).
+/// The water's dark tiles on NVIDIA need it only in
+/// `water_shading:CS_TransmissionVolumetrics_GenerateTiles` (1aa247ed3653b616).
+static LIMIT_EXIT_FOR: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Whether `container` is one of the programs the variable `var` names (hashes as the log names
+/// shaders, or their beginnings, separated by commas), read once into `list`.
+fn named_in(var: &str, list: &OnceLock<Vec<String>>, container: &[u8]) -> bool {
+    let named = list.get_or_init(|| {
+        std::env::var(var)
             .unwrap_or_default()
             .split(',')
             .map(|h| h.trim().to_lowercase())

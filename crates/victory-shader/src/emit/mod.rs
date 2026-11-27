@@ -448,6 +448,13 @@ pub fn with_wide_first<R>(on: bool, f: impl FnOnce() -> R) -> R {
     r
 }
 
+/// Runs `f` (a translation) with a loop's iteration limit leaving through the loop's exits for
+/// this program, as `VICTORY_LOOP_LIMIT_EXIT=1` has it for every program (the caller names the
+/// programs one by one: `VICTORY_LOOP_LIMIT_EXIT_FOR`).
+pub fn with_loop_limit_exit<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    lower::with_loop_limit_exit(on, f)
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
