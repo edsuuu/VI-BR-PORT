@@ -1789,6 +1789,27 @@ fn block_fits(used: u64, kept: u64, line: u64) -> bool {
     used + kept + POOL_BLOCK <= line
 }
 
+/// Whether `len` more bytes of title memory by address (an arena of 64
+/// MiB, `crate::memory`) go into the card's own memory
+/// (`crate::shadow::by_address`): while the card's use with them stays under
+/// 97 hundredths of `budget`; with `crate::pool::gate` on, with what is
+/// kept for render targets not made yet ([`targets_room_kept`]) too.
+///
+/// With the texture blocks held under the queue's line the card has room
+/// again, and the arenas would take it up to that mark at once; the render
+/// targets then grow with no room test and put the card over its budget
+/// again. An arena is not given back either.
+#[cfg(windows)]
+pub(crate) fn by_address_room(budget: u64, used: u64, len: u64) -> bool {
+    let to_come = if crate::pool::gate() { targets_room_kept() } else { 0 };
+    by_address_fits(budget, used, len, to_come)
+}
+
+#[cfg(any(windows, test))]
+fn by_address_fits(budget: u64, used: u64, len: u64, to_come: u64) -> bool {
+    used + len + to_come < budget / 100 * 97
+}
+
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet ([`targets_rule`]).
@@ -3630,6 +3651,21 @@ mod tests {
                 assert_eq!(crate::host::vram_keep_below(budget, used, line), crate::host::vram_keep(budget, used));
             }
         }
+    }
+
+    /// An arena of title memory by address goes to the card only while the
+    /// render targets still to come have room beside it (with the gate).
+    #[test]
+    fn title_memory_by_address_leaves_room_for_the_targets_to_come() {
+        const MB: u64 = 1 << 20;
+        let budget = 5666 * MB;
+        // Under 97 hundredths of the budget (5,496 MB) with nothing to come,
+        // as before.
+        assert!(by_address_fits(budget, 5400 * MB, 64 * MB, 0));
+        assert!(!by_address_fits(budget, 5440 * MB, 64 * MB, 0));
+        // With 400 MB of targets to come: up to 5,096 MB.
+        assert!(by_address_fits(budget, 5000 * MB, 64 * MB, 400 * MB));
+        assert!(!by_address_fits(budget, 5040 * MB, 64 * MB, 400 * MB));
     }
 
     #[test]
