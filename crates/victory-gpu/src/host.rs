@@ -162,6 +162,31 @@ pub(crate) fn vram_keep(budget: u64, used: u64) -> (u64, u64) {
     }
 }
 
+/// [`vram_keep`] by the texture queue's own line (`line`) instead of fixed
+/// shares of the budget: none go while `used` is 2 % of the budget or more
+/// under the line, then enough to come down to 5 % under it, sooner from 5 %
+/// over it. With the texture queue's line at 90 % of the budget (its
+/// default) it is [`vram_keep`]. Used with `VICTORY_POOL_GATE=1`
+/// (`crate::resource::blocks_full`), whose reserve in the texture blocks is
+/// set by these steps whatever the line.
+pub(crate) fn vram_keep_below(budget: u64, used: u64, line: u64) -> (u64, u64) {
+    const KEPT_MS: u64 = 600_000;
+    const IDLE_MS: u64 = 5_000;
+    const SHORT_MS: u64 = 1_500;
+    if budget == 0 {
+        return (IDLE_MS, u64::MAX);
+    }
+    let step = budget / 100;
+    let aim = line.saturating_sub(5 * step);
+    if used < line.saturating_sub(2 * step) {
+        (KEPT_MS, u64::MAX)
+    } else if used < line + 5 * step {
+        (IDLE_MS, used.saturating_sub(aim))
+    } else {
+        (SHORT_MS, used.saturating_sub(aim))
+    }
+}
+
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
 /// scaled down under VRAM pressure. Never returns less than 1,000 ms so
 /// handles not yet recorded into a list or slot remain protected.
