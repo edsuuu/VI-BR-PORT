@@ -123,13 +123,15 @@ struct Cold {
 /// whole, ranges read in their hot pieces only, the pieces read of those,
 /// the pieces left; pieces compared ahead of sends that hash them again
 /// ([`Lean::ahead`]), of those found changed, and fetched whole for want of
-/// room in the compare's results.
-pub(super) static LEAN_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+/// room in the compare's results; pieces found changed that were not hot
+/// ([`Lean::found`]: a whole read or a compare ahead of a send found them).
+pub(super) static LEAN_STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 
 pub(super) mod lean_stat {
     pub(crate) const AHEAD: usize = 4;
     pub(crate) const AHEAD_FOUND: usize = 5;
     pub(crate) const AHEAD_UNCOMPARED: usize = 6;
+    pub(crate) const COLD_FOUND: usize = 7;
 }
 
 impl Lean {
@@ -250,7 +252,13 @@ impl Lean {
 
     /// Submission `number`'s compare found `piece` of `copy` changed.
     pub(super) fn found(&mut self, copy: u64, piece: u32, number: u64) {
-        let at = self.changed.entry(copy).or_default().entry(piece).or_insert(number);
+        let span = hot_span();
+        let at = self.changed.entry(copy).or_default().entry(piece).or_insert(0);
+        // Not hot: only a whole read (or a compare ahead of a send) finds
+        // such a piece, so with a longer `every` such a find comes later.
+        if *at == 0 || *at + span < number {
+            LEAN_STATS[lean_stat::COLD_FOUND].fetch_add(1, Ordering::Relaxed);
+        }
         *at = (*at).max(number);
     }
 }
@@ -264,7 +272,8 @@ pub(super) fn lean_line(frames: f64) {
     tracing::info!(
         "declared ranges read whole once in {every} submissions (VICTORY_CARD_COMPARE_EVERY, hot for {} submissions) per frame: {:.1} read whole, \
          {:.1} read in their hot pieces only, {:.0} pieces read of those, {:.0} left; {:.1} pieces left so compared ahead of \
-         sends that hash them again, {:.1} of them found changed, {:.1} fetched whole for want of room",
+         sends that hash them again, {:.1} of them found changed, {:.1} fetched whole for want of room; {:.1} pieces found \
+         changed that were not hot (what a longer VICTORY_CARD_COMPARE_EVERY finds later)",
         hot_span(),
         s[0],
         s[1],
@@ -273,6 +282,7 @@ pub(super) fn lean_line(frames: f64) {
         s[lean_stat::AHEAD],
         s[lean_stat::AHEAD_FOUND],
         s[lean_stat::AHEAD_UNCOMPARED],
+        s[lean_stat::COLD_FOUND],
     );
 }
 
