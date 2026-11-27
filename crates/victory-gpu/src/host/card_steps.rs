@@ -869,7 +869,8 @@ impl Host {
             own.list.reset();
             return Some(own);
         }
-        let between = self.uav_buffer(BETWEEN)?;
+        // Table slots of shared heaps are pointed at it (`constant_slot`).
+        let between = crate::host::named_by_slots(|| self.uav_buffer(BETWEEN))?;
         name(&between, || "copies of title memory on the card".into());
         let list = self.new_list().ok()?;
         Some(Own { list, between })
