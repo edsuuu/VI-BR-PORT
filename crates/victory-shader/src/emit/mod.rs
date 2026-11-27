@@ -417,6 +417,23 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    /// See [`with_wide_first`].
+    static WIDE_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the exact wave-wide form tried before the approximate ones for
+/// this program, as `VICTORY_WAVE_WIDE=1` has it for every program. With that switch on for all
+/// of them a run lost the card as the world started (a group barrier some thread never reaches),
+/// so the caller names the programs one by one (`VICTORY_WAVE_WIDE_FOR`): the title's light
+/// clustering, which the approximate form gives each half of its cells only half of the lights.
+pub fn with_wide_first<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = WIDE_FIRST.replace(on);
+    let r = f();
+    WIDE_FIRST.set(was);
+    r
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -717,7 +734,8 @@ pub fn emit(
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
         // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // (or for this program alone: [`with_wide_first`])
+        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1") || WIDE_FIRST.get();
         let wide_form = |deep: Option<&ir::Program>| {
             let bases = [deep, forms[1].1.as_ref().map(|f| &f.0), forms[0].1.as_ref().map(|f| &f.0), Some(p)];
             let again = widen(c, native, bases.into_iter().flatten().next().expect("the program itself"), why);
