@@ -2892,11 +2892,14 @@ impl State {
         // What a bake samples and does not find is baked wrong for the run
         // (blocks of noise on a character's clothes in one launch of seven):
         // the log says when its pass did not bring every due slot up to date.
-        // With the bake's own sources known (`VICTORY_BAKE_ADMIT=1`), when
-        // one of those was left: the other due slots are the world's, which
-        // the bake does not sample.
-        let left_due = if admit { missing > 0 } else { !served || refused > 0 };
-        if baking && left_due {
+        // It goes by every due slot left, with `VICTORY_BAKE_ADMIT=1` too: the
+        // sources found are those the dwords of what the bake binds name, and
+        // a source it reads by a way not looked through (past
+        // `crate::bake::BUFFER_BYTES` of a buffer, past `crate::bake::MOST`)
+        // is among the slots refused, not among the sources missing. So the
+        // count of these lines compares with the runs without the switch;
+        // `sources_missing` says what was left of the sources found.
+        if baking && (!served || refused > 0 || missing > 0) {
             static LEFT: AtomicU64 = AtomicU64::new(0);
             let n = LEFT.fetch_add(1, Ordering::Relaxed) + 1;
             if n <= 64 || n.is_power_of_two() {
