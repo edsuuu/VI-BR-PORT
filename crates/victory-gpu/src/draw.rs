@@ -2820,6 +2820,9 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if crate::pipeline::is_builder(self.pipeline as This) {
+            crate::pipeline::builder_dispatched();
+        }
         #[cfg(feature = "diagnostics")]
         list.note_after(|| format!("after {}", p.name));
         self.buffers_written();
@@ -4169,6 +4172,9 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if crate::pipeline::is_builder(self.pipeline as This) {
+                crate::pipeline::builder_dispatched();
+            }
             // The lamps' shadow-mask table is last written by an indirect
             // dispatch (the other passes follow direct ones only, as before).
             if p.stages.first().and_then(|s| s.shader.ambient) == Some(crate::ambient::Role::LampShadows) {

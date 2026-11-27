@@ -510,6 +510,76 @@ fn builder_asked() -> bool {
     *ASKED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
 }
 
+/// Builder dispatches let through to the host since the start
+/// ([`builder_report`]).
+#[cfg(windows)]
+static BUILDER_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A dispatch of the builder was let through ([`builder_runs`] said yes).
+#[cfg(windows)]
+pub(crate) fn builder_dispatched() {
+    BUILDER_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// With ray tracing asked for: a loud line at the first call (the run's
+/// first frame report) and then every 30 s, saying whether the structure
+/// builder runs, so that no run is measured as one with ray tracing while
+/// nothing builds the structures. Off: which of its pipelines it misses
+/// (refused, or still being made), of how many. Runs: how many of its
+/// dispatches went to the card a frame since the last line. Nothing is
+/// made or decided here.
+#[cfg(windows)]
+pub(crate) fn builder_report() {
+    use std::sync::atomic::Ordering;
+    if !builder_asked() {
+        return;
+    }
+    // When the last line was said, at which frame and dispatch count.
+    static LAST: Mutex<Option<(std::time::Instant, u64, u64)>> = Mutex::new(None);
+    let frame = crate::frame::current();
+    let dispatches = BUILDER_DISPATCHES.load(Ordering::Relaxed);
+    let (frames, let_through, secs) = {
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        let since = last.map(|(at, f, d)| (at.elapsed(), frame.saturating_sub(f), dispatches.saturating_sub(d)));
+        if since.is_some_and(|(elapsed, ..)| elapsed < std::time::Duration::from_secs(30)) {
+            return;
+        }
+        *last = Some((std::time::Instant::now(), frame, dispatches));
+        since.map_or((frame, dispatches, 0), |(elapsed, f, d)| (f, d, elapsed.as_secs()))
+    };
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    let of = b.pipelines.len();
+    match b.state {
+        RUNS => tracing::info!(
+            pipelines = of,
+            per_frame = format_args!("{:.1}", let_through as f64 / frames.max(1) as f64),
+            frames,
+            secs,
+            resting = frame < b.rests,
+            "RAY TRACING asked for, structure builder RUNS: all {of} of its pipelines made; builder dispatches to the card per frame since the last line"
+        ),
+        OFF => tracing::warn!(
+            missing = b.missing.len(),
+            of,
+            which = ?b.missing,
+            still_being_made = b.waiting,
+            "RAY TRACING asked for, structure builder OFF: missing {} of {of}; no structure is built, this run does not measure ray tracing",
+            b.missing.len()
+        ),
+        _ => {
+            let missing: Vec<String> =
+                b.pipelines.iter().filter(|p| make::made(p) != Some(true)).map(|p| make::hashes(p)).collect();
+            tracing::warn!(
+                created = of,
+                not_made = missing.len(),
+                which = ?missing,
+                "RAY TRACING asked for, structure builder not dispatched yet: {of} of its pipelines created, {} of them without a host pipeline so far",
+                missing.len()
+            );
+        }
+    }
+}
+
 /// Whether the builder's pipelines go to the workers ahead of the others,
 /// at their creation and at a look ([`make::ahead`]): with the builder asked
 /// for, unless `VICTORY_BVH_AHEAD=0` (then they wait in the list of
