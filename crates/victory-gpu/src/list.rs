@@ -203,6 +203,18 @@ impl Detached {
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
+
+    /// The list's submission has run: its dynamic descriptor slots are
+    /// given back now, not when the list is dropped, which waits for many
+    /// submissions more (`VICTORY_BURY_LAG`, 64). Held so long they ran out
+    /// in heavy frames ("no free dynamic descriptor slots: a table is not
+    /// made", and the draw goes without it). After Belobug's e9428969.
+    /// On by default; `VICTORY_LANDED_TABLES=0` keeps them until the drop.
+    pub(crate) fn release_tables(&mut self) {
+        if crate::toggled!("VICTORY_LANDED_TABLES") {
+            self._state.tables_done();
+        }
+    }
 }
 
 /// A host list that has run and waits to be used again, and the bytes of
