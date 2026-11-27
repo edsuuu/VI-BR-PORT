@@ -1303,8 +1303,9 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     }
     // A region that reads and writes LDS is still taken when it only raises flags
     // (`lds_flag_region`): a read that misses the other host wave's write changes nothing
-    // the region leaves behind.
-    let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_none_or(|v| v != "0");
+    // the region leaves behind. Only with `VICTORY_LDS_FLAGS=1` (off by default: it changes the
+    // form of `CS_Tiling_Generate_Opaque` and waits for a run that keeps it).
+    let flags_on = std::env::var_os("VICTORY_LDS_FLAGS").is_some_and(|v| v == "1");
     for r in (0..n).filter(|&r| reads[r] && writes[r]).collect::<Vec<_>>() {
         let blocks: Vec<usize> = (0..n).filter(|&b| !all[b] && find(&mut region, b) == r).collect();
         if !(flags_on && lds_flag_region(p, st, &blocks)) {
