@@ -312,6 +312,7 @@ impl Own {
                         let constants = [at as u32 + done * 8, n];
                         list.SetComputeRoot32BitConstants(0, 2, constants.as_ptr().cast(), 0);
                         list.Dispatch(n.div_ceil(64), 1, 1);
+                        CARD_PASSES[5].fetch_add(1, Ordering::Relaxed);
                         done += n;
                     }
                 }
