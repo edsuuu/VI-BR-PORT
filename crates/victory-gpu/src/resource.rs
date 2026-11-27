@@ -1851,6 +1851,29 @@ static WORLD_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// for known: some ten seconds at the frame rates of a world that loads.
 const TARGETS_SETTLE_FRAMES: u64 = 300;
 
+/// [`TARGETS_SETTLE_FRAMES`], or `VICTORY_TARGETS_SETTLE_FRAMES=<n>` (30 to
+/// 300; unset: 300).
+///
+/// Until then up to 3,072 MB less what targets hold are kept for targets
+/// not made yet, and that is what refuses the texture queue at a scene's
+/// start: the prison of 27/11 (prisao-s-jogo2) had 1,935-2,524 MB kept with
+/// 1,136 MB of targets made, the queue refused from the world's first frame
+/// and 8,500 textures already on the card brought up to date although it
+/// had no room, until the rule measured them 12 s in (384 MB kept from
+/// then). The world's targets are made in its first frames; with fewer
+/// frames the scene's new textures are admitted sooner. What protects a
+/// later, larger target is as for the measured rule ([`targets_presented`]).
+#[cfg(windows)]
+fn targets_settle_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_TARGETS_SETTLE_FRAMES")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(TARGETS_SETTLE_FRAMES, |n| n.clamp(30, TARGETS_SETTLE_FRAMES))
+    })
+}
+
 /// The least margin kept above the targets' peak, and its share of the
 /// peak ([`targets_rule`]).
 const TARGETS_MARGIN_MIN: u64 = 384 << 20;
@@ -1860,12 +1883,12 @@ const TARGETS_MARGIN_QUARTERS: u64 = 1;
 /// time the card's memory in use passed the budget, up to the most.
 const TARGETS_GROW_STEP: u64 = 256 << 20;
 
-/// Whether what the world's targets take is known: [`TARGETS_SETTLE_FRAMES`]
+/// Whether what the world's targets take is known: [`targets_settle_frames`]
 /// after its first frame.
 #[cfg(windows)]
 fn targets_known() -> bool {
     let world = WORLD_AT.load(std::sync::atomic::Ordering::Relaxed);
-    world != u64::MAX && crate::frame::current().saturating_sub(world) >= TARGETS_SETTLE_FRAMES
+    world != u64::MAX && crate::frame::current().saturating_sub(world) >= targets_settle_frames()
 }
 
 /// Which rule set the room kept for targets ([`targets_rule`]).
