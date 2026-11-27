@@ -859,3 +859,93 @@ fn a_loop_lanes_leave_one_by_one_is_taken_wave_wide_before_host_waves_meet_in_it
     // (the other forms keep the block as one every lane runs: see `lower::with_loop_exits`)
     assert_eq!(lower::branches_around(&st, &[head]), Some(Vec::new()));
 }
+
+/// `if (t < s0) { do { if (some lane) { s2 += 1; SCC = s2 >= s1 } } while (!SCC) }`, then a
+/// store every lane makes: the shape of the slice loops of the water's light
+/// (`water_shading:CS_TransmissionVolumetrics_Tiled`, 0x2da8-0x2eb4), whose exit is the SCC of
+/// `s_and_saveexec` ("some lane is left") where no lane is. The console takes the outer skip
+/// when no lane is below s0 and never runs that loop with EXEC clear. A form that leaves the
+/// skip out walks the region with EXEC clear: the loop goes round to the translation's
+/// iteration limit, which ends the program before the store (whole tiles of the water left
+/// unwritten). So the skip is not a pure one ([`ir::pure_skips`]); kept and taken wave-wide,
+/// the store is made whatever s0 is.
+#[test]
+fn a_skip_around_a_loop_that_needs_a_lane_to_end_is_kept() {
+    let body = |skip: u32| {
+        vec![
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE82_03B2, // s_mov_b32 s2, 50
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            skip,        // s_cbranch_execz to the end of the region (or s_nop)
+            0xBF82_0001, // s_branch to the loop's head
+            0x8002_8102, // next round: s_add_u32 s2, s2, 1
+            0xBE8E_240C, // head: s_and_saveexec_b64 s[14:15], s[12:13]
+            0xBF88_0001, // s_cbranch_execz over the next
+            0xBF09_0102, // s_cmp_ge_u32 s2, s1
+            0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+            0xBF84_FFFA, // s_cbranch_scc0 to the next round
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x7E00_0287, // v_mov_b32 v0, 7
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16, // buffer_store_dword v0, off, s[8:11], 0
+        ]
+    };
+    // The two host waves of the console wave as `widen` takes them: the branches around the
+    // places that need every lane taken wave-wide, and the scalar branches around their
+    // meetings agreed on, until no more are found.
+    let widened = |native: &NativeProgram, p: &ir::Program, first: &HashSet<usize>| {
+        let mut wide = first.clone();
+        let mut agreed = HashSet::new();
+        lower::with_loop_exits(|| loop {
+            let st = structure::structure_wide(p, &wide).expect("structure");
+            lower::take_needs();
+            lower::take_meets();
+            let shader = lower::with_agreed(&agreed, || lowered(native, p, &wide));
+            let needs = lower::take_needs();
+            let meets = lower::take_meets();
+            let Ok(shader) = shader else {
+                let more = lower::branches_around(&st, &needs).unwrap_or_default();
+                let before = wide.len();
+                wide.extend(more);
+                assert!(wide.len() > before, "{:?}", shader.err());
+                continue;
+            };
+            let before = agreed.len();
+            agreed.extend(lower::scalar_branches_around(&st, &meets).expect("placed"));
+            if agreed.len() == before {
+                break shader;
+            }
+        })
+    };
+    let native = native(&body(0xBF88_0007));
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let skip = (0..p.blocks.len())
+        .find(|&b| {
+            p.blocks[b].insts.iter().any(|i| i.name() == "v_cmp_gt_u32")
+                && p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execz")
+        })
+        .expect("the skip");
+    assert!(!ir::pure_skips(&p, true).contains(&skip), "{:?}", ir::pure_skips(&p, true));
+    let kept = widened(&native, &p, &HashSet::from([skip]));
+    // the region walked with EXEC clear, as the form without the skip had it
+    let walked_native = native_of(&body(0xBF80_0000), true, 64);
+    let walked_p = ir::build(&walked_native.code, walked_native.wave64, walked_native.vgprs).expect("ir::build");
+    let walked = widened(&walked_native, &walked_p, &HashSet::new());
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        for s in [&kept, &walked] {
+            let mut copy = s.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    // (threads below s0, rounds' end s1) -> the store, made or not
+    for (below, s1) in [(0u32, 53u32), (10, 53), (64, 51), (40, 50)] {
+        let Some(got) = on_the_card(&kept, [below, s1]) else { return };
+        assert_eq!(got, 7, "kept: {below} threads inside, s1 = {s1}");
+    }
+    let Some(lost) = on_the_card(&walked, [0, 53]) else { return };
+    assert_eq!(lost, 0, "walked with EXEC clear: the loop runs to the limit and the store is lost");
+    let Some(made) = on_the_card(&walked, [10, 53]) else { return };
+    assert_eq!(made, 7, "walked with a lane inside");
+    eprintln!("ran on the hardware device: the store is made with no lane in the region once the skip is kept");
+}
