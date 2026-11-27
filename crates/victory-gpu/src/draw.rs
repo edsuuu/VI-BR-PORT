@@ -121,8 +121,10 @@ fn bake_exact() -> bool {
 
 /// How long a draw of the title's bake waits for the texture uploads that are
 /// on their way on the copy queue of their own (`crate::texture::ahead`,
-/// `VICTORY_UPLOAD_AHEAD`): `VICTORY_BAKE_SETTLE_MS`, 500; 0: it does not
-/// wait, as before.
+/// `VICTORY_UPLOAD_AHEAD`): `VICTORY_BAKE_SETTLE_MS=<ms>` (500 was the value
+/// tried); unset or 0: it does not wait, as before. Off by default until it is
+/// proven (see `crate::bake::on`: both runs through the counselor's cutscene
+/// with the two bake changes on ended in a fault in the title's code).
 ///
 /// A texture an earlier pass sent up that way is no longer due, so the pass
 /// ahead of a bake does not see it, and its slot goes on showing what it
@@ -136,7 +138,7 @@ fn bake_exact() -> bool {
 fn bake_settle() -> Option<std::time::Duration> {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let ms = *MS.get_or_init(|| {
-        std::env::var("VICTORY_BAKE_SETTLE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(500)
+        std::env::var("VICTORY_BAKE_SETTLE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
     });
     (ms > 0).then(|| std::time::Duration::from_millis(ms))
 }

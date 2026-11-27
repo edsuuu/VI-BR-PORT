@@ -30,10 +30,16 @@
 use std::sync::Mutex;
 
 /// Whether a bake draw's sources are found and brought up to date at the
-/// draw (`VICTORY_BAKE_SOURCES=0`: not, as before; on by default).
+/// draw (`VICTORY_BAKE_SOURCES=1`; off by default, as before).
+///
+/// Off until it is proven: the two runs that went through the counselor's
+/// cutscene with it and the wait for uploads on ([`crate::draw`]'s
+/// `VICTORY_BAKE_SETTLE_MS`) both ended in a fault in the title's code some
+/// four and a half minutes in (runs barco-s-final and barco-d-agua2q of 27 Nov);
+/// none of the runs through it without them did.
 pub(crate) fn on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_SOURCES").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_SOURCES").is_some_and(|v| v == "1"))
 }
 
 /// The most sources one draw takes: the bake's records are a few dozen;
