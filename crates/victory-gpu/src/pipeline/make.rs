@@ -251,6 +251,24 @@ pub(crate) fn early(p: &Arc<Pending>) {
     }
 }
 
+/// Queues `p` for the workers at once, ahead of the pipelines only started
+/// at their creation ([`early`]), as if a draw had asked for it: for
+/// pipelines that are all needed in the same instant (the structure
+/// builder's, which run all or none). Nothing waits here; [`now`] waits for
+/// one a worker has begun and makes one no worker has taken yet.
+///
+/// The builder's were made by [`now`] alone: one after the other on the
+/// title's recording thread at the first builder dispatch, behind the early
+/// list on a cold cache: some fifty of them at two to four a second stood
+/// a frame for 32 s and the title's own watchdog (30 s) ended the run (a
+/// run on another fork whose builder decided as ours does).
+pub(super) fn ahead(p: &Arc<Pending>) {
+    if p.shaders.is_empty() {
+        return;
+    }
+    start(p, REQUESTED);
+}
+
 /// Whether the frame's budget is one for all threads together: a thread
 /// that waits takes what is left of it and gives back what it did not
 /// use. Counted only when a wait had ended, the budget was one per thread:

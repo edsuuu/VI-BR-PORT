@@ -510,6 +510,17 @@ fn builder_asked() -> bool {
     *ASKED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
 }
 
+/// Whether the builder's pipelines go to the workers ahead of the others,
+/// at their creation and at a look ([`make::ahead`]): with the builder asked
+/// for, unless `VICTORY_BVH_AHEAD=0` (then they wait in the list of
+/// pipelines started at creation, and the first look makes the rest on the
+/// title's thread, as before).
+#[cfg(windows)]
+fn builder_ahead() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    builder_asked() && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_AHEAD").is_none_or(|v| v != "0"))
+}
+
 /// Whether the last look at a builder dispatch turned the builder off (or
 /// keeps it off while its programs are made). Nothing is made, locked or
 /// decided here; false before the first look.
@@ -711,6 +722,13 @@ pub(crate) fn builder_runs() -> bool {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    if !b.whole && builder_ahead() {
+        // Those not made yet go to the workers first, side by side: this
+        // thread then waits for the slowest instead of making each in turn.
+        for p in &b.pipelines {
+            make::ahead(p);
+        }
+    }
     let retry = retry();
     let runs = b.look(
         crate::frame::current(),
@@ -994,6 +1012,12 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        drop(b);
+        // The title creates them long before its first build, which needs
+        // every one of them in the same frame.
+        if builder_ahead() {
+            make::ahead(&host);
+        }
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),
