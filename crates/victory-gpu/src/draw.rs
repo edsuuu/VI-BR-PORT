@@ -299,7 +299,15 @@ pub(crate) fn in_place_indirect_line(frames: f64) {
 /// title's draws (158 passes a frame walking in the prison, 464 with the
 /// in-place records clamped alone). What it gives up: the guard against a
 /// record nothing wrote (`crate::indirect`), which then runs as it is.
+/// With `VICTORY_AB` naming the switch (diagnostics builds): on in its phases on.
 fn trusts_records() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_INDIRECT_TRUST")) {
+            return crate::ab::on(bit);
+        }
+    }
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_TRUST").is_some_and(|v| v == "1"))
 }

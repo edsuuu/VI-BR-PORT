@@ -2387,9 +2387,17 @@ unsafe fn group_writes(groups: *const u8, count: u32) -> GroupWrites {
 /// Which of the title's barrier groups record a wait for every earlier
 /// shader write (`VICTORY_GROUP_WAITS`): `all` of them (unset: as it was),
 /// `named` (the groups that name unordered access, before or after), or
-/// `ended` (only the groups that end one).
+/// `ended` (only the groups that end one). With `VICTORY_AB` naming the
+/// switch (diagnostics builds): `all` in its phases on, `ended` in the others.
 #[cfg(windows)]
 fn group_waits(writes: GroupWrites) -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_GROUP_WAITS")) {
+            return crate::ab::on(bit) || writes == GroupWrites::Ended;
+        }
+    }
     static SET: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     let set = *SET.get_or_init(|| match std::env::var("VICTORY_GROUP_WAITS").as_deref() {
         Ok("named") => 1,
