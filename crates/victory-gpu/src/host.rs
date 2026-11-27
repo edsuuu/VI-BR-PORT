@@ -6589,6 +6589,21 @@ impl HostList {
         self.note(what, None);
     }
 
+    /// With `VICTORY_GPU_TIMING` and `VICTORY_GPU_TIMING_AFTER=1` (off
+    /// unless set): a note right behind a command, so that its time on the
+    /// card ends there. A command's time otherwise runs to the next note,
+    /// and takes in what the layer records between them without one (the
+    /// next command's preludes, the title's barriers, copies): the timing
+    /// run's 2-7 ms of `InstanceCullingCS_Tree_BatchCull` a dispatch could be
+    /// either. What follows is then summed as `after [<pipeline>]`.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn note_after(&self, what: impl FnOnce() -> String) {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if *ON.get_or_init(|| timing() && crate::switch::on("VICTORY_GPU_TIMING_AFTER")) {
+            self.note(what, None);
+        }
+    }
+
     /// As [`HostList::note_op`], for a copy that reads the host GPU range
     /// `(address, bytes)`: the report places the faulting address in it.
     #[cfg(feature = "diagnostics")]
