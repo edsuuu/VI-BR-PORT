@@ -1102,6 +1102,17 @@ mod tests {
         eprintln!("pieces whose flight's byte is not in title memory: {lost:?}; lean statistics {stats:?}");
         assert!(lost.is_empty(), "shaders' writes lost to the sends' hashes");
         assert!(stats[heat::lean_stat::AHEAD] > 0 && stats[heat::lean_stat::AHEAD_FOUND] > 0, "pieces compared ahead of sends");
+        // With VICTORY_CARD_HASH_TABLE=1 / VICTORY_CARD_COMPARE_TABLE=1 the
+        // same, with the passes in one dispatch a list.
+        let table: Vec<u64> = super::table::STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
+        eprintln!("lists as one dispatch over a table: {table:?}");
+        if super::table::hash_on() {
+            assert!(table[super::table::stat::HASH_LISTS] > 0, "hash passes through the table");
+        }
+        if super::table::compare_on() {
+            assert!(table[super::table::stat::COMPARE_LISTS] > 0, "compares through the table");
+        }
+        assert_eq!(table[super::table::stat::NO_ROOM], 0);
         assert_eq!(look(host), Some(0), "nothing differs at rest");
         assert_eq!(host.log_messages(), None);
     }
