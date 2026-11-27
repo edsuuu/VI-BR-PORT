@@ -116,7 +116,7 @@
   "option.detailed_log.label": "Detailed log",
   "option.detailed_log.hint": "More lines in the log (diagnostics build)",
 
-  "cli.usage": "Usage: launcher.ps1 [-Check | -Get | -Set <id>=<value> | -Reset | -PrintEnv | -Version]. With no mode it opens the window.",
+  "cli.usage": "Usage: launcher.ps1 [-Check | -Get | -Set <id>=<value> | -Reset | -PrintEnv | -Version | -Snapshot <png> [-View play|preparing|more] [-Language en|pt-BR]]. With no mode it opens the window.",
   "cli.saved": "Saved to {0}.",
   "cli.window_missing": "The window is not built yet ({0}). The command-line modes work: {1}",
   "cli.settings_file": "Settings file: {0}",

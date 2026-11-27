@@ -116,7 +116,7 @@
   "option.detailed_log.label": "Log detalhado",
   "option.detailed_log.hint": "Mais linhas no log (build de diagnóstico)",
 
-  "cli.usage": "Uso: launcher.ps1 [-Check | -Get | -Set <id>=<valor> | -Reset | -PrintEnv | -Version]. Sem modo, abre a janela.",
+  "cli.usage": "Uso: launcher.ps1 [-Check | -Get | -Set <id>=<valor> | -Reset | -PrintEnv | -Version | -Snapshot <png> [-View play|preparing|more] [-Language en|pt-BR]]. Sem modo, abre a janela.",
   "cli.saved": "Salvo em {0}.",
   "cli.window_missing": "A janela ainda não foi feita ({0}). Os modos de linha de comando funcionam: {1}",
   "cli.settings_file": "Arquivo de configurações: {0}",

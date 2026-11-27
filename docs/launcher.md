@@ -95,9 +95,26 @@ scripts\launcher.ps1 -Set language=en
 scripts\launcher.ps1 -Reset                  # every option back to its default
 scripts\launcher.ps1 -PrintEnv               # play.ps1's parameters, the switches, the steps and their command lines
 scripts\launcher.ps1 -Version                # v0.1.0 (<commit>)
+scripts\launcher.ps1 -Snapshot play.png -View more -Language en   # the window drawn off screen, never shown
 ```
 
 `launcher.cmd` takes the same arguments (`launcher.cmd -Get`).
+
+## The window
+
+960 x 640, not resizable, in the colours and sizes of `scripts/launcher/tokens.json`. The
+**Play** view has the Play button (or **Choose the executable** while none is saved) and the
+options panel: profile, image, generated frames and ray tracing, **More options**, the GitHub
+link and the version. **More options** has every other option, by group, with **Restore the
+defaults**; a change is saved the moment it is made. Options that are not on this branch are
+drawn disabled and off, with "Not on this version yet". **Preparing** shows the four steps and a
+progress bar while Play prepares; a step that fails leaves its message, its log and the command
+to run by hand. Every control is reached with Tab and has a gold focus rectangle and a name for
+screen readers. When the window opens the sunset fades in from the night colour and the sun's
+glow breathes slowly; with the animations of Windows turned off, nothing moves.
+
+The window reads the saved file again when it changes on disk, so an option changed through the
+MCP server or `-Set` shows in an open window within a second.
 
 ## The MCP server
 
@@ -128,7 +145,11 @@ claude mcp add launcher -- powershell -NoProfile -ExecutionPolicy Bypass -File <
 | `scripts/launcher/PlayScript.ps1` | what `scripts/play.ps1` sets, read from its syntax tree |
 | `scripts/launcher/Game.ps1` | the steps of Play and its dry run |
 | `scripts/launcher/Text.ps1`, `Version.ps1` | texts and the version |
-| `scripts/launcher/Theme.ps1`, `Window.ps1` | the window |
+| `scripts/launcher/Theme.ps1` | the window's brushes, fonts, icons and control templates, made from `tokens.json` |
+| `scripts/launcher/Views.ps1` | the XAML of the scene and of the Play, Preparing and More options views |
+| `scripts/launcher/Window.ps1` | the window: saving each change, reading the saved file again, the fades |
+| `scripts/launcher/PlayRunner.ps1` | Play on a background runspace, its progress, the hidden window while the game runs |
+| `scripts/launcher/Snapshot.ps1` | `-Snapshot`: the window drawn into a PNG |
 | `scripts/launcher/Test-Launcher.ps1` | the self-check |
 
 ## Em português
