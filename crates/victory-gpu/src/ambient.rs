@@ -38,6 +38,9 @@
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
+//!
+//! `VICTORY_AMBIENT_OUTSIDE=<share>[:<least>]` keeps the constant inside rooms
+//! and gives the estimate outside them ([`outside`]).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -297,6 +300,37 @@ fn whole_gain(gain: f32, share: f32) -> f32 {
     1.0 + (gain - 1.0) * share.clamp(0.0, 1.0)
 }
 
+/// `VICTORY_AMBIENT_OUTSIDE=<share>[:<least>]`, with `VICTORY_AMBIENT=constant:...`:
+/// texels the stencil plane does not mark inside a room take the estimate
+/// (that share of it, never under the constant `<least>`, what the title's
+/// program left kept up to four times it) instead of the constant, and the
+/// bound on what the air scatters (`VICTORY_AMBIENT_AIR`) acts as much as the
+/// screen is inside. Unset or 0: the constant and the air's bound everywhere,
+/// as before.
+///
+/// Why: the constant is written over what the title's program left, so at
+/// night outdoors it takes away the sky's light the probes hold (the
+/// blue-green of the opening on the 26 Nov morning, run intro-video) and puts
+/// there a flat level five to fifty times what the street's surfaces send out
+/// (slow mean of the kept radiance 0.002-0.02 in run intro-s-grosso, against
+/// 0.1): an even brown on every face. And the air's bound, made for the
+/// prison's halls, holds the fog of a night street to 0.8 of that mean, so the
+/// halo of its lamps and of the police lights goes. Inside (the prison's
+/// rooms, about 98% of their screen) nothing changes.
+fn outside() -> [f32; 2] {
+    static SET: OnceLock<[f32; 2]> = OnceLock::new();
+    *SET.get_or_init(|| parse_outside(&std::env::var("VICTORY_AMBIENT_OUTSIDE").unwrap_or_default()))
+}
+
+fn parse_outside(set: &str) -> [f32; 2] {
+    let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
+    let (share, least) = set.split_once(':').unwrap_or((set, ""));
+    match number(share) {
+        Some(share) => [share, number(least).unwrap_or(0.0)],
+        None => [0.0, 0.0],
+    }
+}
+
 /// The word `tint`: the air's colour goes 60% of the way (times how much the
 /// key raises the room: none at a gain of 1, all from 2) to that of the light
 /// around. Its own switch word, since it changes colours, not levels.
@@ -340,7 +374,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=22, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
+#define RS "RootConstants(num32BitConstants=25, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -363,6 +397,9 @@ cbuffer Set : register(b0) {
     float lamps; float full; float least; float key;
     float most_gain; float inside_only; float air_hold; float geo_key;
     float air_tint; float room;
+    // (VICTORY_AMBIENT_OUTSIDE) The estimate's share and least light outside
+    // rooms with the constant; whether the stencil plane is bound.
+    float outside_level; float outside_least; float has_stencil;
 };
 Texture2D<float> depth : register(t0);
 // The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
@@ -514,7 +551,8 @@ void inside_share() {
     // (Valid once a room has been seen: before that the key gives nothing.)
     float seen_one = was.a > 0.0 || n > 0 ? 1.0 : 0.0;
     cells[INSIDE] = float4(max(exp(geo_log) - 1e-3, 0.0), geo_log, share, seen_one);
-    cells[INSIDE_MEAN] = float4(mean_luma, 0.0, 0.0, seen_one);
+    // (y: the share has been measured, though no room was seen.)
+    cells[INSIDE_MEAN] = float4(mean_luma, 1.0, 0.0, seen_one);
 }
 #endif
 
@@ -574,7 +612,11 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     if (air_hold > 0.0) cap /= gain_whole(cells[CELLS]);
     float3 c = scattered[at];
     float has = dot(c, LUMA);
-    if (has > cap) c *= cap / has;
+    // (VICTORY_AMBIENT_OUTSIDE) As much as the screen is inside: none on a
+    // night street, whose lamps light its fog.
+    float bound_share = 1.0;
+    if (outside_level > 0.0 && cells[INSIDE_MEAN].y > 0.0) bound_share = saturate(cells[INSIDE].z);
+    if (has > cap) c *= lerp(1.0, cap / has, bound_share);
     // (`tint`) Where the key raises a dark room, the air's colour goes part
     // of the way to that of the light its surfaces send out: without rays the
     // probes that light a hall's air hold the sky's light (a brown veil at
@@ -651,7 +693,12 @@ void raise(uint3 at : SV_DispatchThreadID) {
         open = saturate(1.0 - strength * 2.0 * sum / N);
     }
     float3 found;
-    if (constant > 0.0) {
+    // (VICTORY_AMBIENT_OUTSIDE) Outside rooms the estimate, not the constant.
+    bool outdoors = constant > 0.0 && outside_level > 0.0 && has_stencil > 0.0 &&
+        (stencil.Load(int3(p, 0)).y & 8u) == 0u;
+    float share_of_estimate = outdoors ? outside_level : level;
+    float least_light = outdoors ? outside_least : least;
+    if (constant > 0.0 && !outdoors) {
         found = float3(1.0, 0.98, 0.94) * constant;
         // A share of the light around, where that is more than the constant.
         float4 mean_now = cells[CELLS];
@@ -682,9 +729,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float3 all = float3(sr.w, sg.w, sb.w) / sum;
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
-    found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    found = lerp(found, cells[CELLS].rgb, 0.2) * share_of_estimate * open;
     // Never under the least light asked for (estimate:<share>:<least>).
-    float3 floor_light = float3(1.0, 0.98, 0.94) * least * open * gain_at(cells[CELLS], p);
+    float3 floor_light = float3(1.0, 0.98, 0.94) * least_light * open * gain_at(cells[CELLS], p);
     if (dot(found, LUMA) < dot(floor_light, LUMA)) found = floor_light;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
@@ -701,7 +748,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 5) * 16;
 /// The passes' root constants, in words (the `Set` buffer).
-const WORDS: usize = 22;
+const WORDS: usize = 25;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -858,7 +905,17 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
         if *said < 4 {
             *said += 1;
-            tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
+            let [outside_share, outside_least] = outside();
+            tracing::info!(
+                ?role,
+                size = ?views.size,
+                level,
+                constant,
+                outside_share,
+                outside_least,
+                stencil = views.stencil.is_some(),
+                "a stand-in for the indirect light"
+            );
         }
     }
     list.keep(&pass.cells);
@@ -890,7 +947,14 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     // (`room` is read by every pass, the air's too, which has no stencil
     // plane: it reads what the resolve measured.)
     words[21] = if key > 0.0 && key_room() { 1.0f32 } else { 0.0 }.to_bits();
-    let measure_rooms = key > 0.0 && key_room() && views.stencil.is_some();
+    // The estimate outside rooms with the constant (VICTORY_AMBIENT_OUTSIDE):
+    // it needs the stencil plane, the points gathered and the rooms' share.
+    let [outside_level, outside_least] = if constant > 0.0 { outside() } else { [0.0, 0.0] };
+    let outdoors = outside_level > 0.0 && views.stencil.is_some();
+    words[22] = outside_level.to_bits();
+    words[23] = outside_least.to_bits();
+    words[24] = if views.stencil.is_some() { 1.0f32 } else { 0.0 }.to_bits();
+    let measure_rooms = ((key > 0.0 && key_room()) || outdoors) && views.stencil.is_some();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -920,8 +984,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
             // (Recorded by `unshadow`, above.)
             Role::LampShadows => {}
             Role::Resolve => {
-                // (With the constant, only for the air's bound.)
-                if constant == 0.0 || air() > 0.0 {
+                // (With the constant, only for the air's bound and the
+                // estimate outside rooms.)
+                if constant == 0.0 || air() > 0.0 || outdoors {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
                 }
@@ -1085,6 +1150,15 @@ mod tests {
         // A room filling the screen: all of it, as without `room`.
         assert_eq!(whole_gain(8.0, 1.0), 8.0);
         assert_eq!(whole_gain(3.0, 0.5), 2.0);
+    }
+
+    #[test]
+    fn outside_settings() {
+        assert_eq!(parse_outside(""), [0.0, 0.0]);
+        assert_eq!(parse_outside("0"), [0.0, 0.0]);
+        assert_eq!(parse_outside("1"), [1.0, 0.0]);
+        assert_eq!(parse_outside("1:0.03"), [1.0, 0.03]);
+        assert_eq!(parse_outside("x:0.03"), [0.0, 0.0]);
     }
 
     #[test]
