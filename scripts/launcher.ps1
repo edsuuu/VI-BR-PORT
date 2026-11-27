@@ -6,7 +6,8 @@
 #   -Reset              every option back to its default
 #   -PrintEnv           what Play would run: play.ps1's parameters, the switches, the steps
 #   -Version            v<version> (<commit>)
-#   -Snapshot <png>     draws the window off screen into a picture (-View play|preparing|more)
+#   -Snapshot <png>     draws the window off screen into a picture, never showing it
+#                       (-View play|preparing|more, -Language en|pt-BR: drawn, not saved)
 # The settings live in %APPDATA%\VI-BR-PORT\launcher.json (VICTORY_LAUNCHER_CONFIG=<file> overrides).
 param(
     [switch]$Check,
@@ -16,7 +17,8 @@ param(
     [switch]$PrintEnv,
     [switch]$Version,
     [string]$Snapshot,
-    [ValidateSet('play', 'preparing', 'more')][string]$View = 'play'
+    [ValidateSet('play', 'preparing', 'more', 'options')][string]$View = 'play',
+    [string]$Language
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -100,7 +102,7 @@ try {
     }
     . $window
     if ($Snapshot) {
-        Save-LauncherWindowSnapshot -Path $Snapshot -View $View
+        Save-LauncherWindowSnapshot -Path $Snapshot -View $View -Language $Language
         exit 0
     }
     Show-LauncherWindow

@@ -7,7 +7,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
-foreach ($part in 'Theme', 'Views', 'PlayRunner') { . (Join-Path $PSScriptRoot "$part.ps1") }
+foreach ($part in 'Theme', 'Views', 'PlayRunner', 'Snapshot') { . (Join-Path $PSScriptRoot "$part.ps1") }
 
 # The only page the launcher ever opens.
 $script:LauncherGithubUrl = 'https://github.com/edsuuu/VI-BR-PORT'
