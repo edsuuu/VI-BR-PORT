@@ -947,6 +947,68 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     list.fill_scratch(address as *const u8, len)
 }
 
+/// Constant views of descriptor tables since the last frame line, while
+/// [`direct_constants`] is on: bound on the title memory's host copy
+/// ([`direct_constant`]), and filled into upload memory at submission.
+static CONSTANT_VIEWS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Whether a table's constant view is bound on the host copy of the title
+/// memory it names, as a root constant view is ([`root_view`]), instead of
+/// filled into upload memory at submission (`VICTORY_DIRECT_CONSTANTS=1`;
+/// off unless set). A fill reads title memory on the CPU when the list is
+/// submitted; where a flight's shaders write those bytes the submission
+/// settles for it first (`host::blocked_by`, "a fill of upload memory"),
+/// unless the card does the fill (`VICTORY_CARD_STEPS`). On the copy the
+/// view reads, when the draw runs and in the queue's order, the title's
+/// bytes (the range is refreshed before the list runs) and what shaders
+/// queued before it wrote.
+fn direct_constants() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_CONSTANTS").is_some_and(|v| v == "1"))
+}
+
+/// The buffer and host GPU address a table's constant view of `size` bytes
+/// at title address `address` reads on the title memory's host copy, its
+/// range refreshed before the list runs; `None`: it is filled, as before
+/// ([`direct_constants`] off, no host copy of it, a place in the copy not
+/// on 256 bytes (the console asks 16), or a rounded size past the copy's
+/// end).
+fn direct_constant(list: &HostList, address: u64, size: u32) -> Option<(ID3D12Resource, u64)> {
+    if !direct_constants() {
+        return None;
+    }
+    let direct = (|| {
+        if size == 0 || size > 1 << 16 {
+            return None;
+        }
+        let shadow = crate::shadow::find(address, u64::from(size))?;
+        let gpu = shadow.gpu(address);
+        let rounded = u64::from(size.next_multiple_of(256));
+        if !gpu.is_multiple_of(256) || shadow.left(address) < rounded {
+            return None;
+        }
+        shadow.refresh(list, address, rounded);
+        #[cfg(feature = "diagnostics")]
+        crate::book::root(gpu, rounded);
+        Some((shadow.buffer.clone(), gpu))
+    })();
+    CONSTANT_VIEWS[usize::from(direct.is_none())].fetch_add(1, Ordering::Relaxed);
+    direct
+}
+
+/// The frame line's table constant views, while [`direct_constants`] is
+/// on: bound on the host copy, filled.
+pub(crate) fn constant_views_line(frames: f64) {
+    if !direct_constants() {
+        return;
+    }
+    let [direct, filled] = [0, 1].map(|i| CONSTANT_VIEWS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "table constant views per frame (VICTORY_DIRECT_CONSTANTS): {direct:.0} bound on the host copy of title memory, \
+         {filled:.0} filled into upload memory at submission"
+    );
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -4000,6 +4062,13 @@ impl State {
                 let used = entries().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        // On the host copy of the title memory, read when
+                        // the draw runs, in the queue's order
+                        // (`VICTORY_DIRECT_CONSTANTS=1`).
+                        if let Some((buffer, gpu)) = direct_constant(list, address, size) {
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;
