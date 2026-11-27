@@ -2330,11 +2330,20 @@ impl State {
         // host slots the pass then made from the title's record (runs
         // intro-s-bs3..bs6); `crate::bake::objects` takes them as before.
         let objects = crate::bake::objects();
+        // Nor the bake's own targets (the 2048x2048 atlas, 22 MB, met as a
+        // dword), nor anything larger than a decal can be
+        // (`crate::bake::SOURCE_BYTES`): what a candidate costs is bounded.
+        let targets: Vec<(u64, u64)> =
+            self.targets.iter().filter_map(|&t| crate::texture::title_span(t as This, 0)).collect();
         let is_texture = |index: u32| {
-            heap.handle(index).and_then(crate::descriptor::view).is_some_and(|view| match view {
+            let texture = heap.handle(index).and_then(crate::descriptor::view).is_some_and(|view| match view {
                 View::Placed(false, resource, _) => resource[0] != 1,
                 _ => objects && crate::descriptor::host::is_texture_view(&view),
-            })
+            });
+            texture
+                && slot_memory(heap, index).is_some_and(|(at, len)| {
+                    len <= crate::bake::SOURCE_BYTES && !targets.iter().any(|&(t, n)| at < t + n && t < at + len)
+                })
         };
         for stage in p.stages.iter().filter(|s| bake_shader(&s.shader)) {
             for u in &stage.translated().used {

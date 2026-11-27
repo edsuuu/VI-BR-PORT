@@ -71,6 +71,12 @@ pub(crate) fn into_target(at: u64) -> u32 {
     }
 }
 
+/// The largest texture taken as a source: the decals are 64 KiB to 1 MiB
+/// (512x512 BC3 with its levels: 352 KiB); the 22 MB atlases and 3.6 MB
+/// textures met as dwords were the bake's own targets or no source at all
+/// (runs intro-s-bs3..bs6, barco-s-final).
+pub(crate) const SOURCE_BYTES: u64 = 2 << 20;
+
 /// The most sources one draw takes: the bake's records are a few dozen;
 /// past this the dwords are not indices.
 pub(crate) const MOST: usize = 256;
