@@ -6,6 +6,6 @@ $ErrorActionPreference = 'Stop'
 $script:LauncherDir = $PSScriptRoot
 $script:LauncherRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 
-foreach ($part in 'Json', 'Text', 'Config', 'Options', 'PlayScript', 'Version') {
+foreach ($part in 'Json', 'Text', 'Config', 'Options', 'PlayScript', 'Version', 'Game') {
     . (Join-Path $PSScriptRoot "$part.ps1")
 }
