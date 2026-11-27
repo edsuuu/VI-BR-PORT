@@ -73,10 +73,31 @@ function Get-LauncherTranslationKey {
     return (($bytes | ForEach-Object { $_.ToString('x2') }) -join '')
 }
 
+# One argument written for a Windows command line as programs read it back (the C runtime's
+# and Rust's rules): backslashes are only special before a quote, so those before an inner
+# quote or the closing quote are doubled ("G:\" would otherwise end in a literal quote). The
+# line shown for a step and the line it is started with are both made of these.
 function Format-LauncherArgument {
     param([AllowEmptyString()][string]$Value)
-    if ($Value -eq '' -or $Value -match '[\s"]') { return '"' + $Value.Replace('"', '\"') + '"' }
-    return $Value
+    if ($Value -ne '' -and $Value -notmatch '[\s"]') { return $Value }
+    $text = New-Object System.Text.StringBuilder
+    [void]$text.Append('"')
+    $slashes = 0
+    foreach ($c in $Value.ToCharArray()) {
+        if ($c -eq '\') { $slashes++; continue }
+        if ($c -eq '"') { [void]$text.Append([char]'\', 2 * $slashes + 1) }
+        elseif ($slashes -gt 0) { [void]$text.Append([char]'\', $slashes) }
+        $slashes = 0
+        [void]$text.Append($c)
+    }
+    if ($slashes -gt 0) { [void]$text.Append([char]'\', 2 * $slashes) }
+    [void]$text.Append('"')
+    return $text.ToString()
+}
+
+function Format-LauncherCommandLine {
+    param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments)
+    return (($Arguments | ForEach-Object { Format-LauncherArgument $_ }) -join ' ')
 }
 
 # A PowerShell single-quoted string. PowerShell takes the typographic quotes U+2018 to U+201B
@@ -128,7 +149,7 @@ function New-LauncherStep {
     $step['command'] = $null
     if ($File) {
         $step['log'] = Join-Path (Get-LauncherDataDir) "logs\$Id.log"
-        $step['command'] = ((@($File) + @($Arguments)) | ForEach-Object { Format-LauncherArgument $_ }) -join ' '
+        $step['command'] = Format-LauncherCommandLine -Arguments (@($File) + @($Arguments))
     }
     return $step
 }
@@ -198,50 +219,6 @@ function Get-LauncherPlayPlan {
     return $plan
 }
 
-# The environment of a step's process: this one's, without the VICTORY_ switches it may carry
-# (as play.ps1 clears them), plus the step's own.
-function New-LauncherProcessInfo {
-    param([Parameter(Mandatory)]$Step)
-    $cmd = $env:ComSpec
-    if (-not $cmd) { $cmd = 'cmd.exe' }
-    $logDir = Split-Path -Parent $Step['log']
-    if (-not (Test-Path -LiteralPath $logDir)) { New-Item -ItemType Directory -Path $logDir -Force | Out-Null }
-    $line = ((@($Step['file']) + @($Step['arguments'])) | ForEach-Object { '"' + $_ + '"' }) -join ' '
-    $info = New-Object System.Diagnostics.ProcessStartInfo
-    $info.FileName = $cmd
-    # cmd /s keeps every quote between its first and last; the output goes to the step's log.
-    $info.Arguments = '/d /s /c "' + $line + ' > "' + $Step['log'] + '" 2>&1"'
-    $info.UseShellExecute = $false
-    $info.CreateNoWindow = $true
-    $info.WorkingDirectory = $Step['cwd']
-    foreach ($name in @($info.EnvironmentVariables.Keys)) {
-        if ($name -like 'VICTORY_*' -and $name -notin $script:LauncherKeptPaths) { $info.EnvironmentVariables.Remove($name) }
-    }
-    foreach ($k in $Step['environment'].Keys) { $info.EnvironmentVariables[$k] = [string]$Step['environment'][$k] }
-    return $info
-}
-
-function Stop-LauncherProcessTree {
-    param([Parameter(Mandatory)][int]$Id)
-    $ErrorActionPreference = 'Continue'
-    & "$env:SystemRoot\System32\taskkill.exe" /PID $Id /T /F 2>&1 | Out-Null
-}
-
-function Get-LauncherLastLogLine {
-    param([string]$Path)
-    try {
-        $stream = New-Object System.IO.FileStream($Path, 'Open', 'Read', 'ReadWrite')
-        try {
-            $start = [Math]::Max(0, $stream.Length - 4096)
-            [void]$stream.Seek($start, 'Begin')
-            $reader = New-Object System.IO.StreamReader($stream)
-            $lines = $reader.ReadToEnd() -split "`r?`n" | Where-Object { $_.Trim() }
-            if ($lines) { return [string]@($lines)[-1] }
-        } finally { $stream.Dispose() }
-    } catch { }
-    return $null
-}
-
 function Send-LauncherProgress {
     param($Progress, [string]$Step, [string]$State, [string]$Message)
     if ($null -eq $Progress) { return }
@@ -257,29 +234,6 @@ function Send-LauncherProgress {
     $report['message'] = $Message
     $report['percent'] = [int][Math]::Round(100.0 * $done / $count)
     & $Progress $report
-}
-
-# Runs one step's process to its end; $State.Cancel = $true (from another thread) stops it.
-function Invoke-LauncherStep {
-    param([Parameter(Mandatory)]$Step, $Progress, $State)
-    $process = [System.Diagnostics.Process]::Start((New-LauncherProcessInfo -Step $Step))
-    try {
-        $last = $null
-        while (-not $process.WaitForExit(250)) {
-            if ($null -ne $State -and $State['Cancel']) {
-                Stop-LauncherProcessTree -Id $process.Id
-                $process.WaitForExit()
-                return 'cancelled'
-            }
-            $line = Get-LauncherLastLogLine -Path $Step['log']
-            if ($line -and $line -ne $last) {
-                $last = $line
-                Send-LauncherProgress -Progress $Progress -Step $Step['id'] -State 'running' -Message $line
-            }
-        }
-        $process.WaitForExit()
-        return $process.ExitCode
-    } finally { $process.Dispose() }
 }
 
 # Play: the steps of Get-LauncherPlayPlan, each reported to $Progress as it starts and ends
