@@ -2725,7 +2725,10 @@ impl<'a> Lower<'a> {
             }
         }
         if loop_limit_exit() && self.exchange.as_ref().is_some_and(|e| !e.1) && self.s.threads.is_some() {
-            let headers: Vec<usize> = self.counters.keys().copied().collect();
+            // (in block order: a block leaving two loops tests their limits in this order, and
+            // the map's own order changes from one process to the next)
+            let mut headers: Vec<usize> = self.counters.keys().copied().collect();
+            headers.sort_unstable();
             let (block, rpo) = (&self.block, &self.rpo);
             let reachable = |q: usize| block[q].is_some();
             let back = |q: usize, h: usize| rpo[h] <= rpo[q];
