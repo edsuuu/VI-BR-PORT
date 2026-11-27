@@ -390,7 +390,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
     if !cards() || !host.card_ready() {
         return None;
     }
-    let (buffer, _) = host.shared_buffer(size)?;
+    let (buffer, _) = crate::host::named_by_slots(|| host.shared_buffer(size))?;
     CARD_BYTES[0].fetch_add(size, Ordering::Relaxed);
     Some(buffer)
 }
@@ -460,7 +460,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    let buffer = crate::host::named_by_slots(|| host.uav_buffer(size));
     if buffer.is_none() {
         CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
     }
@@ -507,7 +507,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
     if !host.card_ready() {
         return None;
     }
-    let (buffer, _) = host.shared_buffer(size)?;
+    let (buffer, _) = crate::host::named_by_slots(|| host.shared_buffer(size))?;
     WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed);
     Some(buffer)
 }
@@ -550,7 +550,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let made = host.mapped_card_buffer(size, true);
+    let made = crate::host::named_by_slots(|| host.mapped_card_buffer(size, true));
     if made.is_none() {
         WINDOW_MAPPED_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
@@ -586,7 +586,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
         return None;
     }
-    let buffer = host.uav_buffer(size);
+    let buffer = crate::host::named_by_slots(|| host.uav_buffer(size));
     if buffer.is_none() {
         WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
     }
@@ -5120,7 +5120,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
+        let (buffer, data) = crate::host::named_by_slots(|| host().and_then(|h| h.shared_buffer(size)))?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
@@ -5342,15 +5342,15 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
         mb.unwrap_or(4096) << 20
     });
     let room = host.video_memory().is_none_or(|[budget, used, ..]| used + len < budget / 100 * 97);
-    let (staging, data) = host.shared_buffer(len)?;
+    let (staging, data) = crate::host::named_by_slots(|| host.shared_buffer(len))?;
     let on_card = if room && USED.fetch_add(len, Ordering::Relaxed) + len <= most {
-        host.uav_buffer(len)
+        crate::host::named_by_slots(|| host.uav_buffer(len))
     } else {
         None
     };
     let buffer = match on_card {
         Some(buffer) => buffer,
-        None => host.shared_buffer(len)?.0,
+        None => crate::host::named_by_slots(|| host.shared_buffer(len))?.0,
     };
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x} by address, the CPU's side"));
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} by address"));
@@ -5444,7 +5444,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let (buffer, data) = crate::host::named_by_slots(|| host().and_then(|h| h.shared_buffer(len)))?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
@@ -5534,7 +5534,7 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
             Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
         });
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
+    let (buffer, data) = crate::host::named_by_slots(|| host().and_then(|h| h.shared_buffer(len.next_multiple_of(256))))?;
     crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };

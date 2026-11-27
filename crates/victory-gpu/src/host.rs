@@ -216,23 +216,72 @@ fn wait_resident() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_RESIDENT").is_none_or(|v| v != "0"))
 }
 
-/// Whether plain buffers wait too (unset: yes, as before).
-/// `VICTORY_WAIT_RESIDENT=textures`: only texture blocks and textures (made
-/// with [`not_resident`]) wait; plain buffers (upload, CPU-mapped and
-/// unordered-access buffers: host copies of title memory, scratch chunks)
-/// are made resident and not waited for. The bet is that they are named only
-/// by lists recorded after they exist. Not so everywhere: the heap pass
-/// (`draw::heap_buffer_pass`) and the constant views of tables write slots
-/// of the title's heaps, which lists still in the air read by index, with
-/// views of copies just made; such a list reads a page not mapped yet.
-fn wait_resident_buffers() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| wait_resident() && buffers_wait(std::env::var("VICTORY_WAIT_RESIDENT").ok().as_deref()))
+/// Which plain buffers wait to be resident (unset: all of them, as before).
+/// `VICTORY_WAIT_RESIDENT=textures`: texture blocks and textures (made with
+/// [`not_resident`]) wait, and so do the buffers a slot of a heap that lists
+/// share can show ([`named_by_slots`]: host copies of title memory, list
+/// scratch, the card steps' buffers); other plain buffers are made resident
+/// and not waited for. `VICTORY_WAIT_RESIDENT=textures-any`: no plain buffer
+/// waits, slot-named ones neither (the fork's form). The bet there is that a
+/// buffer is named only by lists recorded after it exists. Not so
+/// everywhere: the heap pass (`draw::heap_buffer_pass`) and the constant
+/// views of tables write slots of the title's heaps, which lists still in
+/// the air read by index, with views of copies just made; such a list reads
+/// a page not mapped yet.
+fn buffers() -> Buffers {
+    static ON: OnceLock<Buffers> = OnceLock::new();
+    *ON.get_or_init(|| {
+        if !wait_resident() {
+            return Buffers::Unless;
+        }
+        buffers_wait(std::env::var("VICTORY_WAIT_RESIDENT").ok().as_deref())
+    })
 }
 
-/// Whether a `VICTORY_WAIT_RESIDENT` setting leaves plain buffers waiting.
-fn buffers_wait(setting: Option<&str>) -> bool {
-    setting.is_none_or(|v| v.trim() != "textures")
+/// Which plain buffers wait to be resident ([`buffers`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Buffers {
+    /// All of them.
+    All,
+    /// Those made inside [`named_by_slots`] alone.
+    Named,
+    /// None.
+    Unless,
+}
+
+/// How a `VICTORY_WAIT_RESIDENT` setting other than `0` leaves plain
+/// buffers waiting.
+fn buffers_wait(setting: Option<&str>) -> Buffers {
+    match setting.map(str::trim) {
+        Some("textures") => Buffers::Named,
+        Some("textures-any") => Buffers::Unless,
+        _ => Buffers::All,
+    }
+}
+
+thread_local! {
+    /// Whether buffers made on this thread now are ones a shared heap's slot
+    /// can show ([`named_by_slots`]).
+    static NAMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f`, whose new plain buffers a slot of a heap that lists share can
+/// show: lists sent before may read them by index. They wait to be resident
+/// as textures do, with `VICTORY_WAIT_RESIDENT=textures` too.
+pub(crate) fn named_by_slots<T>(f: impl FnOnce() -> T) -> T {
+    let was = NAMED.with(|n| n.replace(true));
+    let out = f();
+    NAMED.with(|n| n.set(was));
+    out
+}
+
+/// Whether a plain buffer made now waits to be resident ([`buffers`]).
+fn wait_resident_buffers() -> bool {
+    match buffers() {
+        Buffers::All => true,
+        Buffers::Named => NAMED.with(std::cell::Cell::get),
+        Buffers::Unless => false,
+    }
 }
 
 /// The flag memory is made with that [`resident`] waits for.
@@ -1944,7 +1993,9 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    // Table constant views point slots of shared heaps at it
+    // (`constant_at`).
+    let (buffer, data) = named_by_slots(|| host.upload_buffer(size))?;
     name(&buffer, || "list scratch".into());
     ALIVE[1].fetch_add(1, Ordering::Relaxed);
     ALIVE[2].fetch_add(size, Ordering::Relaxed);
@@ -12218,15 +12269,29 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         );
     }
 
-    /// `VICTORY_WAIT_RESIDENT=textures` alone lets plain buffers go
-    /// without the wait; unset or anything else, they wait as before.
+    /// `VICTORY_WAIT_RESIDENT=textures` lets plain buffers go without the
+    /// wait but those a shared slot can show, `textures-any` all of them;
+    /// unset or anything else, they wait as before.
     #[test]
     fn buffers_wait_unless_only_textures_do() {
-        assert!(super::buffers_wait(None));
-        assert!(super::buffers_wait(Some("1")));
-        assert!(super::buffers_wait(Some("")));
-        assert!(!super::buffers_wait(Some("textures")));
-        assert!(!super::buffers_wait(Some(" textures ")));
+        use super::Buffers;
+        assert_eq!(super::buffers_wait(None), Buffers::All);
+        assert_eq!(super::buffers_wait(Some("1")), Buffers::All);
+        assert_eq!(super::buffers_wait(Some("")), Buffers::All);
+        assert_eq!(super::buffers_wait(Some("textures")), Buffers::Named);
+        assert_eq!(super::buffers_wait(Some(" textures ")), Buffers::Named);
+        assert_eq!(super::buffers_wait(Some("textures-any")), Buffers::Unless);
+    }
+
+    /// Inside `named_by_slots` the buffers made are slot-named, and the mark
+    /// goes when it returns, nested or not.
+    #[test]
+    fn named_by_slots_marks_its_own_buffers_only() {
+        let named = || super::NAMED.with(std::cell::Cell::get);
+        assert!(!named());
+        let seen = super::named_by_slots(|| (named(), super::named_by_slots(named), named()));
+        assert_eq!(seen, (true, true, true));
+        assert!(!named());
     }
 
     #[test]
