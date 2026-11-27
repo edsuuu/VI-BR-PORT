@@ -877,6 +877,23 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 /// the ones whose first page was not there (asked by the first page alone,
 /// as before, they counted as not there at all).
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Since the last line, the looks of the pass over the heap's views at
+/// slots of placed 2D textures, by the first level their view shows (0, 1,
+/// 2, 3 or more): with some of their memory there [0..4], with none [4..8];
+/// and of those there that show from a level past the first, the ones with
+/// all of the larger levels' memory mapped too [8], with none of it [9]
+/// (the title views a texture from the first level it holds, and the
+/// larger levels lie after the smaller ones in its memory). Whether a shot
+/// begins soft because the title has not brought the large levels in yet,
+/// or because ours are late: `VICTORY_LEVEL_CENSUS=0`: not counted.
+pub(crate) static LEVEL_CENSUS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+pub(crate) fn level_census() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LEVEL_CENSUS").is_none_or(|v| v != "0"))
+}
+
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Marks the last traced draw as not run on the host.
@@ -2793,6 +2810,21 @@ impl State {
                 let first = crate::resource::first_mip(&desc);
                 let len = crate::resource::placed_bytes_from(&resource, first).unwrap_or(1);
                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                if level_census() {
+                    let bucket = first.min(3) as usize + if mapped == 0 { 4 } else { 0 };
+                    LEVEL_CENSUS[bucket].fetch_add(1, Ordering::Relaxed);
+                    if mapped > 0
+                        && first > 0
+                        && let Some(whole) = crate::resource::placed_bytes(&resource).filter(|&whole| whole > len)
+                    {
+                        let above = crate::texture::mapped_bytes((address + len) as *const u8, (whole - len) as usize);
+                        if above == whole - len {
+                            LEVEL_CENSUS[8].fetch_add(1, Ordering::Relaxed);
+                        } else if above == 0 {
+                            LEVEL_CENSUS[9].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
                 if mapped == 0 {
                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
                     tally[3] += 1;

@@ -10337,6 +10337,25 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
             }
+            if crate::draw::level_census() {
+                let c: [u64; 10] = std::array::from_fn(|i| crate::draw::LEVEL_CENSUS[i].swap(0, Ordering::Relaxed));
+                tracing::info!(
+                    "textures picked by index, by the first level their view shows (VICTORY_LEVEL_CENSUS), looks since the \
+                     last line: with memory there from level 0 {}, 1 {}, 2 {}, 3 or more {}; with none there from level 0 {}, \
+                     1 {}, 2 {}, 3 or more {}; of those there from a level past the first, {} with the larger levels' memory \
+                     mapped too, {} with none of it",
+                    c[0],
+                    c[1],
+                    c[2],
+                    c[3],
+                    c[4],
+                    c[5],
+                    c[6],
+                    c[7],
+                    c[8],
+                    c[9]
+                );
+            }
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                 let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));
