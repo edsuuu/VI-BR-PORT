@@ -520,12 +520,22 @@ pub fn emit(
         // The program in two other forms: without its early-outs, and
         // without any branch that only skips code no lane is left for.
         let form = |p: Option<ir::Program>| {
-            p.and_then(|p| {
-                let st = structure::structure(&p).ok()?;
-                let io = io::raise(&p, native).ok()?;
-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
-                Some((p, st, io, res))
-            })
+            // (`VICTORY_WAVE_WHY=1` says what kept a form from being tried)
+            let Some(p) = p else {
+                if why {
+                    eprintln!("WAVE64-RETRY a form the program does not have");
+                }
+                return None;
+            };
+            let said = |what: &str, e: &ShaderError| {
+                if why {
+                    eprintln!("WAVE64-RETRY a form not tried, {what}: {e}");
+                }
+            };
+            let st = structure::structure(&p).inspect_err(|e| said("its structure", e)).ok()?;
+            let io = io::raise(&p, native).inspect_err(|e| said("its inputs and outputs", e)).ok()?;
+            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).inspect_err(|e| said("its resources", e)).ok()?;
+            Some((p, st, io, res))
         };
         let forms = [
             ("without early-outs", form(ir::without_early_outs(p))),
