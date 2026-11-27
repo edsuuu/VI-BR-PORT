@@ -249,13 +249,52 @@ fn key() -> [f32; 2] {
 /// the key by the slow log-average of the cells' luminance instead of their
 /// mean (a few bright windows and tubes pull the mean of a dark hall above a
 /// plain corridor's: run prisao-s-amb-t10).
-fn key_flags() -> (bool, bool, bool) {
-    static SET: OnceLock<(bool, bool, bool)> = OnceLock::new();
-    *SET.get_or_init(|| {
-        let set = std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default();
-        let words: Vec<&str> = set.split(':').skip(2).map(str::trim).collect();
-        (words.contains(&"inside"), words.contains(&"air"), words.contains(&"geo"))
-    })
+///
+/// `room` (implies `inside`): the key is measured on the cells the stencil
+/// plane marks inside a room only, and what is not per texel (the air's hold
+/// of `air`, the `tint`) acts as much as the screen is inside (the slow share
+/// of such cells). A scene with nothing inside then gets nothing of the key:
+/// the opening's night street (run intro-s-cand: gain 8 measured on the
+/// street, the fog held to an eighth everywhere) keeps its fog, while the
+/// prison's rooms (about 98% inside, agente-interior.md 14.3) are raised as
+/// before. Without the word: the whole screen's measure, as before.
+fn key_flags() -> KeyWords {
+    static SET: OnceLock<KeyWords> = OnceLock::new();
+    *SET.get_or_init(|| key_words(&std::env::var("VICTORY_AMBIENT_KEY").unwrap_or_default()))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct KeyWords {
+    inside: bool,
+    air: bool,
+    geo: bool,
+    room: bool,
+}
+
+fn key_words(set: &str) -> KeyWords {
+    let words: Vec<&str> = set.split(':').skip(2).map(str::trim).collect();
+    let room = words.contains(&"room");
+    KeyWords {
+        inside: room || words.contains(&"inside"),
+        air: words.contains(&"air"),
+        geo: words.contains(&"geo"),
+        room,
+    }
+}
+
+/// The key's gain for a measured light: the ratio of the key to it, from 1
+/// up to `most` (no key: 1). The passes' `gain_of` does the same.
+fn key_gain(key: f32, most: f32, measured: f32) -> f32 {
+    if key <= 0.0 {
+        return 1.0;
+    }
+    (key / measured.max(1e-4)).clamp(1.0, most.max(1.0))
+}
+
+/// What of a gain acts on what is not per texel (`room`): as much as the
+/// screen is inside. The passes' `gain_whole` does the same.
+fn whole_gain(gain: f32, share: f32) -> f32 {
+    1.0 + (gain - 1.0) * share.clamp(0.0, 1.0)
 }
 
 /// The word `tint`: the air's colour goes 60% of the way (times how much the
@@ -270,15 +309,19 @@ fn key_tint() -> bool {
 }
 
 fn key_geo() -> bool {
-    key_flags().2
+    key_flags().geo
 }
 
 fn key_inside() -> bool {
-    key_flags().0
+    key_flags().inside
 }
 
 fn key_air_hold() -> bool {
-    key_flags().1
+    key_flags().air
+}
+
+fn key_room() -> bool {
+    key_flags().room
 }
 
 /// Strength and radius of the creases' shade.
@@ -297,7 +340,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=21, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
+#define RS "RootConstants(num32BitConstants=22, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -305,6 +348,12 @@ const SOURCE: &str = r#"
 #define GEO (2 * CELLS + 1)
 // Then the slow log-average of each of their colours (the hue of the bulk).
 #define GEO_RGB (2 * CELLS + 2)
+// Then, of the cells inside a room (the stencil plane's bit 3 at their
+// centre): the slow log-average of their luminance (x, and its log in y), the
+// slow share of the screen they are (z); and their slow mean luminance (x of
+// the next).
+#define INSIDE (2 * CELLS + 3)
+#define INSIDE_MEAN (2 * CELLS + 4)
 #define PX 160
 #define PY 90
 cbuffer Set : register(b0) {
@@ -313,7 +362,7 @@ cbuffer Set : register(b0) {
     float follow; float most; float air; float around;
     float lamps; float full; float least; float key;
     float most_gain; float inside_only; float air_hold; float geo_key;
-    float air_tint;
+    float air_tint; float room;
 };
 Texture2D<float> depth : register(t0);
 // The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
@@ -330,8 +379,17 @@ static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 // out less than `key` on the mean (the slow mean of the kept radiance) gets
 // closer to it: the ratio, from 1 up to `most_gain` (no key: 1). The light
 // itself raises the mean, so the gain settles below the ratio it starts at.
+float gain_of(float measured) {
+    return clamp(key / max(measured, 1e-4), 1.0, max(most_gain, 1.0));
+}
 float gain_to_key(float4 mean_now) {
     if (key <= 0.0 || mean_now.a <= 0.0) return 1.0;
+    // (`room`: measured on the cells inside a room only; none yet: no gain.)
+    if (room > 0.0) {
+        float4 in_room = cells[INSIDE];
+        if (in_room.a <= 0.0) return 1.0;
+        return gain_of(geo_key > 0.0 ? in_room.x : cells[INSIDE_MEAN].x);
+    }
     // (`geo`: the log-average instead of the mean.)
     float measured = dot(mean_now.rgb, LUMA);
     if (geo_key > 0.0) {
@@ -339,7 +397,18 @@ float gain_to_key(float4 mean_now) {
         if (geo.a <= 0.0) return 1.0;
         measured = geo.x;
     }
-    return clamp(key / max(measured, 1e-4), 1.0, max(most_gain, 1.0));
+    return gain_of(measured);
+}
+
+// The gain for what is not per texel (the air's hold, its tint): with
+// `room`, as much of it as the screen is inside (none on a night street).
+float gain_whole(float4 mean_now) {
+    float g = gain_to_key(mean_now);
+    if (room > 0.0) {
+        float4 in_room = cells[INSIDE];
+        g = lerp(1.0, g, in_room.a > 0.0 ? saturate(in_room.z) : 0.0);
+    }
+    return g;
 }
 
 // The same at a texel of the screen: with inside_only, 1 where the stencil
@@ -416,6 +485,37 @@ void place(uint3 at : SV_DispatchThreadID) {
     float3 p = seen(int2((float2(at.xy) + 0.5) * size / float2(CX, CY)), size);
     cells[CELLS + 1 + at.y * CX + at.x] = float4(p, p.z * p.z);
 }
+// (`room`) The cells inside a room, by the stencil plane at their centre:
+// their slow log-average and mean luminance, and the slow share of the
+// screen they are. With none inside the measures keep what they were (the
+// next room starts from them) and the share goes to 0.
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void inside_share() {
+    float n = 0, logs = 0, sum = 0;
+    for (uint i = 0; i < CELLS; i++) {
+        int2 p = int2((float2(i % CX, i / CX) + 0.5) * float2(width, height) / float2(CX, CY));
+        if ((stencil.Load(int3(p, 0)).y & 8u) == 0u) continue;
+        float l = dot(cells[i].rgb, LUMA);
+        n += 1;
+        logs += log(l + 1e-3);
+        sum += l;
+    }
+    float4 was = cells[INSIDE];
+    float4 mean_was = cells[INSIDE_MEAN];
+    float share_now = n / float(CELLS);
+    float share = was.a > 0.0 ? lerp(was.z, share_now, follow) : share_now;
+    float geo_log = was.y;
+    float mean_luma = mean_was.x;
+    if (n > 0) {
+        geo_log = was.a > 0.0 ? lerp(was.y, logs / n, follow) : logs / n;
+        mean_luma = was.a > 0.0 ? lerp(mean_was.x, sum / n, follow) : sum / n;
+    }
+    // (Valid once a room has been seen: before that the key gives nothing.)
+    float seen_one = was.a > 0.0 || n > 0 ? 1.0 : 0.0;
+    cells[INSIDE] = float4(max(exp(geo_log) - 1e-3, 0.0), geo_log, share, seen_one);
+    cells[INSIDE_MEAN] = float4(mean_luma, 0.0, 0.0, seen_one);
+}
 #endif
 
 #ifdef GATHER
@@ -470,7 +570,8 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     // The light the key adds to surfaces does not raise what the air may
     // scatter: the bound stays where it was before (the slow mean includes
     // the added light, so it is taken back out by the gain).
-    if (air_hold > 0.0) cap /= gain_to_key(cells[CELLS]);
+    // (`room`: as much as the screen is inside.)
+    if (air_hold > 0.0) cap /= gain_whole(cells[CELLS]);
     float3 c = scattered[at];
     float has = dot(c, LUMA);
     if (has > cap) c *= cap / has;
@@ -481,7 +582,7 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     float4 mean_now = cells[CELLS];
     float mean_luma = dot(mean_now.rgb, LUMA);
     if (air_tint > 0.0 && mean_now.a > 0.0 && mean_luma > 1e-5) {
-        float t = air_tint * saturate(gain_to_key(mean_now) - 1.0);
+        float t = air_tint * saturate(gain_whole(mean_now) - 1.0);
         // The hue of the bulk of the picture (log-average of each colour),
         // not of its bright windows.
         float4 bulk = cells[GEO_RGB];
@@ -598,7 +699,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 3) * 16;
+const CELL_BYTES: u64 = (2 * CELLS + 5) * 16;
+/// The passes' root constants, in words (the `Set` buffer).
+const WORDS: usize = 22;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -610,6 +713,7 @@ struct Pass {
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
     unshadow: ID3D12PipelineState,
+    inside: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
     /// Where the slow mean is copied for the log line ([`report_mean`]).
@@ -644,6 +748,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
     let unshadow = pipeline("UNSHADOW", s!("unshadow"))?;
+    let inside = pipeline("PLACE", s!("inside_share"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     let readback = {
         let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
@@ -681,6 +786,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         raise,
         air,
         unshadow,
+        inside,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -759,7 +865,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 21];
+    let mut words = [0u32; WORDS];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -781,6 +887,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[18] = if key_air_hold() { 1.0f32 } else { 0.0 }.to_bits();
     words[19] = if key_geo() { 1.0f32 } else { 0.0 }.to_bits();
     words[20] = if key_tint() { 0.6f32 } else { 0.0 }.to_bits();
+    // (`room` is read by every pass, the air's too, which has no stencil
+    // plane: it reads what the resolve measured.)
+    words[21] = if key > 0.0 && key_room() { 1.0f32 } else { 0.0 }.to_bits();
+    let measure_rooms = key > 0.0 && key_room() && views.stencil.is_some();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -788,7 +898,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 21, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, WORDS as u32, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -814,6 +924,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 if constant == 0.0 || air() > 0.0 {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
+                }
+                if measure_rooms {
+                    run(&pass.inside, 1, 1, 1);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
             }
@@ -841,22 +954,36 @@ fn report_mean(list: &HostList, pass: &Pass) {
         // SAFETY: the copy was recorded 5 s ago and has run; 16 bytes mapped.
         unsafe {
             if pass.readback.Map(0, None, Some(&mut data)).is_ok() {
-                let m = std::slice::from_raw_parts(data.cast::<f32>(), 8).to_vec();
+                let m = std::slice::from_raw_parts(data.cast::<f32>(), 16).to_vec();
                 pass.readback.Unmap(0, None);
                 let luma = 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
                 let [key, most] = key();
                 let geo = m[4];
-                let measured = if key_geo() { geo } else { luma };
-                let gain = if key > 0.0 && m[3] > 0.0 { (key / measured.max(1e-4)).clamp(1.0, most.max(1.0)) } else { 1.0 };
+                // (`room`: the cells inside a room, and their share.)
+                let (room_geo, room_share, room_mean, room_seen) = (m[8], m[10], m[12], m[11] > 0.0);
+                let measured = match (key_room(), key_geo()) {
+                    (true, true) => room_geo,
+                    (true, false) => room_mean,
+                    (false, true) => geo,
+                    (false, false) => luma,
+                };
+                let valid = if key_room() { room_seen } else { m[3] > 0.0 };
+                let gain = if valid { key_gain(key, most, measured) } else { 1.0 };
+                let air_gain = if key_room() { whole_gain(gain, if room_seen { room_share } else { 0.0 }) } else { gain };
                 tracing::info!(
                     mean = ?[m[0], m[1], m[2]],
                     luma,
                     geo,
                     key,
                     gain,
+                    air_gain,
+                    room_share,
+                    room_geo,
+                    room_mean,
                     inside_only = key_inside(),
                     air_hold = key_air_hold(),
                     by_geo = key_geo(),
+                    by_room = key_room(),
                     "the indirect light's stand-in: slow mean of the light around and the key's gain"
                 );
             }
@@ -875,6 +1002,8 @@ fn report_mean(list: &HostList, pass: &Pass) {
         )]);
         l.CopyBufferRegion(&pass.readback, 0, &pass.cells, CELLS * 16, 16);
         l.CopyBufferRegion(&pass.readback, 16, &pass.cells, (2 * CELLS + 1) * 16, 16);
+        // (The rooms' measures and share, and their mean.)
+        l.CopyBufferRegion(&pass.readback, 32, &pass.cells, (2 * CELLS + 3) * 16, 32);
         l.ResourceBarrier(&[crate::host::transition(
             &pass.cells,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -896,7 +1025,7 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
-    let mut words = [0u32; 21];
+    let mut words = [0u32; WORDS];
     words[0] = word;
     words[6] = views.size[0];
     words[7] = views.size[1];
@@ -908,7 +1037,7 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 21, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, WORDS as u32, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -937,6 +1066,25 @@ mod tests {
         assert_eq!(parse("constant:0.1:0.5"), Set::Constant(0.1, 0.5));
         assert_eq!(parse("constant:0.1:x"), Set::Constant(0.1, 0.0));
         assert_eq!(parse("constant:nan"), Set::Off);
+    }
+
+    #[test]
+    fn key_words_and_gains() {
+        assert_eq!(key_words("0.2:8"), KeyWords::default());
+        let prison = key_words("0.2:8:inside:air:geo");
+        assert!(prison.inside && prison.air && prison.geo && !prison.room);
+        // `room` implies `inside`.
+        let room = key_words("0.2:8:room:air:geo");
+        assert!(room.room && room.inside && room.air && room.geo);
+        assert_eq!(key_gain(0.0, 8.0, 0.01), 1.0);
+        assert_eq!(key_gain(0.2, 8.0, 0.4), 1.0);
+        assert_eq!(key_gain(0.2, 8.0, 0.1), 2.0);
+        assert_eq!(key_gain(0.2, 8.0, 0.0002), 8.0);
+        // Nothing inside (the opening's street): none of the key on the air.
+        assert_eq!(whole_gain(8.0, 0.0), 1.0);
+        // A room filling the screen: all of it, as without `room`.
+        assert_eq!(whole_gain(8.0, 1.0), 8.0);
+        assert_eq!(whole_gain(3.0, 0.5), 2.0);
     }
 
     #[test]
