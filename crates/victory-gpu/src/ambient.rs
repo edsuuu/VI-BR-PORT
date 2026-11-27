@@ -26,6 +26,7 @@
 //! `VICTORY_AMBIENT`:
 //! - unset or `0`/`off`: the title's own output.
 //! - a number: that share of the estimate (1: all of it).
+//! - `estimate:<share>:<least>`: the same, never under the constant `<least>`.
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
 //! - `constant:<level>:<share>`: the constant, or that share of the light
 //!   around (the slow mean of what is on screen) where that is more: by day
@@ -124,7 +125,8 @@ pub(crate) fn wanted(role: Role) -> bool {
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
     Off,
-    Estimate(f32),
+    /// The share of the estimate, and the least light it gives (0: none).
+    Estimate(f32, f32),
     /// The level, and the share of the light around that takes its place
     /// where that is more (0: none).
     Constant(f32, f32),
@@ -133,13 +135,31 @@ enum Set {
 fn parse(set: &str) -> Set {
     let set = set.trim();
     let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
-    match set.strip_prefix("constant:") {
-        Some(rest) => {
-            let (level, share) = rest.split_once(':').unwrap_or((rest, ""));
-            number(level).map_or(Set::Off, |level| Set::Constant(level, number(share).unwrap_or(0.0)))
-        }
-        None => number(set).map_or(Set::Off, Set::Estimate),
+    let pair = |rest: &str| {
+        let (a, b) = rest.split_once(':').unwrap_or((rest, ""));
+        (number(a), number(b).unwrap_or(0.0))
+    };
+    if let Some(rest) = set.strip_prefix("constant:") {
+        let (level, share) = pair(rest);
+        return level.map_or(Set::Off, |level| Set::Constant(level, share));
     }
+    // `estimate:<share>:<least>`: the estimate, never under the constant
+    // `<least>` (a room the estimate finds dark keeps the night constant).
+    if let Some(rest) = set.strip_prefix("estimate:") {
+        let (level, least) = pair(rest);
+        return level.map_or(Set::Off, |level| Set::Estimate(level, least));
+    }
+    number(set).map_or(Set::Off, |level| Set::Estimate(level, 0.0))
+}
+
+/// `VICTORY_AMBIENT_CELLS=full`: the light around is averaged over every
+/// texel of each of the 64x36 cells of the kept radiance (10x10 at 640x360),
+/// not 5x5 of them: a fluorescent tube one or two texels thin is then counted
+/// in every frame, not only when a sample falls on it (which made the
+/// estimate flicker as the camera turned). Unset: 5x5, as before.
+fn full_cells() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| std::env::var("VICTORY_AMBIENT_CELLS").is_ok_and(|v| v.trim() == "full"))
 }
 
 fn set() -> Set {
@@ -193,7 +213,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=13, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=15, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -203,7 +223,7 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float around;
-    float lamps;
+    float lamps; float full; float least;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -229,14 +249,16 @@ void keep(uint3 at : SV_DispatchThreadID) {
     uint w, h;
     radiance.GetDimensions(w, h);
     float3 sum = 0;
-    for (uint y = 0; y < 5; y++) for (uint x = 0; x < 5; x++) {
-        uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / 5.0) * float2(w, h) / float2(CX, CY));
+    // 5x5 samples of the cell, or (full) every texel of it.
+    uint2 n = full > 0.0 ? max(uint2(w / CX, h / CY), uint2(1, 1)) : uint2(5, 5);
+    for (uint y = 0; y < n.y; y++) for (uint x = 0; x < n.x; x++) {
+        uint2 p = uint2((float2(at.xy) + (float2(x, y) + 0.5) / float2(n)) * float2(w, h) / float2(CX, CY));
         float3 c = max(radiance[p], 0.0);
         c = any(isnan(c)) || any(isinf(c)) ? 0.0 : c;
         // Lamps and glints count, but not for everything.
         sum += c / max(1.0, dot(c, LUMA) / lamps);
     }
-    cells[at.y * CX + at.x] = float4(sum / 25.0, 1.0);
+    cells[at.y * CX + at.x] = float4(sum / float(n.x * n.y), 1.0);
 }
 [RootSignature(RS)]
 [numthreads(1, 1, 1)]
@@ -403,6 +425,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = all + 1.2 * float3(dot(sr.xyz, n), dot(sg.xyz, n), dot(sb.xyz, n)) / sum;
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
+    // Never under the least light asked for (estimate:<share>:<least>).
+    float3 floor_light = float3(1.0, 0.98, 0.94) * least * open;
+    if (dot(found, LUMA) < dot(floor_light, LUMA)) found = floor_light;
     float3 was = unpack(light[p]);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -520,7 +545,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     }
     let (level, constant, around) = match set() {
         Set::Off => return false,
-        Set::Estimate(level) => (level, 0.0f32, 0.0f32),
+        Set::Estimate(level, least) => (level, 0.0f32, least),
         Set::Constant(level, around) => (0.0, level, around),
     };
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
@@ -545,7 +570,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     list.keep(&pass.points);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 13];
+    let mut words = [0u32; 15];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -556,6 +581,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[10] = air().to_bits();
     words[11] = around.to_bits();
     words[12] = lamps().to_bits();
+    words[13] = if full_cells() { 1.0f32 } else { 0.0 }.to_bits();
+    // The estimate's least light rides in the share's place (the constant
+    // form's, which the estimate does not use).
+    words[14] = if constant == 0.0 { around } else { 0.0 }.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -563,7 +592,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 13, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -607,7 +636,7 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
-    let mut words = [0u32; 13];
+    let mut words = [0u32; 15];
     words[0] = word;
     words[6] = views.size[0];
     words[7] = views.size[1];
@@ -619,7 +648,7 @@ fn unshadow(list: &HostList, pass: &Pass, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 13, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 15, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
@@ -640,7 +669,9 @@ mod tests {
         assert_eq!(parse(""), Set::Off);
         assert_eq!(parse("off"), Set::Off);
         assert_eq!(parse("0"), Set::Off);
-        assert_eq!(parse("0.8"), Set::Estimate(0.8));
+        assert_eq!(parse("0.8"), Set::Estimate(0.8, 0.0));
+        assert_eq!(parse("estimate:0.8:0.1"), Set::Estimate(0.8, 0.1));
+        assert_eq!(parse("estimate:x:0.1"), Set::Off);
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3, 0.0));
         assert_eq!(parse("constant:0.1:0.5"), Set::Constant(0.1, 0.5));
         assert_eq!(parse("constant:0.1:x"), Set::Constant(0.1, 0.0));
