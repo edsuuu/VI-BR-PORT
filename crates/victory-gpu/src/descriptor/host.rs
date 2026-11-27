@@ -4185,7 +4185,7 @@ fn make_twinned(
                     tracing::warn!(
                         address = format_args!("{at:#x}"),
                         times,
-                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}",
+                        "placed unordered texture view not mirrored (null: writes through it are lost): resource {resource:?}, view {:?}, all view words {desc:?}",
                         &desc[..10]
                     );
                 }
