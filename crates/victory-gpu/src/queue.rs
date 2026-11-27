@@ -1226,6 +1226,8 @@ extern "system" fn copy_page_mappings(
 ) -> HRESULT {
     #[cfg(windows)]
     let _timed = crate::titletime::begin(crate::titletime::Kind::Queue);
+    #[cfg(windows)]
+    let _stall = crate::stall::Mapping::begin();
     let Some(map) = crate::resource::page_mapper() else {
         return E_INVALIDARG;
     };

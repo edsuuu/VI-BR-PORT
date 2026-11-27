@@ -1261,6 +1261,7 @@ pub extern "system" fn XMemMapPhysicalPages(
     {
         arrange(base, pages);
     }
+    let _stall = victory_gpu::stall::Mapping::begin();
     let mut costed = Costed::begin(Some(n));
     let _called = victory_gpu::timeline::span("the title's XMemMapPhysicalPages");
     let _busy = Busy::begin();
@@ -1315,6 +1316,7 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    let _stall = victory_gpu::stall::Mapping::begin();
     lift_thread();
     if side_by_side() > 1 && n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.

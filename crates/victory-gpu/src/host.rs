@@ -10524,6 +10524,13 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         crate::copystat::presented();
         self.frames += 1;
+        crate::stall::presented([
+            SUBMISSION_US[0].load(Ordering::Relaxed),
+            SUBMISSION_US[1].load(Ordering::Relaxed),
+            PREPARING[2].load(Ordering::Relaxed),
+            RESIDENT[1].load(Ordering::Relaxed),
+            MAPPED[1].load(Ordering::Relaxed),
+        ]);
         mesh_dip_check();
         #[cfg(feature = "diagnostics")]
         {
@@ -10547,6 +10554,7 @@ impl Meter {
             let scale = if i % 2 == 0 { 1e3 } else { 1e6 };
             PREPARING[i].swap(0, Ordering::Relaxed) as f64 / scale / frames
         });
+        crate::stall::swapped();
         let [back_ms, back_mb] = [0, 1].map(|i| {
             COPY_BACK[i].swap(0, Ordering::Relaxed) as f64 / [1e3, 1e6][i] / frames
         });
@@ -10664,6 +10672,11 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+            crate::stall::line(
+                self.logged.elapsed().as_secs_f64(),
+                crate::draw::HEAP_TEXTURES_QUEUE[2].load(Ordering::Relaxed),
+                crate::draw::HEAP_TEXTURES_QUEUE[5].load(Ordering::Relaxed),
+            );
             self.logged = std::time::Instant::now();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",

@@ -81,6 +81,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+pub mod stall;
+#[cfg(windows)]
 pub mod streamline;
 #[cfg(windows)]
 mod tiles;
