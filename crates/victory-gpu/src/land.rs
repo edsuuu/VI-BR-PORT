@@ -243,6 +243,12 @@ impl Pool {
                 } else {
                     crate::cores::keep_many_on_fast_cores(name);
                 }
+                // The pools the submitting thread hands work to and waits
+                // for: landings, the merges under flights' writes, the heaps'
+                // records.
+                if matches!(name, "victory-land" | "victory-under" | "victory-records") {
+                    crate::cores::raise_helper();
+                }
                 pool.help()
             });
         }

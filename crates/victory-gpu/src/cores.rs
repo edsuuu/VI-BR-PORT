@@ -69,6 +69,36 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
+/// Whether the threads the submitting thread waits for run at its priority,
+/// above normal (`VICTORY_HELPER_PRIORITY=1`; off by default: at normal, as
+/// before). Read once.
+///
+/// The submitting thread runs above normal (queue/behind.rs), but the
+/// threads it hands work to and then waits for (the wide pool; the pools of
+/// landings, of the merges under flights' writes and of the heaps' records;
+/// the heaps' record thread; the pass beside the lists; the thread that lands
+/// flights) ran at normal, level with the title's threads and the eight list
+/// translators. Measured by the fork
+/// it comes from (Kemerd/VIctory-NVIDIA-RT 80c70b719, i5-12400F, six cores,
+/// RTX 3060, one run off / on): 8.6 / 9.6 fps, refreshes 23.1 / 17.6 ms a
+/// frame, waiting for the heaps' records 6.2 / 2.5 ms. The thread that lands
+/// flights is added here (the relay, which that fork's submit did not wait
+/// for in the same way).
+fn helpers_raised() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_HELPER_PRIORITY"))
+}
+
+/// Raises the calling thread, one the submitting thread waits for, to that
+/// thread's priority when [`helpers_raised`]; else leaves it as it is.
+pub(crate) fn raise_helper() {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    if helpers_raised() {
+        // SAFETY: the calling thread.
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+    }
+}
+
 fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
     if stage() < from {
@@ -95,6 +125,27 @@ fn ask(what: &str, from: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With the switch unset (as the tests run) a helper keeps the priority
+    /// it was started with.
+    #[test]
+    fn a_helper_is_left_at_its_priority_unless_asked() {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+        let (before, after) = std::thread::spawn(|| {
+            // SAFETY: the calling thread.
+            let before = unsafe { GetThreadPriority(GetCurrentThread()) };
+            raise_helper();
+            // SAFETY: as above.
+            (before, unsafe { GetThreadPriority(GetCurrentThread()) })
+        })
+        .join()
+        .unwrap();
+        if !helpers_raised() {
+            assert_eq!(before, after);
+        } else {
+            assert!(after > before);
+        }
+    }
 
     #[test]
     fn the_fast_cores_are_those_of_the_best_class_if_there_is_a_worse_one() {
