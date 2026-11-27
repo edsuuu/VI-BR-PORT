@@ -93,6 +93,20 @@ pub(crate) fn gate() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_GATE").is_some_and(|v| v == "1"))
 }
 
+/// Whether a piece is cut from the fullest block that has room for it
+/// (`VICTORY_POOL_FULLEST=1`; off by default: from the first, as before).
+///
+/// Once no block can be made ([`gate`]) the blocks there are must do. A
+/// block that holds little gets nothing new while a fuller one has room: it
+/// keeps its long free ranges for the large textures, and it empties as its
+/// textures go, and an empty block goes back to the card by the rule there
+/// was ([`Pool::rested`]). From the first block with room, every block gets
+/// small textures into its holes and stays.
+fn fullest() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_FULLEST").is_some_and(|v| v == "1"))
+}
+
 /// What had no place: `known` if a piece of `len` bytes at `align` would
 /// have none where that had none, else this one.
 fn smaller(known: Option<(u64, u64)>, len: u64, align: u64) -> (u64, u64) {
@@ -206,17 +220,25 @@ struct Ripe {
     started: u64,
     finished: u64,
     ahead: usize,
-    /// Whether a block may be made ([`gate`]).
+    /// Whether a block may be made ([`gate`]), and whether the fullest
+    /// block with room is taken first ([`fullest`]).
     grow: Grow,
+    fullest: bool,
 }
 
 impl Ripe {
-    const ALL: Ripe = Ripe { started: 0, finished: 0, ahead: 0, grow: Grow::Yes };
+    const ALL: Ripe = Ripe { started: 0, finished: 0, ahead: 0, grow: Grow::Yes, fullest: false };
 
     fn now() -> Ripe {
         let (started, finished) = crate::host::submissions();
         // Not more than are kept ([`room`]): they would go and be made again.
-        Ripe { started, finished, ahead: ahead().min(SPARES.load(Ordering::Relaxed)), grow: Grow::Yes }
+        Ripe {
+            started,
+            finished,
+            ahead: ahead().min(SPARES.load(Ordering::Relaxed)),
+            grow: Grow::Yes,
+            fullest: fullest(),
+        }
     }
 
     /// Whether a piece of `len` bytes is cut from a block at all.
@@ -287,6 +309,13 @@ pub(crate) struct Piece {
 struct Block<B> {
     memory: B,
     free: Ranges,
+    /// The bytes of `free`.
+    room: u64,
+    /// The smallest piece (bytes, alignment) its free ranges had no place
+    /// for since one last came free in it (as [`Pool::no_fit`]): a block
+    /// nearly full is asked first ([`fullest`]), and was looked through
+    /// for every piece.
+    no_fit: Option<(u64, u64)>,
     /// The end of the highest piece ever taken: above it the memory is as
     /// it was made (zeros).
     used_to: u64,
@@ -342,7 +371,24 @@ impl<B: Clone> Pool<B> {
         // the same look as before.
         let known = ripe.grow == Grow::No && self.no_fit.is_some_and(|(l, a)| len >= l && align >= a);
         let mut found = None;
-        if !known {
+        if known {
+            // Not looked for.
+        } else if ripe.fullest {
+            // The fullest block with room first ([`fullest`]); of two as
+            // full, the first.
+            let fits = |b: &&Block<B>| ripe.is(b) && b.room >= len && !b.no_fit.is_some_and(|(l, a)| len >= l && align >= a);
+            let mut order: Vec<(u64, usize)> =
+                self.blocks.iter().enumerate().filter_map(|(i, b)| b.as_ref().filter(fits).map(|b| (b.room, i))).collect();
+            order.sort_unstable();
+            for (_, i) in order {
+                let Some(block) = self.blocks[i].as_mut() else { continue };
+                if let Some(start) = block.free.take(len, align) {
+                    found = Some((i, start));
+                    break;
+                }
+                block.no_fit = Some(smaller(block.no_fit, len, align));
+            }
+        } else {
             for (i, block) in self.blocks.iter_mut().enumerate() {
                 if let Some(block) = block
                     && ripe.is(block)
@@ -377,6 +423,9 @@ impl<B: Clone> Pool<B> {
                 (i, self.blocks[i].as_mut()?.free.take(len, align)?)
             }
         };
+        if let Some(block) = self.blocks[i].as_mut() {
+            block.room -= len;
+        }
         if ripe.ahead > 0 {
             if !ripe.is(self.blocks[i].as_ref()?) {
                 let n = UNRIPE.fetch_add(1, Ordering::Relaxed) + 1;
@@ -407,7 +456,8 @@ impl<B: Clone> Pool<B> {
                 self.blocks.len() - 1
             }
         };
-        self.blocks[i] = Some(Block { memory, free: Ranges::new(BLOCK), used_to: 0, made, since: crate::host::now_ms() });
+        self.blocks[i] =
+            Some(Block { memory, free: Ranges::new(BLOCK), room: BLOCK, no_fit: None, used_to: 0, made, since: crate::host::now_ms() });
         self.no_fit = None;
         i
     }
@@ -426,6 +476,8 @@ impl<B: Clone> Pool<B> {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
                 block.free.give(piece.start, piece.len);
+                block.room += piece.len;
+                block.no_fit = None;
                 any |= block.free.whole(BLOCK);
             }
             self.no_fit = None;
@@ -895,6 +947,70 @@ mod tests {
         assert!(pool.take_ripe(BLOCK / 4, 65536, REST - 1, ripe, || panic!("no block without room")).is_none());
         let (p, _, again) = pool.take_ripe(BLOCK / 4, 65536, REST, ripe, || panic!("no block without room")).unwrap();
         assert_eq!((p.block, p.start, again), (pieces[5].block, pieces[5].start, true));
+    }
+
+    /// A piece is cut from the fullest block that has room for it, so the
+    /// block that holds least empties and goes back; the bytes free in each
+    /// block are kept right.
+    #[test]
+    fn the_fullest_block_with_room_is_taken_first() {
+        let mut pool: Pool<u64> = Pool::new(0);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let ripe = Ripe { fullest: true, ..Ripe::ALL };
+        let piece = BLOCK / 8;
+        // Three full blocks.
+        let taken: Vec<Piece> = (0..24).map(|_| pool.take_ripe(piece, 65536, 0, ripe, make).unwrap().0).collect();
+        assert_eq!(pool.blocks(), 3);
+        // Block 0 keeps one piece, block 1 six, block 2 three.
+        let mut kept = Vec::new();
+        for (i, p) in taken.into_iter().enumerate() {
+            let keep = match p.block {
+                0 => i % 8 == 0,
+                1 => i % 8 < 6,
+                _ => i % 8 < 3,
+            };
+            if keep {
+                kept.push(p);
+            } else {
+                pool.give(p, 0);
+            }
+        }
+        pool.rested(REST);
+        let rooms = |pool: &Pool<u64>| pool.blocks.iter().map(|b| b.as_ref().map_or(u64::MAX, |b| b.room / piece)).collect::<Vec<_>>();
+        assert_eq!(rooms(&pool), [7, 2, 5]);
+        // The fullest that has room: block 1 twice, then block 2; block 0,
+        // the first, gets nothing while they have room.
+        let blocks: Vec<usize> = (0..7).map(|_| pool.take_ripe(piece, 65536, REST, ripe, make).unwrap().0.block).collect();
+        assert_eq!(blocks, [1, 1, 2, 2, 2, 2, 2]);
+        assert_eq!(rooms(&pool), [7, 0, 0]);
+        // A piece too long for the fuller ones goes where it fits.
+        assert_eq!(pool.take_ripe(4 * piece, 65536, REST, ripe, make).unwrap().0.block, 0);
+        assert_eq!(made.get(), 3);
+        // A block with the bytes but no unbroken range for a piece is
+        // looked through once for it, until a piece comes free in it.
+        let mut holes: Pool<u64> = Pool::new(0);
+        let four: Vec<Piece> = (0..4).map(|_| holes.take_ripe(BLOCK / 4, 65536, 0, ripe, || Some(9)).unwrap().0).collect();
+        holes.give(four[0], 0);
+        holes.give(four[2], 0);
+        holes.rested(REST);
+        assert!(holes.take_ripe(BLOCK / 2, 65536, REST, Ripe { grow: Grow::No, ..ripe }, || None).is_none());
+        assert_eq!(holes.blocks[0].as_ref().unwrap().no_fit, Some((BLOCK / 2, 65536)));
+        holes.give(four[1], REST);
+        holes.rested(2 * REST);
+        assert_eq!(holes.blocks[0].as_ref().unwrap().no_fit, None);
+        assert_eq!(holes.take_ripe(BLOCK / 2, 65536, 2 * REST, Ripe { grow: Grow::No, ..ripe }, || None).unwrap().0.start, 0);
+        // From the first with room (off) the next piece goes to block 0.
+        for p in kept.iter().filter(|p| p.block == 1).take(1) {
+            pool.give(*p, REST);
+        }
+        pool.rested(2 * REST);
+        assert_eq!(rooms(&pool), [3, 1, 0]);
+        assert_eq!(pool.take(piece, 65536, 2 * REST, make).unwrap().0.block, 0);
+        assert_eq!(pool.take_ripe(piece, 65536, 2 * REST, ripe, make).unwrap().0.block, 1);
     }
 
     /// A pooled texture's piece comes back when its last reference goes, not
