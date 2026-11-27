@@ -554,6 +554,31 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
             Ok(program) => {
                 t.translated += 1;
                 t.instructions += program.blocks.iter().map(|b| b.insts.len()).sum::<usize>();
+                // `VICTORY_LIST_PS_CONTROL=1` with `--list`: a pixel program's
+                // `DB_SHADER_CONTROL` and whether it kills and writes views (the
+                // census of the programs early depth is for).
+                if t.list
+                    && std::env::var_os("VICTORY_LIST_PS_CONTROL").is_some_and(|v| v == "1")
+                    && let victory_shader::native::StageIo::Ps { db_shader_control: db, .. } = &p.io
+                {
+                    use victory_shader::gfx10::Fields;
+                    let insts = || program.blocks.iter().flat_map(|b| &b.insts);
+                    let writes_views = insts().any(|i| {
+                        matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
+                            && (i.name().contains("store") || i.name().contains("atomic"))
+                    });
+                    t.lines.push(format!(
+                        "{}  ps-control db={db:#07x} z_order={} kill_enable={} exec_on_hier_fail={} exec_on_noop={} alpha_to_mask_disable={} depth_before_shader={} exports={:#x} writes_views={writes_views}",
+                        example(),
+                        db >> 4 & 3,
+                        db >> 6 & 1,
+                        db >> 9 & 1,
+                        db >> 10 & 1,
+                        db >> 11 & 1,
+                        db >> 12 & 1,
+                        db & (0b111 | 1 << 8 | 1 << 7),
+                    ));
+                }
                 // Per-lane descriptors are traced on the per-lane form; its
                 // failure is listed after the resources' and I/O's.
                 let structured = structure::structure(&program);
