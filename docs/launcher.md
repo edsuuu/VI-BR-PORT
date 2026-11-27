@@ -1,0 +1,145 @@
+# The launcher
+
+A window to start the game with the fork's settings, and a set of command-line modes that do
+the same without a window. It is PowerShell and WPF, already on every Windows: nothing to
+install. It runs on Windows PowerShell 5.1 and on PowerShell 7.
+
+- **Double-click `launcher.cmd`** in the repository's folder: the window opens and no console
+  window stays open.
+- The first time, it asks for the executable of the game you dumped (a file picker). It is
+  saved and asked again only if the file is not there any more.
+- **Play** checks for `target\<build>\victory.exe` (it never builds it: when it is missing it
+  says which `cargo build` command makes it), prepares what has to be prepared, and starts the
+  game through `scripts\play.ps1`. The window hides while the game runs and comes back when it
+  exits.
+
+Nothing of the game is in the launcher or in this repository (docs/asset-policy.md): no name,
+logo or picture. The only page it ever opens is the fork's GitHub page, from the link at the
+bottom of the options panel; the version beside it is `v<workspace version> (<short commit>)`.
+
+## What Play does
+
+| Step | When | What runs |
+|---|---|---|
+| Compile | always | only a check that `target\<build>\victory.exe` is there |
+| Translate the shaders | `victory.exe` changed, or a switch the shader cache is keyed on changed (`VICTORY_RT_MISS`, which ray tracing turns off, and the others listed in `options.json`, taken from `crates/victory-gpu/src/shader_cache.rs`) | `victory.exe shaders <the game's folder> --jobs <threads>` |
+| Warm up the pipelines | after a run drew with pipelines not made ahead yet, or after the shaders were translated again (never before the first run: `warm --used` makes the pipelines earlier runs wrote down) | `victory.exe warm --used --jobs <threads>` |
+| Open the game | always | `scripts\play.ps1 -Exe <game> -Build <build> -Console <profile> [-RayTracing] -More @{...}` |
+
+What was done is kept in `prepared.json`, next to the saved settings, one entry per build
+(the SHA-256 of `victory.exe`, the hash of the translation switches, and when the shaders,
+the warm-up and the last run happened). Each step's output goes to `logs\<step>.log` in the
+same folder.
+
+## The options
+
+`scripts/launcher/options.json` describes every option: its id (stable: the MCP server takes
+it), kind, group, default and, for each value, the `play.ps1` parameters and the `VICTORY_*`
+switches it sets. An option marked "not on this version" has its code on another branch: it
+is shown disabled and never sent.
+
+| Id | Kind | Default | Values and what they set | On this version |
+|---|---|---|---|---|
+| `profile` | choice | `series-s` | `series-s`, `series-x`: `play.ps1 -Console` | yes |
+| `image` | choice | `native` | `native`: the title's own upscaler (`VICTORY_UPSCALER=6`, from `play.ps1`); `dlss`: `VICTORY_DLSS=1`, `VICTORY_UPSCALER` unset | `dlss` no |
+| `frame_generation` | toggle | off | `VICTORY_FRAMEGEN=1`; needs `image=dlss` (turning it on sets it; `image=native` turns it off) | no |
+| `reflex` | toggle | off | `VICTORY_REFLEX=on` | no |
+| `ray_tracing` | toggle | off | on: `play.ps1 -RayTracing` (`VICTORY_BVH_BUILDER=1`); off: `VICTORY_RT_MISS=1`, as `play.ps1` does | yes |
+| `light_day_night` | toggle | on | `VICTORY_AMBIENT_DAY=0.5:2`, `VICTORY_AMBIENT_CONTRAST=4:8`, `VICTORY_AMBIENT_CUT=3`, `VICTORY_AMBIENT_AIR_SOFT=1`, `VICTORY_AMBIENT_EDGE=4` | no (the ambient switches are not merged yet) |
+| `water_light` | toggle | on | off: `VICTORY_WATER_LIGHT=0` (read on cards of 32-lane waves) | yes |
+| `outdoor_brightness` | choice | `default` | `VICTORY_AMBIENT_OUTSIDE`: `default` 1:0.16, `darker` 1:0.08, `brighter` 1:0.25 | yes |
+| `thin_lists` | toggle | on | `VICTORY_THIN=1`, off `VICTORY_THIN=0` | yes |
+| `card_memory` | choice | `1024` | `512`, `1024`, `2048`: `VICTORY_MEMORY_CARD_MB` | yes |
+| `jobs` | choice | `20` | `8`, `12`, `20`: `--jobs` of the shader and warm-up steps | yes |
+| `build` | choice | `release` | `release`, `diag`: `play.ps1 -Build` (`target\release` or `target\diag`) | yes |
+| `capture_frames` | toggle | off | `VICTORY_CAPTURE=<settings folder>\captures`; needs `build=diag` (turning it on sets it; `build=release` turns it off) | yes |
+| `detailed_log` | toggle | off | `VICTORY_LOG=debug` (debug lines exist only in the diag build; the default filter is `info`) | yes |
+
+With every option at its default the run gets exactly the switches `scripts\play.ps1` sets
+with no parameter: `launcher.ps1 -Check` proves it by reading what `play.ps1` sets from the
+script itself and comparing. The launcher's build default is `release` (the build the
+README's benchmark is of; `play.ps1`'s own default is `diag`).
+
+There is no "start from" choice: nothing on this branch picks between the last save and a
+new game.
+
+## The saved settings
+
+`%APPDATA%\VI-BR-PORT\launcher.json` (`VICTORY_LAUNCHER_CONFIG=<file>` puts it elsewhere; the
+self-check uses its own). Every change, in the window or through the MCP server, is written at
+once, through a temporary file moved into place, as UTF-8 without BOM. The window and the MCP
+server share the file: the window reads it again when it changes on disk.
+
+```json
+{
+  "format": 1,
+  "options": { "ray_tracing": true, "thin_lists": true },
+  "game_exe": "D:\\dump\\<the game's executable>",
+  "language": "pt-BR"
+}
+```
+
+An option not in the file has its default; a value this version does not know is left in
+the file and the default is used. Keys the launcher does not know are kept. A file that does
+not read is set aside as `launcher.json.bad` and the defaults are used. `language` is `en` or
+`pt-BR` (`null`: Portuguese on a Portuguese Windows, English on any other).
+
+## Command-line modes
+
+```powershell
+scripts\launcher.ps1 -Check                  # the self-check (no window, nothing started)
+scripts\launcher.ps1 -Get                    # the saved settings, as JSON
+scripts\launcher.ps1 -Set ray_tracing=on     # one option (on/off, true/false, or a listed value)
+scripts\launcher.ps1 -Set game_exe=D:\dump\<executable>
+scripts\launcher.ps1 -Set language=en
+scripts\launcher.ps1 -Reset                  # every option back to its default
+scripts\launcher.ps1 -PrintEnv               # play.ps1's parameters, the switches, the steps and their command lines
+scripts\launcher.ps1 -Version                # v0.1.0 (<commit>)
+```
+
+`launcher.cmd` takes the same arguments (`launcher.cmd -Get`).
+
+## The MCP server
+
+`scripts\launcher-mcp.ps1` serves the launcher's options to an MCP client over stdio, with
+the same saved file as the window: an option turned off through it shows as off in an open
+window. Its tools list the options, read the settings, set an option, turn an on/off option
+on or off, reset to the defaults, return what Play would run (a dry run that starts nothing)
+and return the version. To register it with Claude Code:
+
+```powershell
+claude mcp add launcher -- powershell -NoProfile -ExecutionPolicy Bypass -File <repository>\scripts\launcher-mcp.ps1
+```
+
+## Files
+
+| File | What it holds |
+|---|---|
+| `launcher.cmd` | the double-click entry |
+| `scripts/launcher.ps1` | the entry script and its command-line modes |
+| `scripts/launcher-mcp.ps1` | the MCP server |
+| `scripts/launcher/options.json` | every option |
+| `scripts/launcher/tokens.json` | the design system: colours, type, sizes, radii, motion |
+| `scripts/launcher/lang/en.json`, `pt-BR.json` | every visible text |
+| `scripts/launcher/Launcher.ps1` | loads the parts below |
+| `scripts/launcher/Json.ps1` | JSON read and written the same on both PowerShells |
+| `scripts/launcher/Config.ps1` | the saved settings |
+| `scripts/launcher/Options.ps1` | options.json, setting an option, resolving a run |
+| `scripts/launcher/PlayScript.ps1` | what `scripts/play.ps1` sets, read from its syntax tree |
+| `scripts/launcher/Game.ps1` | the steps of Play and its dry run |
+| `scripts/launcher/Text.ps1`, `Version.ps1` | texts and the version |
+| `scripts/launcher/Theme.ps1`, `Window.ps1` | the window |
+| `scripts/launcher/Test-Launcher.ps1` | the self-check |
+
+## Em português
+
+Dê dois cliques em `launcher.cmd`: a janela abre sem deixar console aberto. Na primeira vez
+ela pede o executável do jogo que você extraiu e guarda. **Jogar** confere se há
+`target\<build>\victory.exe` (se não houver, mostra o comando `cargo build` que o faz),
+traduz os shaders e aquece os pipelines só quando precisa, e abre o jogo pelo
+`scripts\play.ps1`. As opções ficam salvas em `%APPDATA%\VI-BR-PORT\launcher.json` assim que
+mudam, pela janela ou pelo servidor MCP; o padrão de todas dá exatamente o que o `play.ps1`
+usa sem parâmetros (`scripts\launcher.ps1 -Check` confere). Opções cujo código está em outro
+branch (DLSS, quadros gerados, Reflex, luz de dia e de noite) aparecem desativadas e nunca são
+enviadas. Pela linha de comando: `-Get`, `-Set ray_tracing=on`, `-Reset`, `-PrintEnv`,
+`-Version`.
