@@ -484,7 +484,12 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
                     // (`VICTORY_WAVE_PAIRED_FOR`: the paired form for the programs it names, as a
                     // run has it)
                     let paired = victory_shader::emit::paired_names_any() && victory_shader::emit::paired_named(hash);
-                    match victory_shader::emit::with_paired_first(paired, || victory_shader::emit::translate(&bytes)) {
+                    // (`VICTORY_EARLY_DEPTH_FOR`: early depth for the programs it names, as a run has it)
+                    let early = victory_shader::emit::early_depth_names_any() && victory_shader::emit::early_depth_named(hash);
+                    let translated = victory_shader::emit::with_early_depth_named(early, || {
+                        victory_shader::emit::with_paired_first(paired, || victory_shader::emit::translate(&bytes))
+                    });
+                    match translated {
                         Ok(t) => {
                             if std::fs::write(into.join(format!("{hash}.dxil")), &t.dxil).is_ok() {
                                 done.fetch_add(1, Ordering::Relaxed);

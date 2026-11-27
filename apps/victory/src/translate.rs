@@ -530,7 +530,11 @@ fn translate(
     let before: Option<BTreeMap<String, usize>> = dump.as_ref().map(|_| t.failed.iter().map(|(k, v)| (k.clone(), v.0)).collect());
     // (`VICTORY_WAVE_PAIRED_FOR`: the paired form for the programs it names, as a run has it)
     let paired = emit::paired_names_any() && emit::paired_named(&hash);
-    emit::with_paired_first(paired, || translate_programs(&container, programs, &example, t, checks));
+    // (`VICTORY_EARLY_DEPTH_FOR`: early depth for the programs it names, as a run has it)
+    let early = emit::early_depth_names_any() && emit::early_depth_named(&hash);
+    emit::with_early_depth_named(early, || {
+        emit::with_paired_first(paired, || translate_programs(&container, programs, &example, t, checks))
+    });
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
             let was = before.get(reason).copied().unwrap_or(0);
