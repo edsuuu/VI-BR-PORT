@@ -31,10 +31,33 @@ function ConvertFrom-LauncherJsonText {
     return ConvertTo-LauncherData ($Text | ConvertFrom-Json)
 }
 
+# A file's text. A sharing violation or a file that is gone for a moment (another process
+# moving its new copy into place) is tried again for about a second before it counts.
+function Read-LauncherTextFile {
+    param([Parameter(Mandatory)][string]$Path)
+    for ($try = 1; ; $try++) {
+        try {
+            return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+        } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+            if ($try -ge 20) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
+}
+
 function Read-LauncherJson {
     param([Parameter(Mandatory)][string]$Path)
-    $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
-    return ConvertFrom-LauncherJsonText -Text $text
+    return ConvertFrom-LauncherJsonText -Text (Read-LauncherTextFile -Path $Path)
+}
+
+# The backup files a failed File.Replace may leave beside the file (<name>~RF<n>.TMP).
+function Remove-LauncherReplaceLeftovers {
+    param([Parameter(Mandatory)][string]$Path)
+    $dir = Split-Path -Parent $Path
+    if (-not $dir) { return }
+    $leaf = Split-Path -Leaf $Path
+    Get-ChildItem -LiteralPath $dir -Filter "$leaf~RF*.TMP" -Force -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
 }
 
 function ConvertTo-LauncherJsonText {
@@ -56,6 +79,7 @@ function Write-LauncherJson {
             else { [System.IO.File]::Move($temp, $Path) }
             return
         } catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+            Remove-LauncherReplaceLeftovers -Path $Path
             if ($try -ge 20) {
                 Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
                 throw

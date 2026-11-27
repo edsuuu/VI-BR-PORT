@@ -32,13 +32,20 @@ function New-LauncherConfig {
 # (Get-LauncherSettings does): a value this version does not know stays in the file.
 function Get-LauncherConfig {
     $path = Get-LauncherConfigPath
-    if (-not (Test-Path -LiteralPath $path)) { return New-LauncherConfig }
+    if (-not [System.IO.File]::Exists($path)) { return New-LauncherConfig }
+    # Reading can fail for a moment while another process saves (Read-LauncherTextFile tries
+    # again); an error that stays is thrown, never taken for a broken file.
     try {
-        $config = Read-LauncherJson -Path $path
-        if ($config -isnot [System.Collections.IDictionary]) { throw 'the settings file is not a JSON object' }
-    } catch {
+        $text = Read-LauncherTextFile -Path $path
+    } catch [System.IO.FileNotFoundException] {
+        return New-LauncherConfig
+    }
+    # Only text that is not a JSON object is a broken file.
+    $config = $null
+    try { $config = ConvertFrom-LauncherJsonText -Text $text } catch { $config = $null }
+    if ($config -isnot [System.Collections.IDictionary]) {
         $bad = "$path.bad"
-        Move-Item -LiteralPath $path -Destination $bad -Force
+        try { Move-Item -LiteralPath $path -Destination $bad -Force } catch { }
         $script:LauncherConfigSetAside = $bad
         return New-LauncherConfig
     }
