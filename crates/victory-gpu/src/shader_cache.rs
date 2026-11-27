@@ -99,6 +99,8 @@ fn build() -> [u8; 32] {
             // Opt-in Wave32 LDS hazard analysis and write-only compatibility switch.
             "VICTORY_LDS_ANALYZE",
             "VICTORY_LDS_WRITE_ONLY_OK",
+            // Whether pixel programs declare the console's early depth test.
+            "VICTORY_EARLY_DEPTH",
             // Whether the ray-tracing node test always misses.
             "VICTORY_RT_MISS",
         ] {
