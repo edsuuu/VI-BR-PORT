@@ -110,6 +110,18 @@ const FAULTS: usize = 128;
 const FAULTS_ALL: usize = 2048;
 /// Frames over which every page is looked at once.
 const SWEEP: usize = 128;
+/// Frames after an arena could not be had before another is asked for
+/// ([`arenas_fallback`]).
+const ARENA_AGAIN: u64 = 30;
+
+/// `VICTORY_ARENAS_FALLBACK=1` (off by default): an arena that cannot be had
+/// where shaders reach ([4 GiB, 2^37)) is made above it, and one that cannot
+/// be had at all is not asked for again for [`ARENA_AGAIN`] frames. Off, a
+/// failed arena is asked for again at the next dispatch, as before.
+fn arenas_fallback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ARENAS_FALLBACK").is_some_and(|v| v == "1"))
+}
 
 /// What a draw or dispatch does with title memory by address.
 #[derive(Clone, Copy, PartialEq)]
@@ -180,6 +192,8 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
+    /// No arena is asked for before this frame ([`Memory::another_or_wait`]).
+    no_arena_before: u64,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -208,6 +222,8 @@ struct Stats {
     /// Root views outside buffers made ready with a length the builder's
     /// calls gave ([`structure_extent`]), and with a guessed one.
     sized: [u64; 2],
+    /// Times an arena could not be had ([`arenas_fallback`]).
+    no_arena: u64,
 }
 
 // SAFETY: the mappings are of memory the struct owns; all access is under
@@ -258,6 +274,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            no_arena_before: 0,
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -395,11 +412,65 @@ impl Memory {
 
     /// Another arena's pages.
     fn another(&mut self) -> bool {
+        if arenas_fallback() {
+            return self.another_or_wait();
+        }
         let Some(at) = crate::upload::reserve(ARENA as usize) else {
             return false;
         };
         let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
             return false;
+        };
+        self.arenas.push((n, at));
+        // The lowest first.
+        self.free.extend((0..(ARENA / PAGE) as usize).rev().map(|i| (n, at + i * PAGE as usize)));
+        true
+    }
+
+    /// [`Memory::another`] with [`arenas_fallback`]: out of the shaders'
+    /// reach when their range is full, and after a failure not asked for
+    /// again for [`ARENA_AGAIN`] frames. Every builder dispatch comes through
+    /// here, a thousand and more a frame, and a search of the whole address
+    /// range that finds no room takes milliseconds under the mutex (the fork
+    /// this is ported from saw 5 to 18 s of every frame go there, until the
+    /// title's watchdog ended the run).
+    fn another_or_wait(&mut self) -> bool {
+        if self.frame < self.no_arena_before {
+            return false;
+        }
+        let failed = |m: &mut Memory, what: &'static str, error: u32| {
+            m.no_arena_before = m.frame.saturating_add(ARENA_AGAIN);
+            m.stats.no_arena += 1;
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                tracing::warn!(
+                    what,
+                    error,
+                    arenas = m.arenas.len(),
+                    pages = m.pages.len(),
+                    "title memory by address: another arena could not be had; pages without a place read zeros until one can"
+                );
+            }
+            false
+        };
+        // (Where shaders do not look for it: they get its copy's number.)
+        let Some(at) = crate::upload::reserve_out_of_reach(ARENA as usize) else {
+            return failed(self, "no address space for it", crate::upload::last_error());
+        };
+        if at >= 1 << 37 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!(
+                    at = format_args!("{at:#x}"),
+                    arenas = self.arenas.len(),
+                    "title memory by address: the shaders' address range is full; arenas are made above it"
+                )
+            });
+        }
+        let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
+            // (Its memory is of no use without its copy.)
+            crate::upload::release(at);
+            return failed(self, "no copy of it on the host", 0);
         };
         self.arenas.push((n, at));
         // The lowest first.
@@ -803,6 +874,13 @@ impl Memory {
                 s.sized[0] as f64 / frames,
                 s.sized[1] as f64 / frames,
                 EXTENTS.read().unwrap_or_else(|e| e.into_inner()).len()
+            );
+        }
+        if s.no_arena > 0 {
+            tracing::warn!(
+                times = s.no_arena,
+                arenas = self.arenas.len(),
+                "title memory by address: arenas that could not be had since the last line (VICTORY_ARENAS_FALLBACK)"
             );
         }
         self.stats.from = Some((now, self.frame));
