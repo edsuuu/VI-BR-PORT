@@ -47,7 +47,27 @@ pub(crate) fn listed(n: u64) -> bool {
     });
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let after = n.wrapping_sub(first);
-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+    named || asked(n) || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+}
+
+/// `VICTORY_CAPTURE_ON=<file>`: when that file appears it is removed, and the
+/// frame two after the one asked about then is listed: a script that walks
+/// the player somewhere asks for the frame there, whatever its number is in
+/// that run (the second frame on, so that all of it is recorded as listed).
+fn asked(n: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static FILE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    static ASKED: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LOOKED: AtomicU64 = AtomicU64::new(u64::MAX);
+    let Some(file) = FILE.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_ON").map(PathBuf::from)) else {
+        return false;
+    };
+    // Looked for once a frame number, not at every operation recorded.
+    if LOOKED.swap(n, Relaxed) != n && file.exists() && std::fs::remove_file(file).is_ok() {
+        ASKED.store(n + 2, Relaxed);
+        tracing::info!(frame = n + 2, "a frame asked for by the capture file");
+    }
+    ASKED.load(Relaxed) == n
 }
 
 /// With a capture folder, for the frames [`listed`]: `what` is added to
