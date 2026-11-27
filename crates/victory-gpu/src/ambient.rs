@@ -27,6 +27,10 @@
 //! - unset or `0`/`off`: the title's own output.
 //! - a number: that share of the estimate (1: all of it).
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
+//! - `constant:<level>:<share>`: the constant, or that share of the light
+//!   around (the slow mean of what is on screen) where that is more: by day
+//!   outdoors a constant fit for a night indoors leaves what the sun does
+//!   not reach black (the boat of the first open-world mission).
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
@@ -80,14 +84,19 @@ pub(crate) const AIR: (u8, u32) = (1, 32);
 enum Set {
     Off,
     Estimate(f32),
-    Constant(f32),
+    /// The level, and the share of the light around that takes its place
+    /// where that is more (0: none).
+    Constant(f32, f32),
 }
 
 fn parse(set: &str) -> Set {
     let set = set.trim();
     let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
     match set.strip_prefix("constant:") {
-        Some(level) => number(level).map_or(Set::Off, Set::Constant),
+        Some(rest) => {
+            let (level, share) = rest.split_once(':').unwrap_or((rest, ""));
+            number(level).map_or(Set::Off, |level| Set::Constant(level, number(share).unwrap_or(0.0)))
+        }
         None => number(set).map_or(Set::Off, Set::Estimate),
     }
 }
@@ -137,7 +146,7 @@ const SOURCE: &str = r#"
 cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
-    float follow; float most; float air; float unused;
+    float follow; float most; float air; float around;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -294,7 +303,12 @@ void raise(uint3 at : SV_DispatchThreadID) {
     }
     float3 found;
     if (constant > 0.0) {
-        found = float3(1.0, 0.98, 0.94) * constant * open;
+        found = float3(1.0, 0.98, 0.94) * constant;
+        // A share of the light around, where that is more than the constant.
+        float4 mean_now = cells[CELLS];
+        float3 part = around * mean_now.rgb;
+        if (around > 0.0 && mean_now.a > 0.0 && dot(part, LUMA) > dot(found, LUMA)) found = part;
+        found *= open;
         light[p] = pack(found);
         return;
     }
@@ -429,10 +443,10 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let Some(pass) = pass() else {
         return false;
     };
-    let (level, constant) = match set() {
+    let (level, constant, around) = match set() {
         Set::Off => return false,
-        Set::Estimate(level) => (level, 0.0f32),
-        Set::Constant(level) => (0.0, level),
+        Set::Estimate(level) => (level, 0.0f32, 0.0f32),
+        Set::Constant(level, around) => (0.0, level, around),
     };
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
@@ -465,6 +479,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    words[11] = around.to_bits();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -512,7 +527,9 @@ mod tests {
         assert_eq!(parse("off"), Set::Off);
         assert_eq!(parse("0"), Set::Off);
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
-        assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
+        assert_eq!(parse("constant:0.3"), Set::Constant(0.3, 0.0));
+        assert_eq!(parse("constant:0.1:0.5"), Set::Constant(0.1, 0.5));
+        assert_eq!(parse("constant:0.1:x"), Set::Constant(0.1, 0.0));
         assert_eq!(parse("constant:nan"), Set::Off);
     }
 
