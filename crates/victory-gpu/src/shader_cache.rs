@@ -137,7 +137,11 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| {
-        victory_shader::emit::with_wide_first(wide_first(c), || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+        let paired = paired_first(c);
+        victory_shader::emit::with_paired_first(paired, || {
+            victory_shader::emit::with_wide_first(wide_first(c), || victory_shader::emit::translate(c))
+        })
+        .map_err(|e| e.to_string())
     };
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
@@ -163,6 +167,13 @@ fn wide_first(container: &[u8]) -> bool {
     }
     let hash = blake3::hash(container).to_hex();
     named.iter().any(|h| hash.starts_with(h.as_str()))
+}
+
+/// Whether `container` is one of the programs named in `VICTORY_WAVE_PAIRED_FOR` (as in
+/// `VICTORY_WAVE_WIDE_FOR`): those may take the paired form
+/// (`victory_shader::emit::with_paired_first`). Off unless named.
+fn paired_first(container: &[u8]) -> bool {
+    victory_shader::emit::paired_names_any() && victory_shader::emit::paired_named(&blake3::hash(container).to_hex())
 }
 
 /// The cache entry's converter: the build and the container in, the
