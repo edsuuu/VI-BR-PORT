@@ -10409,7 +10409,7 @@ impl Meter {
                     crate::resource::block_terms(host().and_then(|h| h.video_memory()))
             {
                 let [n, free, q0, h0, q1, h1, q2, h2, q3, h3, given] = crate::pool::fill();
-                let [made, not_made, past] = crate::pool::BLOCKS.each_ref().map(|b| b.load(Ordering::Relaxed));
+                let [made, not_made, past, after_wait] = crate::pool::BLOCKS.each_ref().map(|b| b.load(Ordering::Relaxed));
                 let no_place = crate::draw::HEAP_TEXTURES_NO_PLACE[0].load(Ordering::Relaxed);
                 let no_place_now = crate::draw::HEAP_TEXTURES_NO_PLACE[1].swap(0, Ordering::Relaxed);
                 let [card_n, card_b, pc_n, pc_b] = crate::shadow::by_address_counts();
@@ -10419,6 +10419,7 @@ impl Meter {
                      use + 64 MB + {buffers} MB kept for card copies of title buffers + {targets} MB kept for render targets = {} \
                      MB against the line of {line} MB: {}; the queue weighs {weighed} MB; since the start {made} blocks made, \
                      {not_made} blocks not made for want of room, {past} made without room for textures that could not wait, \
+                     {after_wait} made after waiting (for textures that waited {} ms, VICTORY_POOL_WAIT_MS; 0: never), \
                      {given} given back; textures waiting for a place: {no_place_now} looks since the last line, {no_place} since \
                      the start; title memory by address made since the start: {card_n} pieces ({} MB) in the card's own memory, \
                      {pc_n} ({} MB) in the PC's",
@@ -10431,6 +10432,7 @@ impl Meter {
                     h3 >> 20,
                     used + 64 + buffers + targets,
                     if block_room != 0 { "one may be made" } else { "none is made, textures take the free pieces" },
+                    crate::pool::wait_bound(),
                     card_b >> 20,
                     pc_b >> 20,
                 );

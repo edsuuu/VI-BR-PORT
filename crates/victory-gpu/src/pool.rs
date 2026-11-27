@@ -86,8 +86,9 @@ pub(crate) fn on() -> bool {
 /// the slot shows what it showed), and the queue and the sweep then go by the
 /// free part of the blocks (`crate::resource::weighed`). A texture that
 /// cannot wait (a draw reads it through a table now, or a bake) still gets
-/// its block ([`PAST`]). Nothing is moved, and nothing is given back that was
-/// not before.
+/// its block ([`PAST`]), and so does one that has waited past
+/// [`wait_bound`] ([`AFTER_WAIT`]). Nothing is moved, and nothing is given
+/// back that was not before.
 pub(crate) fn gate() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_POOL_GATE").is_some_and(|v| v == "1"))
@@ -129,19 +130,116 @@ enum Grow {
     /// The card has room (or the gate is off): as before, and blocks ahead
     /// too.
     Yes,
-    /// It has none, and the texture cannot wait: a block for it, none ahead.
+    /// It has none, and the texture cannot wait, or has waited past
+    /// [`wait_bound`]: a block for it, none ahead.
     Must,
     /// It has none, and the texture can wait ([`waiting`]): no block.
     No,
 }
 
+/// What [`texture`] may do for a piece that fits no block, with `room` for
+/// a new block on the card ([`may_grow`]) or not: by whether the texture
+/// this thread makes can wait ([`waiting`]) and has not waited too long
+/// ([`Asking`]).
+fn grow_now(room: bool) -> Grow {
+    match (room, CAN_WAIT.get() && !OVERDUE.get()) {
+        (true, _) => Grow::Yes,
+        (false, false) => Grow::Must,
+        (false, true) => Grow::No,
+    }
+}
+
 /// Since the start: blocks of textures made; times a block was not made for
 /// want of room on the card (a texture then waited); blocks made without
-/// that room for a texture that could not wait.
-pub(crate) static BLOCKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// that room for a texture that could not wait; and blocks made without it
+/// for a texture that had waited past [`wait_bound`].
+pub(crate) static BLOCKS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 const MADE: usize = 0;
 const NOT_MADE: usize = 1;
 const PAST: usize = 2;
+const AFTER_WAIT: usize = 3;
+
+/// How long a texture waits for a place at most, in ms, before it is given
+/// a block whatever the card's room (`VICTORY_POOL_WAIT_MS`, 3000; 0: it
+/// waits for ever). Only with [`gate`].
+///
+/// The sweep lets textures go while the blocks have less than its reserve
+/// free (`crate::resource::blocks_full`), but it never looks whether that
+/// free room is unbroken: with the free bytes of the blocks broken into
+/// holes smaller than a texture, the reserve holds and that texture finds
+/// no place for ever, and its slot goes on showing what it showed. The
+/// bound is per texture ([`Wait`]), counted from the first time it was
+/// turned down, and starts again once it gets its place.
+pub(crate) fn wait_bound() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_POOL_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3000))
+}
+
+/// A texture's wait for a place in a block ([`gate`]): when it was first
+/// turned down (ms, `crate::host::now_ms`), or 0 while it is not waiting.
+pub(crate) struct Wait(AtomicU64);
+
+impl Wait {
+    pub(crate) const fn new() -> Wait {
+        Wait(AtomicU64::new(0))
+    }
+
+    /// Whether it has waited `bound` ms or longer at `now` (never with a
+    /// bound of 0).
+    fn overdue(&self, now: u64, bound: u64) -> bool {
+        let since = self.0.load(Ordering::Relaxed);
+        bound != 0 && since != 0 && now.saturating_sub(since) >= bound
+    }
+
+    /// It was turned down at `now` (`waited`), or it was not: then a wait
+    /// there was is over.
+    fn note(&self, now: u64, waited: bool) {
+        if !waited {
+            self.0.store(0, Ordering::Relaxed);
+        } else if self.0.load(Ordering::Relaxed) == 0 {
+            self.0.store(now.max(1), Ordering::Relaxed);
+        }
+    }
+}
+
+/// The making of a host texture whose wait is `wait`, from [`Asking::new`]
+/// to [`Asking::made`]: within it, a texture that can wait ([`waiting`])
+/// and has waited past [`wait_bound`] asks as one that cannot
+/// ([`Grow::Must`]). With [`gate`] off it does nothing.
+pub(crate) struct Asking<'a> {
+    wait: &'a Wait,
+    /// When it is asked (ms), with [`gate`] on.
+    now: Option<u64>,
+    was: bool,
+}
+
+impl<'a> Asking<'a> {
+    pub(crate) fn new(wait: &'a Wait) -> Asking<'a> {
+        if !gate() {
+            return Asking { wait, now: None, was: OVERDUE.get() };
+        }
+        Asking::at(wait, now(), wait_bound())
+    }
+
+    fn at(wait: &'a Wait, now: u64, bound: u64) -> Asking<'a> {
+        let overdue = CAN_WAIT.get() && wait.overdue(now, bound);
+        Asking { wait, now: Some(now), was: OVERDUE.replace(overdue) }
+    }
+
+    /// The texture was made (`made`) or not: if not for want of a place
+    /// ([`waits`]) its wait goes on, else it is over.
+    pub(crate) fn made(self, made: bool) {
+        if let Some(now) = self.now {
+            self.wait.note(now, !made && WAITED.get());
+        }
+    }
+}
+
+impl Drop for Asking<'_> {
+    fn drop(&mut self) {
+        OVERDUE.set(self.was);
+    }
+}
 
 /// Whether the card had no room for a new block when last asked
 /// (`crate::resource::block_room`): the free pieces of the blocks are then
@@ -183,6 +281,9 @@ thread_local! {
     /// ([`waiting`]), and the last one asked for did ([`waits`]).
     static CAN_WAIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static WAITED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The texture being made on this thread has waited past
+    /// [`wait_bound`] ([`Asking`]). (Read only while [`CAN_WAIT`] is set.)
+    static OVERDUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Runs `make`, which may make a host texture that can wait: if no block
@@ -714,11 +815,8 @@ pub(crate) unsafe fn texture(
     // Whether a block may be made for it if it fits none ([`gate`]).
     WAITED.set(false);
     let mut ripe = Ripe::now();
-    ripe.grow = match (may_grow(), CAN_WAIT.get()) {
-        (true, _) => Grow::Yes,
-        (false, false) => Grow::Must,
-        (false, true) => Grow::No,
-    };
+    ripe.grow = grow_now(may_grow());
+    let overdue = OVERDUE.get();
     let taken = lock(&TEXTURES).take_ripe(info.SizeInBytes, info.Alignment.max(1), now(), ripe, || {
         let desc = D3D12_HEAP_DESC {
             SizeInBytes: BLOCK,
@@ -739,7 +837,16 @@ pub(crate) unsafe fn texture(
         }
         if heap.is_some() {
             BLOCKS[MADE].fetch_add(1, Ordering::Relaxed);
-            if ripe.grow == Grow::Must {
+            if ripe.grow == Grow::Must && overdue && CAN_WAIT.get() {
+                // A texture that waited past the bound ([`wait_bound`]).
+                let n = BLOCKS[AFTER_WAIT].fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_power_of_two() {
+                    tracing::info!(
+                        "blocks of textures made without room on the card, for textures that waited {} ms for a place: {n}",
+                        wait_bound()
+                    );
+                }
+            } else if ripe.grow == Grow::Must {
                 let n = BLOCKS[PAST].fetch_add(1, Ordering::Relaxed) + 1;
                 if n.is_power_of_two() {
                     tracing::info!(
@@ -983,6 +1090,98 @@ mod tests {
         assert!(pool.take_ripe(BLOCK / 4, 65536, REST - 1, ripe, || panic!("no block without room")).is_none());
         let (p, _, again) = pool.take_ripe(BLOCK / 4, 65536, REST, ripe, || panic!("no block without room")).unwrap();
         assert_eq!((p.block, p.start, again), (pieces[5].block, pieces[5].start, true));
+    }
+
+    /// A block whose free bytes are two holes of a quarter block, apart.
+    fn holes() -> Pool<u64> {
+        let mut pool: Pool<u64> = Pool::new(0);
+        let four: Vec<Piece> = (0..4).map(|_| pool.take(BLOCK / 4, 65536, 0, || Some(1)).unwrap().0).collect();
+        pool.give(four[0], 0);
+        pool.give(four[2], 0);
+        pool.rested(REST);
+        pool
+    }
+
+    /// One asking, at `now`, for a piece of `len` bytes by a texture that
+    /// can wait and whose wait is `wait`, while the card has no room for a
+    /// new block: as [`texture`] asks, with `made` counting the blocks made.
+    fn ask(pool: &mut Pool<u64>, wait: &Wait, now: u64, bound: u64, len: u64, made: &std::cell::Cell<u64>) -> Option<Piece> {
+        waiting(|| {
+            let asking = Asking::at(wait, now, bound);
+            let grow = grow_now(false);
+            let make = || {
+                made.set(made.get() + 1);
+                Some(100 + made.get())
+            };
+            let got = pool.take_ripe(len, 65536, now, Ripe { grow, ..Ripe::ALL }, make).map(|(p, _, _)| p);
+            if got.is_none() && grow == Grow::No {
+                WAITED.set(true);
+            }
+            asking.made(got.is_some());
+            got
+        })
+        .0
+    }
+
+    /// A texture larger than every hole waits while the card has no room,
+    /// and gets a block once it has waited the bound, not before; its wait
+    /// then starts again from nothing.
+    #[test]
+    fn a_texture_larger_than_every_hole_gets_a_block_after_the_bound() {
+        let mut pool = holes();
+        let made = std::cell::Cell::new(0);
+        let wait = Wait::new();
+        let half = BLOCK / 2;
+        // First turned down at 10 s: the bound counts from there.
+        for now in [10_000, 11_000, 12_000, 12_999] {
+            assert!(ask(&mut pool, &wait, now, 3000, half, &made).is_none(), "{now}");
+            assert_eq!(made.get(), 0);
+        }
+        assert_eq!(wait.0.load(Ordering::Relaxed), 10_000);
+        let p = ask(&mut pool, &wait, 13_000, 3000, half, &made).unwrap();
+        assert_eq!((p.block, made.get()), (1, 1));
+        assert_eq!(wait.0.load(Ordering::Relaxed), 0);
+        // Not overdue on its next wait until the bound has passed again.
+        wait.note(20_000, true);
+        assert!(!wait.overdue(22_999, 3000));
+        assert!(wait.overdue(23_000, 3000));
+        // Outside a texture that can wait the bound changes nothing.
+        let asking = Asking::at(&wait, 30_000, 3000);
+        assert_eq!(grow_now(false), Grow::Must);
+        assert!(!OVERDUE.get());
+        drop(asking);
+    }
+
+    /// With a bound of 0 such a texture waits for ever, as without one.
+    #[test]
+    fn with_a_bound_of_0_a_texture_waits_for_ever() {
+        let mut pool = holes();
+        let made = std::cell::Cell::new(0);
+        let wait = Wait::new();
+        for now in (10_000..10_000_000).step_by(250_000) {
+            assert!(ask(&mut pool, &wait, now, 0, BLOCK / 2, &made).is_none());
+        }
+        assert_eq!((made.get(), pool.blocks()), (0, 1));
+        assert_eq!(wait.0.load(Ordering::Relaxed), 10_000);
+    }
+
+    /// A texture that fits a hole takes it, even past the bound: it never
+    /// makes a block, and it does not start a wait.
+    #[test]
+    fn a_texture_that_fits_a_hole_never_forces_a_block() {
+        let mut pool = holes();
+        let made = std::cell::Cell::new(0);
+        // Long past the bound.
+        let old = Wait::new();
+        old.note(1, true);
+        let p = ask(&mut pool, &old, 100_000, 3000, BLOCK / 4, &made).unwrap();
+        assert_eq!((p.block, p.start, made.get()), (0, 0, 0));
+        assert_eq!(old.0.load(Ordering::Relaxed), 0);
+        let fresh = Wait::new();
+        let p = ask(&mut pool, &fresh, 100_000, 3000, BLOCK / 4, &made).unwrap();
+        assert_eq!((p.block, p.start, made.get()), (0, BLOCK / 2, 0));
+        assert_eq!(fresh.0.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.blocks(), 1);
     }
 
     /// A piece is cut from the fullest block that has room for it, so the

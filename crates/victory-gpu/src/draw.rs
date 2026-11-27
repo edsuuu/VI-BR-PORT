@@ -2914,7 +2914,10 @@ impl State {
             // the slot waits as one whose memory is not there yet does: it
             // shows what it showed, and is looked at again after 1, 2, 4, ...
             // frames, at most about four seconds. (A bake cannot wait, nor a
-            // texture draws read through a table now: those get their block.)
+            // texture draws read through a table now: those get their block.
+            // Nor does a texture wait longer than `VICTORY_POOL_WAIT_MS`,
+            // 3000 by default, from the first time it was turned down: then
+            // it gets its block too, `crate::pool::wait_bound`.)
             if room && !baking && !source && crate::pool::full() {
                 let view = heap.handle(index).and_then(crate::descriptor::view);
                 let wanted = view.as_ref().and_then(crate::descriptor::host::placed_texture).or(view);

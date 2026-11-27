@@ -1230,6 +1230,9 @@ struct Hosted {
     wanted: std::sync::atomic::AtomicU32,
     /// The next host copy takes the place of one with fewer levels.
     grown: std::sync::atomic::AtomicBool,
+    /// Since when its host copy waits for a place in a block
+    /// (`crate::pool::gate`).
+    wait: crate::pool::Wait,
 }
 
 /// Whether a texture the title places in memory is read, kept and uploaded
@@ -1548,6 +1551,9 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         // view of it starts below level 0. Every other texture, and this
         // one if the card will not have it so, is made as before.
         const TEXTURE_2D: u32 = 3;
+        // A texture that waited for a place in a block past the bound is
+        // given one now (`crate::pool::wait_bound`, with the gate).
+        let asking = crate::pool::Asking::new(&r.host.wait);
         let mut tiled = None;
         let mut texture = None;
         let shape_fits = fills(&r.desc)
@@ -1593,6 +1599,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             Some(texture) => Some(texture),
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
         };
+        asking.made(texture.is_some());
         let Some(texture) = texture else {
             // (Not one that only waits for a place in a block,
             // `crate::pool::waiting`: it is asked for again.)
@@ -2971,6 +2978,7 @@ fn hand_out_resource(
             placed: std::sync::atomic::AtomicBool::new(false),
             wanted: std::sync::atomic::AtomicU32::new(u32::MAX),
             grown: std::sync::atomic::AtomicBool::new(false),
+            wait: crate::pool::Wait::new(),
         },
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
