@@ -303,16 +303,26 @@ struct Tuned {
 
 /// A file's text as [`tuned`] takes it, and the names in it it does not
 /// know (said in the log).
+///
+/// A line without `=` is VICTORY_AMBIENT's value only when it is the file's
+/// only line (the fork's one-line file). Among other lines it is a mistyped
+/// one (`VICTORY_AMBIENT_AIR 0.8`): it is listed as unknown and changes
+/// nothing, so it neither turns the stand-in off nor overrides a good
+/// VICTORY_AMBIENT line.
 fn parse_tuned(text: &str) -> (Tuned, Vec<String>) {
     let mut t = Tuned::default();
     let mut unknown = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
+    let lines: Vec<&str> =
+        text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).collect();
+    let alone = lines.len() == 1;
+    for line in lines {
         let (name, value) = match line.split_once('=') {
             Some((name, value)) => (name.trim(), value.trim()),
-            None => ("VICTORY_AMBIENT", line),
+            None if alone => ("VICTORY_AMBIENT", line),
+            None => {
+                unknown.push(line.to_owned());
+                continue;
+            }
         };
         match name {
             "VICTORY_AMBIENT" => t.set = Some(parse(value)),
@@ -1769,11 +1779,20 @@ mod tests {
         assert_eq!((t.shade, t.cells, t.lamps), (None, None, None));
         assert_eq!(unknown, ["VICTORY_AMBIENT_FOG"]);
         // A line with nothing after `=` sets the switch unset; a line
-        // without `=` is VICTORY_AMBIENT's (the fork's one-line file).
+        // without `=` alone in the file is VICTORY_AMBIENT's (the fork's
+        // one-line file).
         let (t, _) = parse_tuned("VICTORY_AMBIENT_AIR=\nVICTORY_AMBIENT_CELLS=full\nVICTORY_AMBIENT_SHADE=0.5,1\n");
         assert_eq!((t.air, t.cells, t.shade, t.set), (Some(0.0), Some(true), Some([0.5, 1.0]), None));
         assert_eq!(parse_tuned("  off \n").0.set, Some(Set::Off));
         assert_eq!(parse_tuned("1.5").0.set, Some(Set::Estimate(1.5, 0.0)));
+        assert_eq!(parse_tuned("# the fork's file\n  1.5\n").0.set, Some(Set::Estimate(1.5, 0.0)));
+        // Among other lines, a line without `=` is a mistyped one: listed,
+        // and it neither turns the stand-in off nor overrides the good line.
+        for typo in ["VICTORY_AMBIENT_AIR 0.8", "VICTORY_AMBIENT_AIR:0.8", "off"] {
+            let (t, unknown) = parse_tuned(&format!("VICTORY_AMBIENT=constant:0.1\n{typo}\n"));
+            assert_eq!((t.set, t.air), (Some(Set::Constant(0.1, 0.0)), None), "{typo}");
+            assert_eq!(unknown, [typo]);
+        }
         assert_eq!(parse_tuned("VICTORY_AMBIENT_LAMPS=40").0.lamps, Some(40.0));
         assert_eq!(parse_tuned(""), (Tuned::default(), Vec::<String>::new()));
         // Every switch it lists is one it reads.
