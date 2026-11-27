@@ -170,6 +170,14 @@ pub(crate) fn count(sources: &Sources, past: &PastLine) -> u64 {
     n
 }
 
+/// Whether a pass that served a bake draw's sources alone keeps the mark of
+/// the last full pass (`BAKE_SERVED` of `crate::draw`: the queue's writes
+/// then, plus one; 0, none served all): when the first of the writes that made
+/// the sources due is the one right after it, nothing else came between.
+pub(crate) fn keeps_served(served: u64, first_write: Option<u64>) -> bool {
+    served != 0 && first_write == Some(served)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,5 +241,16 @@ mod tests {
         assert_eq!(sources.missing(), 0);
         let sources = Sources { refused: 1, not_reached: 2, ..sources };
         assert_eq!(sources.missing(), 3);
+    }
+
+    #[test]
+    fn a_pass_of_the_sources_alone_keeps_the_mark_when_nothing_else_came() {
+        // The last full pass ended with the queue at 41 writes: mark 42.
+        assert!(keeps_served(42, Some(42)));
+        // Something was written between (the sources' first write is 43).
+        assert!(!keeps_served(42, Some(43)));
+        // No full pass served all, or no sources.
+        assert!(!keeps_served(0, Some(0)));
+        assert!(!keeps_served(42, None));
     }
 }
