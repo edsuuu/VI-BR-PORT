@@ -4068,7 +4068,7 @@ impl State {
                         // the draw runs, in the queue's order
                         // (`VICTORY_DIRECT_CONSTANTS=1`).
                         if let Some((buffer, gpu)) = direct_constant(list, address, size) {
-                            host.constant_at(index, &buffer, gpu, size);
+                            host.constant_at(index, &buffer, gpu, size, true);
                             continue;
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
@@ -4077,7 +4077,7 @@ impl State {
                         };
                         let slot = (std::ptr::from_ref(heap) as usize, index);
                         list.defer_constants(to, address as *const u8, size as usize, slot);
-                        host.constant_at(index, &buffer, gpu, size);
+                        host.constant_at(index, &buffer, gpu, size, true);
                     }
                     Some(view) => {
                         match halved(self, slot, k * 8) {
