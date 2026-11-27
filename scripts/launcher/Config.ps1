@@ -61,13 +61,15 @@ function Set-LauncherSetting {
     if ($Name -notin 'game_exe', 'language') {
         throw (Get-LauncherText -Key 'error.unknown_setting' -Arguments @($Name))
     }
-    if ($Value -eq '') { $Value = $null }
-    if ($Name -eq 'language' -and $null -ne $Value -and $Value -notin (Get-LauncherLanguages)) {
-        throw (Get-LauncherText -Key 'error.bad_value' -Arguments @($Name, $Value, ((Get-LauncherLanguages) -join ', ')))
+    # (Not $Value itself: a [string] parameter turns $null back into ''.)
+    $saved = $null
+    if (-not [string]::IsNullOrWhiteSpace($Value)) { $saved = $Value.Trim() }
+    if ($Name -eq 'language' -and $null -ne $saved -and $saved -notin (Get-LauncherLanguages)) {
+        throw (Get-LauncherText -Key 'error.bad_value' -Arguments @($Name, $saved, ((Get-LauncherLanguages) -join ', ')))
     }
-    if ($Name -eq 'game_exe' -and $null -ne $Value) { $Value = [System.IO.Path]::GetFullPath($Value) }
+    if ($Name -eq 'game_exe' -and $null -ne $saved) { $saved = [System.IO.Path]::GetFullPath($saved) }
     $config = Get-LauncherConfig
-    $config[$Name] = $Value
+    $config[$Name] = $saved
     Save-LauncherConfig -Config $config
     return Get-LauncherSettings -Config $config
 }
