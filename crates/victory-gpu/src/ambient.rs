@@ -44,6 +44,7 @@
 //! `VICTORY_AMBIENT_DAY=<from>:<to>` gives outside rooms back to the title by
 //! day ([`day`]). `VICTORY_AMBIENT_CONTRAST=<ratio>[:<most gain>]` raises a
 //! dark bulk under a few bright lights outside rooms ([`contrast`]).
+//! `VICTORY_AMBIENT_CUT=<factor>` follows a cut at once ([`cut`]).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -411,6 +412,34 @@ fn contrast_step(log_gain: f32, mean: f32, bulk: f32, [ratio, most]: [f32; 2], o
     (log_gain + 0.2 * err * outside_share.clamp(0.0, 1.0)).clamp(0.0, most.max(1.0).ln())
 }
 
+/// `VICTORY_AMBIENT_CUT=<factor>`: when a frame's log-average of what visible
+/// surfaces send out is more than `<factor>` times the slow one, or under it
+/// by as much (a cut to another scene), the slow measures (the mean, the
+/// log-averages, the rooms' measures and share) start over from that frame;
+/// the rooms' too when half the screen goes from street to room at once.
+/// The contrast gain then goes the whole way at once. Unset: they follow 4% a
+/// frame, as before.
+///
+/// Why: at 4% a frame (20 frames a second) a cut took 3-4 s to be followed:
+/// the cutscene after the boat save showed its first room 5-10 s with the
+/// rooms' share still rising (0.16 then 0.92, run barco-ab-agua0), and a
+/// room is raised by the gain of the last room seen, minutes before.
+fn cut() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| parse_cut(&std::env::var("VICTORY_AMBIENT_CUT").unwrap_or_default()))
+}
+
+/// The factor of `VICTORY_AMBIENT_CUT` as a distance in the log (0: off).
+fn parse_cut(set: &str) -> f32 {
+    set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 1.0).map_or(0.0, f32::ln)
+}
+
+/// Whether a frame's log-average `now` is a cut from the slow `was` (both in
+/// the log), as the mean pass tells it.
+fn is_cut(was: f32, now: f32, cut: f32) -> bool {
+    cut > 0.0 && (now - was).abs() > cut
+}
+
 /// The word `tint`: the air's colour goes 60% of the way (times how much the
 /// key raises the room: none at a gain of 1, all from 2) to that of the light
 /// around. Its own switch word, since it changes colours, not levels.
@@ -454,7 +483,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=29, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
+#define RS "RootConstants(num32BitConstants=30, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -491,6 +520,10 @@ cbuffer Set : register(b0) {
     // log-average before the stand-in outside rooms is raised, and by how
     // much at most (0: never).
     float contrast; float contrast_most;
+    // (VICTORY_AMBIENT_CUT) How far, in the log, a frame's log-average is
+    // from the slow one for the slow measures to start over from it (0:
+    // never).
+    float cut;
 };
 Texture2D<float> depth : register(t0);
 // The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
@@ -591,17 +624,24 @@ void mean() {
     }
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    float4 geo_was = cells[GEO];
+    float geo_now = logs / CELLS;
+    // (VICTORY_AMBIENT_CUT) A cut to another scene: the bulk's log-average
+    // jumps by more than `cut` in the log. The slow measures then start over
+    // from this frame (a 4% step a frame took 3-4 s to follow a cut, the
+    // cutscene's first shots lit by the scene before); z of the log-average
+    // tells the rooms' measure of the resolve that follows.
+    bool cut_now = cut > 0.0 && geo_was.a > 0.0 && abs(geo_now - geo_was.y) > cut;
+    float f = cut_now ? 1.0 : follow;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, f) : now, 1.0);
     // The log-average (geometric mean) of the cells' luminance: it follows
     // the bulk of the picture, not a few windows and tubes (as the title's
     // own meter, a histogram, does), followed slowly in the log.
-    float4 geo_was = cells[GEO];
-    float geo_now = logs / CELLS;
-    float geo_log = geo_was.a > 0.0 ? lerp(geo_was.y, geo_now, follow) : geo_now;
-    cells[GEO] = float4(max(exp(geo_log) - 1e-3, 0.0), geo_log, 0.0, 1.0);
+    float geo_log = geo_was.a > 0.0 ? lerp(geo_was.y, geo_now, f) : geo_now;
+    cells[GEO] = float4(max(exp(geo_log) - 1e-3, 0.0), geo_log, cut_now ? 1.0 : 0.0, 1.0);
     float4 rgb_was = cells[GEO_RGB];
     float3 rgb_now = logs_rgb / CELLS;
-    cells[GEO_RGB] = float4(rgb_was.a > 0.0 ? lerp(rgb_was.rgb, rgb_now, follow) : rgb_now, 1.0);
+    cells[GEO_RGB] = float4(rgb_was.a > 0.0 ? lerp(rgb_was.rgb, rgb_now, f) : rgb_now, 1.0);
     // (VICTORY_AMBIENT_CONTRAST) The gain outside rooms follows, in the log
     // and a fifth of the way a frame, the ratio of this frame's mean to
     // `contrast` times its bulk's log-average: up while a few bright lights
@@ -615,7 +655,8 @@ void mean() {
         float bulk = max(exp(geo_now) - 1e-3, 1e-5);
         float err = log(max(dot(now, LUMA), 1e-6) / (contrast * bulk));
         float outside_share = cells[INSIDE_MEAN].y > 0.0 ? 1.0 - saturate(cells[INSIDE].z) : 1.0;
-        g = clamp(g + 0.2 * err * outside_share, 0.0, log(max(contrast_most, 1.0)));
+        // (At a cut, the whole way at once.)
+        g = clamp(g + (cut_now ? 1.0 : 0.2) * err * outside_share, 0.0, log(max(contrast_most, 1.0)));
         cells[CONTRAST] = float4(exp(g), g, err, 1.0);
     }
 }
@@ -648,12 +689,18 @@ void inside_share() {
     float4 was = cells[INSIDE];
     float4 mean_was = cells[INSIDE_MEAN];
     float share_now = n / float(CELLS);
-    float share = was.a > 0.0 ? lerp(was.z, share_now, follow) : share_now;
+    // (VICTORY_AMBIENT_CUT) A cut the mean pass saw, or one from the street
+    // into a room (or out of it): half the screen changes sides at once.
+    // The rooms' measures start over from this frame; they would otherwise
+    // begin from the last room's, seen minutes before.
+    float f = follow;
+    if (cut > 0.0 && (cells[GEO].z > 0.0 || (was.a > 0.0 && abs(share_now - was.z) > 0.5))) f = 1.0;
+    float share = was.a > 0.0 ? lerp(was.z, share_now, f) : share_now;
     float geo_log = was.y;
     float mean_luma = mean_was.x;
     if (n > 0) {
-        geo_log = was.a > 0.0 ? lerp(was.y, logs / n, follow) : logs / n;
-        mean_luma = was.a > 0.0 ? lerp(mean_was.x, sum / n, follow) : sum / n;
+        geo_log = was.a > 0.0 ? lerp(was.y, logs / n, f) : logs / n;
+        mean_luma = was.a > 0.0 ? lerp(mean_was.x, sum / n, f) : sum / n;
     }
     // (Valid once a room has been seen: before that the key gives nothing.)
     float seen_one = was.a > 0.0 || n > 0 ? 1.0 : 0.0;
@@ -876,7 +923,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 6) * 16;
 /// The passes' root constants, in words (the `Set` buffer).
-const WORDS: usize = 29;
+const WORDS: usize = 30;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -1090,6 +1137,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let [contrast, contrast_most] = if outside_level > 0.0 { contrast() } else { [0.0, 1.0] };
     words[27] = contrast.to_bits();
     words[28] = contrast_most.to_bits();
+    words[29] = cut().to_bits();
     let measure_rooms = ((key > 0.0 && key_room()) || outdoors) && views.stencil.is_some();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
@@ -1364,6 +1412,25 @@ mod tests {
         assert!(contrast_run(1.0, 0.001, set, 60).iter().all(|&g| g <= 8.0 + 1e-4));
         // Inside rooms it does not build up.
         assert_eq!(contrast_step(0.0, 1.0, 0.001, set, 0.0), 0.0);
+    }
+
+    #[test]
+    fn cuts() {
+        assert_eq!(parse_cut(""), 0.0);
+        assert_eq!(parse_cut("1"), 0.0);
+        assert_eq!(parse_cut("0.5"), 0.0);
+        let cut = parse_cut("3");
+        assert!((cut - 3.0f32.ln()).abs() < 1e-6);
+        let log = |v: f32| (v + 1e-3).ln();
+        // Off: never.
+        assert!(!is_cut(log(0.01), log(3.0), 0.0));
+        // From the loading screen into the diner (log-average 0.0007 to 0.012),
+        // and from the diner out to the sun (0.06 to 2.4): cuts.
+        assert!(is_cut(log(0.0007), log(0.012), cut));
+        assert!(is_cut(log(0.06), log(2.4), cut));
+        // Walking down the prison's corridor into the common room
+        // (log-average 0.06-0.09 against 0.05-0.07): not.
+        assert!(!is_cut(log(0.09), log(0.05), cut));
     }
 
     #[test]
