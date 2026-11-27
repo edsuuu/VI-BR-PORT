@@ -41,6 +41,8 @@
 //!
 //! `VICTORY_AMBIENT_OUTSIDE=<share>[:<least>]` keeps the constant inside rooms
 //! and gives the estimate outside them ([`outside`]).
+//! `VICTORY_AMBIENT_DAY=<from>:<to>` gives outside rooms back to the title by
+//! day ([`day`]).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -332,6 +334,42 @@ fn parse_outside(set: &str) -> [f32; 2] {
     }
 }
 
+/// `VICTORY_AMBIENT_DAY=<from>:<to>`, with `VICTORY_AMBIENT_OUTSIDE`: as the
+/// slow mean luminance of the light around goes from `<from>` to `<to>`,
+/// texels outside rooms go from the estimate to the title's own light (what
+/// its rays leave: the sky's light), never under the constant. Unset: the
+/// estimate at any hour, as before.
+///
+/// Why: by day the estimate is about the mean of what sunlit surfaces send
+/// out (slow mean 4-11 on the boat, run barco-ab-agua0), so every shade
+/// outdoors got nearly the light of the sunlit ground: the flat orange wash
+/// of the boat's cutscenes. Night scenes stay far below (the opening's
+/// street 0.002-0.03, the diner cutscene 0.1-0.25, the prison's rooms
+/// 0.1-0.2).
+fn day() -> [f32; 2] {
+    static SET: OnceLock<[f32; 2]> = OnceLock::new();
+    *SET.get_or_init(|| parse_day(&std::env::var("VICTORY_AMBIENT_DAY").unwrap_or_default()))
+}
+
+fn parse_day(set: &str) -> [f32; 2] {
+    let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0);
+    let (from, to) = set.split_once(':').unwrap_or((set, ""));
+    match (number(from), number(to)) {
+        (Some(from), Some(to)) if to > from => [from, to],
+        _ => [0.0, 0.0],
+    }
+}
+
+/// How much of the title's own light a texel outside rooms keeps for a slow
+/// mean luminance `mean` (0: the estimate, 1: the title's). The raise pass
+/// does the same.
+fn day_share(mean: f32, [from, to]: [f32; 2]) -> f32 {
+    if to <= from {
+        return 0.0;
+    }
+    ((mean - from) / (to - from)).clamp(0.0, 1.0)
+}
+
 /// The word `tint`: the air's colour goes 60% of the way (times how much the
 /// key raises the room: none at a gain of 1, all from 2) to that of the light
 /// around. Its own switch word, since it changes colours, not levels.
@@ -375,7 +413,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=25, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
+#define RS "RootConstants(num32BitConstants=27, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -401,6 +439,10 @@ cbuffer Set : register(b0) {
     // (VICTORY_AMBIENT_OUTSIDE) The estimate's share and least light outside
     // rooms with the constant; whether the stencil plane is bound.
     float outside_level; float outside_least; float has_stencil;
+    // (VICTORY_AMBIENT_DAY) The slow mean luminance over which the stand-in
+    // outside rooms starts to give way to the title's own light, and where
+    // it is all the title's (0: never).
+    float day_from; float day_to;
 };
 Texture2D<float> depth : register(t0);
 // The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
@@ -747,6 +789,16 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
+    // (VICTORY_AMBIENT_DAY) By day, outside rooms, the title's own light: the
+    // estimate there is about the mean of what sunlit surfaces send out, so
+    // a shade got as much light as the sun gives (the boat's orange wash).
+    // What the title's rays leave outdoors is the sky's light, right by day.
+    // The constant stays a floor, so nothing gets darker than it was with
+    // the constant alone.
+    if (outdoors && day_to > 0.0 && cells[CELLS].a > 0.0) {
+        float day = saturate((dot(cells[CELLS].rgb, LUMA) - day_from) / max(day_to - day_from, 1e-6));
+        found = lerp(found, float3(1.0, 0.98, 0.94) * constant * open, day);
+    }
     light[p] = pack(max(was, found));
 }
 #endif
@@ -756,7 +808,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 5) * 16;
 /// The passes' root constants, in words (the `Set` buffer).
-const WORDS: usize = 25;
+const WORDS: usize = 27;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -962,6 +1014,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[22] = outside_level.to_bits();
     words[23] = outside_least.to_bits();
     words[24] = if views.stencil.is_some() { 1.0f32 } else { 0.0 }.to_bits();
+    let [day_from, day_to] = day();
+    words[25] = day_from.to_bits();
+    words[26] = day_to.to_bits();
     let measure_rooms = ((key > 0.0 && key_room()) || outdoors) && views.stencil.is_some();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
@@ -1043,6 +1098,9 @@ fn report_mean(list: &HostList, pass: &Pass) {
                 let valid = if key_room() { room_seen } else { m[3] > 0.0 };
                 let gain = if valid { key_gain(key, most, measured) } else { 1.0 };
                 let air_gain = if key_room() { whole_gain(gain, if room_seen { room_share } else { 0.0 }) } else { gain };
+                // (VICTORY_AMBIENT_DAY: how much the title's own light is
+                // kept outside rooms.)
+                let day = day_share(luma, day());
                 tracing::info!(
                     mean = ?[m[0], m[1], m[2]],
                     luma,
@@ -1053,6 +1111,7 @@ fn report_mean(list: &HostList, pass: &Pass) {
                     room_share,
                     room_geo,
                     room_mean,
+                    day,
                     inside_only = key_inside(),
                     air_hold = key_air_hold(),
                     by_geo = key_geo(),
@@ -1167,6 +1226,26 @@ mod tests {
         assert_eq!(parse_outside("1"), [1.0, 0.0]);
         assert_eq!(parse_outside("1:0.03"), [1.0, 0.03]);
         assert_eq!(parse_outside("x:0.03"), [0.0, 0.0]);
+    }
+
+    #[test]
+    fn day_settings_and_share() {
+        assert_eq!(parse_day(""), [0.0, 0.0]);
+        assert_eq!(parse_day("1"), [0.0, 0.0]);
+        assert_eq!(parse_day("2:1"), [0.0, 0.0]);
+        assert_eq!(parse_day("0.5:2"), [0.5, 2.0]);
+        let day = [0.5, 2.0];
+        // Unset: the estimate at any hour.
+        assert_eq!(day_share(9.0, [0.0, 0.0]), 0.0);
+        // The opening's street, the diner cutscene, a prison room: the estimate.
+        for night in [0.002, 0.03, 0.12, 0.25, 0.18] {
+            assert_eq!(day_share(night, day), 0.0);
+        }
+        // The boat by day (slow mean 4-11): the title's own light.
+        for sun in [2.0, 4.0, 11.0] {
+            assert_eq!(day_share(sun, day), 1.0);
+        }
+        assert!((day_share(1.25, day) - 0.5).abs() < 1e-6);
     }
 
     #[test]
