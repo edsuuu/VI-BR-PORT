@@ -222,8 +222,8 @@ fn windows() -> bool {
 
 /// Whether indirect executions whose arguments or count lie in title memory
 /// the card reads in place (renderer port 1, `VICTORY_PORT_CONSTANTS=1`) are
-/// clamped alone, right before they run (`VICTORY_PORT_CONSTANTS_ORDER`; `=0`:
-/// in batches and windows as any other).
+/// clamped alone, right before they run (`VICTORY_PORT_CONSTANTS_ORDER=1`; off
+/// by default here: in batches and windows as any other).
 ///
 /// A batch or a window clamps records ahead: in the pass recorded where it
 /// was opened, before the commands between it and the execution that reads
@@ -234,10 +234,28 @@ fn windows() -> bool {
 /// or none. With port 1 on, palms and trees in the boat mission's cutscene
 /// were missing for runs of frames while the camera moved, and with ports 1
 /// and 5 off they were not (avatarmanz/VIctory-7900XTX 631400f5, its runs
-/// pop-5 and pop-10 to pop-13). On by default; it costs about 2-5 ms a frame
-/// there.
+/// pop-5 and pop-10 to pop-13), where it costs about 2-5 ms a frame.
+///
+/// Off by default in this tree: on an RTX 4060 Ti, walking in the prison,
+/// it clamps 464 executions a frame alone, each a compute dispatch between
+/// two waits in the middle of the draws, and the frame went from 43.5 ms
+/// (23.0 fps) to 52.1 ms (19.2 fps), all of it the submitting thread's wait
+/// for the card (1.6 to 11.7 ms). The dip alarm (`VICTORY_MESH_DIPS`) fired
+/// as often with it as without (about 200 times a minute in the cutscene)
+/// and the flicker measured on the recordings was the same (runs
+/// prisao-s-tudo1, prisao-s-ordem0 and prisao-s-ordem1 of 27 Nov).
+/// `VICTORY_INDIRECT_TRUST=1` reads such records in order at no cost.
+/// With `VICTORY_AB` naming the switch (diagnostics builds): on in its phases on.
 fn in_place_order() -> bool {
-    crate::toggled!("VICTORY_PORT_CONSTANTS_ORDER")
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+        if let Some(bit) = *BIT.get_or_init(|| crate::ab::bit("VICTORY_PORT_CONSTANTS_ORDER")) {
+            return crate::ab::on(bit);
+        }
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_CONSTANTS_ORDER").is_some_and(|v| v == "1"))
 }
 
 /// With [`in_place_order`]: such executions never in a batch (unset or
