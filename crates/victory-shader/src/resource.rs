@@ -234,7 +234,7 @@ pub fn track(
             let mut first_lane = Vec::new();
             let mut offset = Vec::new();
             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
-                let source = t.descriptor(inst, op, b).map_err(fail)?;
+                let source = t.descriptor(inst, op, site).map_err(fail)?;
                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
                 // is the same in every lane: its loop is lowered as it stands
                 // and needs no proof.
@@ -418,6 +418,13 @@ struct Tracer<'a> {
 /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
 /// its negation where not.
 type Known = Vec<(Bool, bool)>;
+
+/// Whether the lanes that read a descriptor are those EXEC lets run the access, not all that
+/// reach it ([`Tracer::descriptor`]; on unless `VICTORY_GUARDED_DESCRIPTORS=0`).
+fn guarded_descriptors() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_GUARDED_DESCRIPTORS").is_none_or(|v| v != "0"))
+}
 
 const MAX_ROUNDS: usize = 64;
 const MAX_JOINS: usize = 8;
@@ -1113,8 +1120,8 @@ impl<'a> Tracer<'a> {
         self.address(lo, hi, extra)
     }
 
-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
+    /// The source of the descriptor operand `op` of `inst`, at site `(at, i)`.
+    fn descriptor(&self, inst: &Inst, op: &Operand, (at, i): Site) -> Result<Source, &'static str> {
         let Operand::Scalar { code, dwords } = *op else {
             return Err("a descriptor not in SGPRs");
         };
@@ -1129,8 +1136,17 @@ impl<'a> Tracer<'a> {
         {
             words = raw.to_vec();
         }
-        // Only the lanes that reach the access read the descriptor.
+        // Only the lanes that reach the access read the descriptor, and of
+        // those only the ones EXEC lets run it: in a program taken without
+        // its early-outs (`ir::without_early_outs`) the lanes that would
+        // have left walk on to the access with EXEC clear
+        // (`VICTORY_GUARDED_DESCRIPTORS=0`: as before, reaching alone).
         let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
+        if guarded_descriptors()
+            && let Some(guard) = self.lanes.and_then(|l| l.guards.get(at)?.get(i).copied().flatten())
+        {
+            known.push((guard, true));
+        }
         self.classify(&words, &mut Vec::new(), &mut known)
     }
 
