@@ -78,8 +78,9 @@ thread_local! {
     /// `VICTORY_BAKE_ADMIT=1`: the slots the draw samples (`crate::bake`),
     /// served first and past the pass's time, bytes and room bounds, and
     /// whether the pass serves them alone (the frame's bakes have used their
-    /// time, or nothing is new since the last bake's pass).
-    static BAKE_SOURCES: std::cell::RefCell<Option<(Vec<u32>, bool)>> = const { std::cell::RefCell::new(None) };
+    /// time, or nothing is new since the last bake's pass), and how many
+    /// of the places looked in for them were read only in part.
+    static BAKE_SOURCES: std::cell::RefCell<Option<(Vec<u32>, bool, u32)>> = const { std::cell::RefCell::new(None) };
 }
 
 /// The milliseconds of every frame the pass that uploads textures picked
@@ -2161,7 +2162,7 @@ impl State {
         let Some(host) = heap.host() else {
             return;
         };
-        let sources = if admit { Self::bake_sources(&self.graphics, p, heap, host.count()) } else { Vec::new() };
+        let (sources, cut) = if admit { Self::bake_sources(&self.graphics, p, heap, host.count()) } else { (Vec::new(), 0) };
         // A bake with no time left serves its sources alone.
         let mut alone = admit && left == 0 && !sources.is_empty();
         if !(bake && left > 0) && !(first && early_ms > 0) && !alone {
@@ -2196,7 +2197,7 @@ impl State {
         PASS_BUDGET.set(Some(budget));
         crate::texture::BAKING.set(bake && bake_exact());
         if admit {
-            BAKE_SOURCES.set(Some((sources, alone)));
+            BAKE_SOURCES.set(Some((sources, alone, cut)));
         }
         self.heap_textures(list, heap, host);
         BAKE_SOURCES.set(None);
@@ -2209,12 +2210,16 @@ impl State {
 
     /// The view-heap slots a draw of the title's decoration bake samples
     /// (`crate::bake`): the dwords of the constant buffers and buffers its
-    /// bake programs read through tables, and of their root constants, that
-    /// name a slot of the heap holding a small placed texture
-    /// ([`crate::bake::is_source`]). The buffers are read through the kernel,
-    /// at most [`crate::bake::BUFFER_BYTES`] of each; nothing is written.
-    fn bake_sources(roots: &[Root], p: &HostPipeline, heap: &crate::descriptor::Heap, count: u32) -> Vec<u32> {
+    /// bake programs read through tables and through root views, and of their
+    /// root constants, that name a slot of the heap holding a small placed
+    /// texture ([`crate::bake::is_source`]). The buffers are read through the
+    /// kernel, at most [`crate::bake::BUFFER_BYTES`] of each; nothing is
+    /// written. Also how many ways were looked through only in part: buffers
+    /// longer than that, and the dwords left once [`crate::bake::MOST`]
+    /// sources were found (one).
+    fn bake_sources(roots: &[Root], p: &HostPipeline, heap: &crate::descriptor::Heap, count: u32) -> (Vec<u32>, u32) {
         let mut out = Vec::new();
+        let mut cut = 0;
         let mut words: Vec<u32> = Vec::new();
         let is_source = |index: u32| match heap.handle(index).and_then(crate::descriptor::view) {
             Some(View::Placed(false, resource, desc)) if resource[0] != 1 => crate::bake::is_source(
@@ -2240,11 +2245,22 @@ impl State {
                             _ => None,
                         }
                     }
+                    // A root view names an address alone: up to the end of
+                    // the title buffer that holds it, or a constant buffer's
+                    // worth when no buffer is known there.
+                    (RootType::Descriptor, ResourceType::Cbv | ResourceType::Srv, Some(&Root::View(at))) => Some((
+                        at,
+                        crate::shadow::extent(at)
+                            .map_or(crate::bake::ROOT_VIEW_BYTES, |(start, len)| (start + len).saturating_sub(at)),
+                    )),
                     _ => None,
                 };
                 let Some((at, bytes)) = range.filter(|&(at, bytes)| at != 0 && bytes >= 4) else {
                     continue;
                 };
+                if bytes > crate::bake::BUFFER_BYTES as u64 {
+                    cut += 1;
+                }
                 let n = (bytes as usize).min(crate::bake::BUFFER_BYTES) / 4;
                 words.clear();
                 words.resize(n, 0);
@@ -2255,7 +2271,10 @@ impl State {
                 crate::bake::candidates(&words, count, is_source, &mut out);
             }
         }
-        out
+        if out.len() >= crate::bake::MOST {
+            cut += 1;
+        }
+        (out, cut)
     }
 
     /// The queue's side of the card accounting line
@@ -2431,7 +2450,7 @@ impl State {
         // `crate::bake`): due now whatever the queue knew of them, served
         // first, past the pass's time and bytes, and past the room line up to
         // `crate::bake::PAST_LINE_BYTES`.
-        let (sources, alone) = BAKE_SOURCES.take().unwrap_or_default();
+        let (sources, alone, cut) = BAKE_SOURCES.take().unwrap_or_default();
         let admit = !sources.is_empty();
         let sources = if admit { host.texture_slots_now(&sources, frame) } else { Vec::new() };
         let source_count = sources.len();
@@ -2446,7 +2465,7 @@ impl State {
             front.append(&mut due);
             due = front;
         }
-        let mut tally = crate::bake::Sources { found: source_count as u32, ..Default::default() };
+        let mut tally = crate::bake::Sources { found: source_count as u32, cut, ..Default::default() };
         let mut past = crate::bake::PastLine::default();
         let mut wait = crate::bake::Wait::new(crate::bake::wait_budget());
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
@@ -2929,6 +2948,7 @@ impl State {
                     past_the_line_kb = past.bytes >> 10,
                     refused_past_the_cap = tally.refused,
                     not_mapped = tally.not_mapped,
+                    read_in_part = tally.cut,
                     uploaded = tally.uploaded,
                     same = tally.same,
                     uploads_waited_for = wait.waited,
