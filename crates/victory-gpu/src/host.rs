@@ -4233,6 +4233,7 @@ fn late_line(frames: f64) {
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
     crate::picked::log(frames);
+    send_thread::line(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
@@ -4257,6 +4258,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 mod send;
+mod send_thread;
 mod table;
 #[cfg(test)]
 pub(crate) use table::{CARD_COMPARE_TABLE, entry as card_table_entry};
@@ -5092,6 +5094,8 @@ impl Host {
                     let n = card_passes(work, list, &passes, prepared.as_ref(), table::stat::COMPARE_LISTS);
                     CARD_PASSES[4].fetch_add(n, Ordering::Relaxed);
                     list.Close()?;
+                    // Behind what the thread that sends has (`VICTORY_SEND_THREAD`).
+                    send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -5228,6 +5232,8 @@ impl Host {
                         stamps.end(list, n);
                     }
                     list.Close()?;
+                    // Behind what the thread that sends has (`VICTORY_SEND_THREAD`).
+                    send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -5532,6 +5538,8 @@ impl Host {
                     stamps.end(list, n);
                 }
                 list.Close()?;
+                // Behind what the thread that sends has (`VICTORY_SEND_THREAD`).
+                send_thread::wait_idle();
                 self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                 self.queue.Signal(&fence, value)?;
                 Ok(())
@@ -5842,9 +5850,19 @@ impl Host {
         let waiting = std::time::Instant::now();
         // The flights the fetch runs behind: those in the line by now have
         // been given to the queue. On the copy queue, those landed here.
+        // With `VICTORY_SEND_THREAD` a flight enters the line when it is
+        // handed to the thread that sends, not when that has put it on the
+        // queue: the target is read first and the thread waited for after,
+        // so every flight at or below it is on the queue by then (the other
+        // way round the fetch could claim to run behind a flight it overtook,
+        // and a landing would leave out what that one writes).
         let ahead = match copy_queue {
             Some(_) => 0,
-            None => line().target,
+            None => {
+                let target = line().target;
+                send_thread::wait_idle();
+                target
+            }
         };
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -6186,6 +6204,8 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
+                    // Behind what the thread that sends has (`VICTORY_SEND_THREAD`).
+                    send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -6856,19 +6876,17 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
-                }
-                self.queue.Signal(&self.fence, *submitted)
-            };
-            awake::sent(&self.device);
+            // The lists go to the queue and the fence is signalled behind
+            // them in `Job::run`, the same calls in the same order as they
+            // were made here; with `VICTORY_SEND_THREAD=1` on a thread of
+            // their own while this one goes on to the flight's bookkeeping
+            // (host/send_thread.rs: the flight goes into the line from here,
+            // under the submission lock, and its value is not completed until
+            // that thread has signalled it).
+            let job = send_thread::Job::new(std::mem::take(&mut lists), cuts, *submitted);
             #[cfg(feature = "diagnostics")]
-            crate::timeline::sent(sending, *submitted, stamp);
-            self.card_sent();
+            let job = job.timed(sending, stamp);
+            let signalled = send_thread::send(self, job);
             stage.next("submit: noting what is in the air");
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6910,6 +6928,8 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        // After whatever was handed to the thread that sends (`VICTORY_SEND_THREAD`).
+        send_thread::wait_idle();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -9897,8 +9917,11 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 impl Host {
     /// The queue everything of ours runs on, for a call that must go to it
     /// in order with the lists (`crate::tiles`: a texture's levels are
-    /// given memory ahead of the list that uploads them).
+    /// given memory ahead of the list that uploads them). With
+    /// `VICTORY_SEND_THREAD` it is given once the lists handed to the thread
+    /// that sends are on it, so the call comes behind them as it did.
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        send_thread::wait_idle();
         &self.queue
     }
 
@@ -10860,6 +10883,11 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // The copy into the back buffer may be on the thread that sends
+            // (`VICTORY_SEND_THREAD`): Present goes to the same queue, behind
+            // it, or the copy would write a buffer the compositor holds
+            // (device removed, 0x887A002B).
+            send_thread::wait_idle();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
@@ -11030,6 +11058,11 @@ impl Host {
             // the picture it keeps.
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(first, D3D12_RESOURCE_STATES(first_state as i32));
+            // The copy into the back buffer may be on the thread that sends
+            // (`VICTORY_SEND_THREAD`): Present goes to the same queue, behind
+            // it, or the copy would write a buffer the compositor holds
+            // (device removed, 0x887A002B).
+            send_thread::wait_idle();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
         }
