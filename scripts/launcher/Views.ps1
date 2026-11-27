@@ -202,7 +202,7 @@ function Get-LauncherPlayViewXaml {
     <Grid Margin="0,$s14,0,0" MaxWidth="{StaticResource Layout.statusWidth}" HorizontalAlignment="Left">
       <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
       <Ellipse x:Name="StatusDot" Width="{StaticResource Layout.statusDot}" Height="{StaticResource Layout.statusDot}" VerticalAlignment="Top" Margin="0,$(ConvertTo-LauncherXamlNumber (([double](Get-LauncherToken 'type.size.small') * 1.33 - [double](Get-LauncherToken 'layout.statusDot')) / 2)),$(Get-LauncherSpace 12),0" Fill="{StaticResource Brush.gold}"/>
-      <TextBox x:Name="StatusText" Grid.Column="1" Style="{StaticResource Text.Selectable}"/>
+      <TextBox x:Name="StatusText" Grid.Column="1" Style="{StaticResource Text.Selectable}" AutomationProperties.Name="$(Get-LauncherViewText -Context $Context -Key 'play.status.name')"/>
     </Grid>
     <Button x:Name="ChangeGameButton" Style="{StaticResource Button.Link}" HorizontalAlignment="Left" Margin="0,$s8,0,0" Foreground="{StaticResource Brush.textMuted}" Content="$(Get-LauncherViewText -Context $Context -Key 'play.change_game')"/>
   </StackPanel>
@@ -221,7 +221,7 @@ function Get-LauncherPlayViewXaml {
         </Button>
         <TextBlock x:Name="VersionText" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="{StaticResource FontSize.caption}" Foreground="{StaticResource Brush.textMuted}" Text="$(ConvertTo-LauncherXmlText $version['text'])" AutomationProperties.Name="$(Get-LauncherViewText -Context $Context -Key 'panel.version.name' -Arguments @($version['text']))"/>
       </DockPanel>
-      <Button x:Name="MoreButton" DockPanel.Dock="Bottom" Style="{StaticResource Button.Outline}" Padding="$s14,0" Margin="0,0,0,$s18" FontSize="{StaticResource FontSize.body}" HorizontalContentAlignment="Stretch">
+      <Button x:Name="MoreButton" DockPanel.Dock="Bottom" Style="{StaticResource Button.Outline}" AutomationProperties.Name="$(Get-LauncherViewText -Context $Context -Key 'panel.more')" Padding="$s14,0" Margin="0,0,0,$s18" FontSize="{StaticResource FontSize.body}" HorizontalContentAlignment="Stretch">
         <DockPanel>
           $((Get-LauncherIconXaml -Icon 'chevron' -Size 'iconChevron' -Stroke 'Brush.text').Replace('<Viewbox ', '<Viewbox DockPanel.Dock="Right" '))
           <TextBlock VerticalAlignment="Center" Text="$(Get-LauncherViewText -Context $Context -Key 'panel.more')"/>

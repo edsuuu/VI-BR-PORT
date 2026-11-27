@@ -4,6 +4,7 @@
 
   "play.button": "JOGAR",
   "play.button.name": "Jogar",
+  "play.status.name": "Situação",
   "play.status.ready": "Pronto para jogar. Shaders já traduzidos.",
   "play.status.prepare": "Pronto para jogar. A primeira vez prepara os shaders.",
   "play.status.no_build": "Não há {0}. Compile primeiro: {1}",
