@@ -653,7 +653,11 @@ fn for_rays(bytes: &[u8]) -> RayOnly {
         RayOnly::Activate
     } else if (has(b"CS_ScreenProbes_TraceRays") && has(b"_BVH")) || (has(b"CS_RaytraceVBuffer") && !has(b"Voxels")) {
         RayOnly::Trace
-    } else if has(b"CS_GenerateShadowMasks_Raytraced") || has(b"CS_RTShadowTrace") || has(b"CS_RaytraceShadows") {
+    } else if has(b"CS_GenerateShadowMasks_Raytraced")
+        || has(b"CS_RTShadowTrace")
+        || has(b"CS_RaytraceShadows")
+        || has(b"CS_TraceShadowRays")
+    {
         RayOnly::ShadowMask
     } else if has(b"CS_TransmissionVolumetrics_Tiled_") {
         // (`_Tiled_<digits>` and `_Tiled_LocalLights_<digits>`; not `_Temporal_Tiled` nor
@@ -695,6 +699,7 @@ fn ray_programs_are_known_by_name() {
     assert_eq!(for_rays(b"..\0CS_ScreenProbes_TraceRays_Fallback\0.."), RayOnly::No);
     assert_eq!(for_rays(b"..\0CS_RaytraceVBuffer_ShaderBinning_WithFar\0.."), RayOnly::Trace);
     assert_eq!(for_rays(b"..\0CS_RaytraceVBuffer_Voxels_RayBinning\0.."), RayOnly::No);
+    assert_eq!(for_rays(b"..\0CS_TraceShadowRays_FullAdaptive\0.."), RayOnly::ShadowMask);
     assert_eq!(for_rays(b"..\0CS_TransmissionVolumetrics_Tiled_5dc3b259_Wrapped\0.."), RayOnly::WaterLight);
     assert_eq!(for_rays(b"..\0CS_TransmissionVolumetrics_Tiled_LocalLights_6f225b64_Wrapped\0.."), RayOnly::WaterLight);
     assert_eq!(for_rays(b"..\0CS_TransmissionVolumetrics_Temporal_Tiled_c7fd991b_Wrapped\0.."), RayOnly::No);
