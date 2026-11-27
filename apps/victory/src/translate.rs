@@ -520,10 +520,19 @@ fn translate(
         }
         return;
     }
-    let programs = match native_programs(dxil) {
+    let mut programs = match native_programs(dxil) {
         Ok(p) => p,
         Err(e) => return t.fail(e.to_string(), example),
     };
+    // `VICTORY_CODE_PATCHES` (unset by default): the words the runtime would replace in this
+    // program before translating it, replaced here too, so that a patch for a game run can be
+    // checked offline first (that its words match, and that the program still translates).
+    if let Some(patches) = emit::code_patches_for(&hash) {
+        for p in &mut programs {
+            let done = emit::patch_code(&mut p.code, &patches);
+            eprintln!("CODE-PATCHES #{hash} {:?}: {done} of {} words replaced", p.stage, patches.len());
+        }
+    }
     // `VICTORY_FAIL_DUMP=<dir>`: the first 3 containers of each failure reason, as the title
     // has them (`.cdxil`), to work on a translator gap offline
     let dump = std::env::var_os("VICTORY_FAIL_DUMP");

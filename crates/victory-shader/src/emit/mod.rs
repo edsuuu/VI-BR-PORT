@@ -438,6 +438,58 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
 thread_local! {
     /// See [`with_code_patches`].
     static CODE_PATCHES: std::cell::RefCell<Vec<(usize, u32, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// How many of [`CODE_PATCHES`] the last translation on this thread found and replaced.
+    static CODE_PATCHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The instruction words `VICTORY_CODE_PATCHES` asks to replace in the program of the container
+/// with hash `hash` (16 hex digits, as logs print it): `(offset, expected, new)`. The switch is
+/// `<hash>:<offset>:<expected>:<new>[,<offset>:<expected>:<new>...][;<hash>:...]`, numbers in hex;
+/// read once. Off (unset) by default.
+pub fn code_patches_for(hash: &str) -> Option<Vec<(usize, u32, u32)>> {
+    static ALL: std::sync::OnceLock<Vec<(String, Vec<(usize, u32, u32)>)>> = std::sync::OnceLock::new();
+    let all = ALL.get_or_init(|| parse_code_patches(&std::env::var("VICTORY_CODE_PATCHES").unwrap_or_default()));
+    all.iter().find(|(h, _)| h.eq_ignore_ascii_case(hash)).map(|(_, p)| p.clone())
+}
+
+/// Parses a `VICTORY_CODE_PATCHES` value ([`code_patches_for`]).
+pub fn parse_code_patches(value: &str) -> Vec<(String, Vec<(usize, u32, u32)>)> {
+    let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
+    value
+        .split(';')
+        .filter_map(|program| {
+            let (hash, rest) = program.trim().split_once(':')?;
+            let patches = rest
+                .split(',')
+                .filter_map(|p| {
+                    let mut f = p.split(':');
+                    Some((hex(f.next()?)? as usize, hex(f.next()?)? as u32, hex(f.next()?)? as u32))
+                })
+                .collect::<Vec<_>>();
+            (!patches.is_empty()).then(|| (hash.trim().to_lowercase(), patches))
+        })
+        .collect()
+}
+
+/// Replaces the words of `code` that `patches` name, each only where the word there is the
+/// expected one, and says how many it replaced: fewer than asked is a patch written for another
+/// program or offset, which an experiment must not take for a result.
+pub fn patch_code(code: &mut [u8], patches: &[(usize, u32, u32)]) -> usize {
+    let mut done = 0;
+    for &(at, expected, new) in patches {
+        if let Some(word) = code.get_mut(at..at + 4)
+            && word == expected.to_le_bytes()
+        {
+            word.copy_from_slice(&new.to_le_bytes());
+            done += 1;
+        }
+    }
+    done
+}
+
+/// How many words the last translation on this thread replaced under [`with_code_patches`].
+pub fn code_patched() -> usize {
+    CODE_PATCHED.get()
 }
 
 /// Runs `f` (a translation) with the console program's instruction words at the given byte offsets
@@ -469,15 +521,7 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    CODE_PATCHES.with_borrow(|patches| {
-        for &(at, expected, new) in patches {
-            if let Some(word) = native.code.get_mut(at..at + 4)
-                && word == expected.to_le_bytes()
-            {
-                word.copy_from_slice(&new.to_le_bytes());
-            }
-        }
-    });
+    CODE_PATCHED.set(CODE_PATCHES.with_borrow(|patches| patch_code(&mut native.code, patches)));
     let p = crate::spill::build(&native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -3109,4 +3153,15 @@ mod barycentric_tests {
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
     }
+}
+
+#[test]
+fn code_patches_parse() {
+    let p = parse_code_patches("C7FD991B910DC7FE:a80:56140600:bf800000,0xa84:56160800:bf800000;5dc3b25986622949:568:3f1e377a:0");
+    assert_eq!(p.len(), 2);
+    assert_eq!(p[0], ("c7fd991b910dc7fe".to_owned(), vec![(0xa80, 0x5614_0600, 0xbf80_0000), (0xa84, 0x5616_0800, 0xbf80_0000)]));
+    assert_eq!(p[1].1, vec![(0x568, 0x3f1e_377a, 0)]);
+    let mut code = 0x5614_0600u32.to_le_bytes().repeat(2);
+    assert_eq!(patch_code(&mut code, &[(0, 0x5614_0600, 1), (4, 0x1234, 2)]), 1);
+    assert_eq!(&code[..4], &1u32.to_le_bytes());
 }

@@ -152,8 +152,20 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
-                let done = match code_patches(&self.hash) {
-                    Some(patches) => victory_shader::emit::with_code_patches(&patches, || translate(&self.container)),
+                // `VICTORY_CODE_PATCHES` (diagnostics, unset by default): instruction words of
+                // title programs replaced before their translation, to test what a pass does
+                // (`victory_shader::emit::code_patches_for`); the log says how many took.
+                let done = match victory_shader::emit::code_patches_for(&self.hash) {
+                    Some(patches) => {
+                        let done = victory_shader::emit::with_code_patches(&patches, || translate(&self.container));
+                        tracing::info!(
+                            hash = %self.hash,
+                            replaced = victory_shader::emit::code_patched(),
+                            asked = patches.len(),
+                            "instruction words of a title program replaced before its translation (VICTORY_CODE_PATCHES)"
+                        );
+                        done
+                    }
                     None => translate(&self.container),
                 };
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
@@ -1072,40 +1084,4 @@ fn bake_programs_are_known_by_name() {
     assert!(bakes(b"..\0PS_DecorationBlend_0011_ff00f5de_Wrapped\0.."));
     assert!(bakes(b"PS_BakeDecorations_0100_583f45fe_Wrapped"));
     assert!(!bakes(b"PS_PedSkin_0001"));
-}
-
-/// Instruction words of title programs replaced before their translation (diagnostics, to test
-/// what a pass does): `VICTORY_CODE_PATCHES=<hash>:<offset>:<expected>:<new>[,<offset>:<expected>:<new>...][;<hash>:...]`,
-/// numbers in hex. Each word is replaced only where the word there is the expected one
-/// (`victory_shader::emit::with_code_patches`).
-fn code_patches(hash: &str) -> Option<Vec<(usize, u32, u32)>> {
-    static ALL: OnceLock<Vec<(String, Vec<(usize, u32, u32)>)>> = OnceLock::new();
-    let all = ALL.get_or_init(|| parse_code_patches(&std::env::var("VICTORY_CODE_PATCHES").unwrap_or_default()));
-    all.iter().find(|(h, _)| h == hash).map(|(_, p)| p.clone())
-}
-
-fn parse_code_patches(value: &str) -> Vec<(String, Vec<(usize, u32, u32)>)> {
-    let hex = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
-    value
-        .split(';')
-        .filter_map(|program| {
-            let (hash, rest) = program.trim().split_once(':')?;
-            let patches = rest
-                .split(',')
-                .filter_map(|p| {
-                    let mut f = p.split(':');
-                    Some((hex(f.next()?)? as usize, hex(f.next()?)? as u32, hex(f.next()?)? as u32))
-                })
-                .collect::<Vec<_>>();
-            (!patches.is_empty()).then(|| (hash.trim().to_lowercase(), patches))
-        })
-        .collect()
-}
-
-#[test]
-fn code_patches_parse() {
-    let p = parse_code_patches("C7FD991B910DC7FE:a80:56140600:bf800000,0xa84:56160800:bf800000;5dc3b25986622949:568:3f1e377a:0");
-    assert_eq!(p.len(), 2);
-    assert_eq!(p[0], ("c7fd991b910dc7fe".to_owned(), vec![(0xa80, 0x5614_0600, 0xbf80_0000), (0xa84, 0x5616_0800, 0xbf80_0000)]));
-    assert_eq!(p[1].1, vec![(0x568, 0x3f1e_377a, 0)]);
 }
