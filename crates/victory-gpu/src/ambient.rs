@@ -42,7 +42,8 @@
 //! `VICTORY_AMBIENT_OUTSIDE=<share>[:<least>]` keeps the constant inside rooms
 //! and gives the estimate outside them ([`outside`]).
 //! `VICTORY_AMBIENT_DAY=<from>:<to>` gives outside rooms back to the title by
-//! day ([`day`]).
+//! day ([`day`]). `VICTORY_AMBIENT_CONTRAST=<ratio>[:<most gain>]` raises a
+//! dark bulk under a few bright lights outside rooms ([`contrast`]).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -370,6 +371,46 @@ fn day_share(mean: f32, [from, to]: [f32; 2]) -> f32 {
     ((mean - from) / (to - from)).clamp(0.0, 1.0)
 }
 
+/// `VICTORY_AMBIENT_CONTRAST=<ratio>[:<most gain>]`, with
+/// `VICTORY_AMBIENT_OUTSIDE`: outside rooms the stand-in is raised, by at
+/// most `<most gain>` (default 8), while the mean of what visible surfaces
+/// send out is more than `<ratio>` times their log-average, until it is not
+/// (the gain follows that ratio over a few frames: [`contrast_step`]). Unset:
+/// no such gain, as before.
+///
+/// Why: the title meters its exposure on what it draws, and a night
+/// cutscene lit by a few strong lamps (the diner after the boat save: slow
+/// mean 0.12-0.23, log-average 0.011-0.03, runs barco-ab-agua0 and
+/// cena-hoje) is exposed for them, so the bulk lit by the stand-in alone
+/// (floor 0.16) sits at 3-10 of 255 on screen; the floor raised from yesterday's
+/// 0.1 changed it by one or two steps. The stencil does not mark that scene
+/// as a room, so the key does nothing there. The opening's night street,
+/// which a key outside rooms washed out (run intro-s-cand), is lit evenly by
+/// its lamps and the floor: its mean is 1.5-4 times its log-average (run
+/// intro-s-luz3), and with a ratio above that it gets no gain.
+fn contrast() -> [f32; 2] {
+    static SET: OnceLock<[f32; 2]> = OnceLock::new();
+    *SET.get_or_init(|| parse_contrast(&std::env::var("VICTORY_AMBIENT_CONTRAST").unwrap_or_default()))
+}
+
+fn parse_contrast(set: &str) -> [f32; 2] {
+    let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
+    let (ratio, most) = set.split_once(':').unwrap_or((set, ""));
+    match number(ratio) {
+        Some(ratio) => [ratio, number(most).unwrap_or(8.0).max(1.0)],
+        None => [0.0, 1.0],
+    }
+}
+
+/// One frame of the contrast gain, in the log, as the mean pass does it:
+/// a fifth of the way to the ratio of `mean` to `ratio` times `bulk` (the
+/// frame's log-average), as much as the screen is outside rooms, between
+/// no gain and `most`.
+fn contrast_step(log_gain: f32, mean: f32, bulk: f32, [ratio, most]: [f32; 2], outside_share: f32) -> f32 {
+    let err = (mean.max(1e-6) / (ratio * bulk.max(1e-5))).ln();
+    (log_gain + 0.2 * err * outside_share.clamp(0.0, 1.0)).clamp(0.0, most.max(1.0).ln())
+}
+
 /// The word `tint`: the air's colour goes 60% of the way (times how much the
 /// key raises the room: none at a gain of 1, all from 2) to that of the light
 /// around. Its own switch word, since it changes colours, not levels.
@@ -413,7 +454,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=27, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
+#define RS "RootConstants(num32BitConstants=29, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -427,6 +468,9 @@ const SOURCE: &str = r#"
 // the next).
 #define INSIDE (2 * CELLS + 3)
 #define INSIDE_MEAN (2 * CELLS + 4)
+// (VICTORY_AMBIENT_CONTRAST) The gain outside rooms (x, its log in y, the
+// last frame's error of the log in z).
+#define CONTRAST (2 * CELLS + 5)
 #define PX 160
 #define PY 90
 cbuffer Set : register(b0) {
@@ -443,6 +487,10 @@ cbuffer Set : register(b0) {
     // outside rooms starts to give way to the title's own light, and where
     // it is all the title's (0: never).
     float day_from; float day_to;
+    // (VICTORY_AMBIENT_CONTRAST) How many times the mean may be the bulk's
+    // log-average before the stand-in outside rooms is raised, and by how
+    // much at most (0: never).
+    float contrast; float contrast_most;
 };
 Texture2D<float> depth : register(t0);
 // The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
@@ -554,6 +602,22 @@ void mean() {
     float4 rgb_was = cells[GEO_RGB];
     float3 rgb_now = logs_rgb / CELLS;
     cells[GEO_RGB] = float4(rgb_was.a > 0.0 ? lerp(rgb_was.rgb, rgb_now, follow) : rgb_now, 1.0);
+    // (VICTORY_AMBIENT_CONTRAST) The gain outside rooms follows, in the log
+    // and a fifth of the way a frame, the ratio of this frame's mean to
+    // `contrast` times its bulk's log-average: up while a few bright lights
+    // stand far above a dark bulk, down to 1 when they do not. Its own light
+    // lifts the bulk, so it settles where the bulk is a `contrast`-th of the
+    // mean, not above. As much as the screen is outside rooms: a gain that
+    // acts on nothing there does not build up.
+    if (contrast > 0.0) {
+        float4 gain_was = cells[CONTRAST];
+        float g = gain_was.a > 0.0 ? gain_was.y : 0.0;
+        float bulk = max(exp(geo_now) - 1e-3, 1e-5);
+        float err = log(max(dot(now, LUMA), 1e-6) / (contrast * bulk));
+        float outside_share = cells[INSIDE_MEAN].y > 0.0 ? 1.0 - saturate(cells[INSIDE].z) : 1.0;
+        g = clamp(g + 0.2 * err * outside_share, 0.0, log(max(contrast_most, 1.0)));
+        cells[CONTRAST] = float4(exp(g), g, err, 1.0);
+    }
 }
 #endif
 
@@ -789,6 +853,10 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
+    // (VICTORY_AMBIENT_CONTRAST) A dark bulk under a few bright lights (the
+    // diner cutscene: mean ten times the log-average) is raised outside
+    // rooms; the bound on what the title left stays where it was.
+    if (outdoors && contrast > 0.0 && cells[CONTRAST].a > 0.0) found *= cells[CONTRAST].x;
     // (VICTORY_AMBIENT_DAY) By day, outside rooms, the title's own light: the
     // estimate there is about the mean of what sunlit surfaces send out, so
     // a shade got as much light as the sun gives (the boat's orange wash).
@@ -806,9 +874,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 5) * 16;
+const CELL_BYTES: u64 = (2 * CELLS + 6) * 16;
 /// The passes' root constants, in words (the `Set` buffer).
-const WORDS: usize = 27;
+const WORDS: usize = 29;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -1017,6 +1085,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     let [day_from, day_to] = day();
     words[25] = day_from.to_bits();
     words[26] = day_to.to_bits();
+    // (The gain is worked out by the mean pass, which has no stencil plane:
+    // it reads the rooms' share the resolve measured, none yet: all outside.)
+    let [contrast, contrast_most] = if outside_level > 0.0 { contrast() } else { [0.0, 1.0] };
+    words[27] = contrast.to_bits();
+    words[28] = contrast_most.to_bits();
     let measure_rooms = ((key > 0.0 && key_room()) || outdoors) && views.stencil.is_some();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
@@ -1082,7 +1155,7 @@ fn report_mean(list: &HostList, pass: &Pass) {
         // SAFETY: the copy was recorded 5 s ago and has run; 16 bytes mapped.
         unsafe {
             if pass.readback.Map(0, None, Some(&mut data)).is_ok() {
-                let m = std::slice::from_raw_parts(data.cast::<f32>(), 16).to_vec();
+                let m = std::slice::from_raw_parts(data.cast::<f32>(), 20).to_vec();
                 pass.readback.Unmap(0, None);
                 let luma = 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
                 let [key, most] = key();
@@ -1101,6 +1174,8 @@ fn report_mean(list: &HostList, pass: &Pass) {
                 // (VICTORY_AMBIENT_DAY: how much the title's own light is
                 // kept outside rooms.)
                 let day = day_share(luma, day());
+                // (VICTORY_AMBIENT_CONTRAST: the gain outside rooms.)
+                let contrast_gain = if m[19] > 0.0 { m[16] } else { 1.0 };
                 tracing::info!(
                     mean = ?[m[0], m[1], m[2]],
                     luma,
@@ -1112,6 +1187,7 @@ fn report_mean(list: &HostList, pass: &Pass) {
                     room_geo,
                     room_mean,
                     day,
+                    contrast_gain,
                     inside_only = key_inside(),
                     air_hold = key_air_hold(),
                     by_geo = key_geo(),
@@ -1136,6 +1212,8 @@ fn report_mean(list: &HostList, pass: &Pass) {
         l.CopyBufferRegion(&pass.readback, 16, &pass.cells, (2 * CELLS + 1) * 16, 16);
         // (The rooms' measures and share, and their mean.)
         l.CopyBufferRegion(&pass.readback, 32, &pass.cells, (2 * CELLS + 3) * 16, 32);
+        // (The contrast gain.)
+        l.CopyBufferRegion(&pass.readback, 64, &pass.cells, (2 * CELLS + 5) * 16, 16);
         l.ResourceBarrier(&[crate::host::transition(
             &pass.cells,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -1246,6 +1324,46 @@ mod tests {
             assert_eq!(day_share(sun, day), 1.0);
         }
         assert!((day_share(1.25, day) - 0.5).abs() < 1e-6);
+    }
+
+    /// The contrast gain over frames, with a scene whose bulk is lit by the
+    /// stand-in alone (it rises with the gain, a frame late) under lamps
+    /// that are not: where it settles and how fast.
+    fn contrast_run(lamps: f32, bulk: f32, set: [f32; 2], frames: usize) -> Vec<f32> {
+        let mut log_gain = 0.0f32;
+        let mut gains = Vec::new();
+        for _ in 0..frames {
+            let gain = log_gain.exp();
+            let lit_bulk = bulk * gain;
+            log_gain = contrast_step(log_gain, lamps + lit_bulk, lit_bulk, set, 1.0);
+            gains.push(log_gain.exp());
+        }
+        gains
+    }
+
+    #[test]
+    fn contrast_settings_and_gain() {
+        assert_eq!(parse_contrast(""), [0.0, 1.0]);
+        assert_eq!(parse_contrast("x"), [0.0, 1.0]);
+        assert_eq!(parse_contrast("3"), [3.0, 8.0]);
+        assert_eq!(parse_contrast("3:4"), [3.0, 4.0]);
+        assert_eq!(parse_contrast("3:0.5"), [3.0, 1.0]);
+        let set = [4.0, 8.0];
+        // The diner cutscene (mean 0.15, bulk 0.012): it settles where the
+        // bulk is a fourth of the mean, 0.15 / (4 x 0.012 - 0.012) = 4.2,
+        // within a second at 20 frames a second, without overshooting.
+        let diner = contrast_run(0.15, 0.012, set, 40);
+        let settled = 0.15 / (4.0 * 0.012 - 0.012);
+        assert!((diner[19] - settled).abs() / settled < 0.05, "{diner:?}");
+        assert!(diner.iter().all(|&g| g <= settled * 1.05), "{diner:?}");
+        // The opening's street (mean 1.5-3.8 times the bulk, run intro-s-luz3): no gain.
+        for (lamps, bulk) in [(0.01, 0.01), (0.0055, 0.002), (0.014, 0.011)] {
+            assert!(contrast_run(lamps, bulk, set, 40).iter().all(|&g| g == 1.0));
+        }
+        // Never past the most.
+        assert!(contrast_run(1.0, 0.001, set, 60).iter().all(|&g| g <= 8.0 + 1e-4));
+        // Inside rooms it does not build up.
+        assert_eq!(contrast_step(0.0, 1.0, 0.001, set, 0.0), 0.0);
     }
 
     #[test]
