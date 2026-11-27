@@ -973,5 +973,33 @@ fn the_lanes_past_a_count_of_threads_do_not_store_or_count_in_the_paired_form() 
     }
 }
 
+/// [`counted_program`] with a group barrier: no lane may leave at entry, in any form. In the
+/// paired form, and in two host waves of 32 that exchange EXEC's halves (the console wave64
+/// program reads EXEC as a number).
+#[test]
+fn the_lanes_past_a_count_of_threads_stay_for_a_barrier_and_do_not_store_or_count() {
+    for threads in [64u32, 128] {
+        let shader = counted_paired(&counted_program(true, threads, true));
+        if !counted_on_the_card(&shader, threads, 2, 64, &format!("paired, barrier, {threads} threads")) {
+            return;
+        }
+    }
+    // (and a console wave32 program with a barrier, in host waves of its own size)
+    for (wave64, threads, barrier) in [(true, 64u32, false), (true, 64, true), (true, 128, true), (false, 64, true)] {
+        let native = counted_program(wave64, threads, barrier);
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let shader = lowered_counted(&native, &p, &HashSet::new(), 32, true).expect("lower");
+        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+            let mut copy = shader.dxil.clone();
+            v.validate(&mut copy).expect("DXIL validation failed");
+        }
+        let what = format!("wave64 {wave64}, barrier {barrier}, {threads} threads");
+        let wave = if wave64 { 64 } else { 32 };
+        if !counted_on_the_card(&shader, threads, 2, wave, &what) {
+            return;
+        }
+    }
+}
+
 #[path = "paired_tests.rs"]
 mod paired;

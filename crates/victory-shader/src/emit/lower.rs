@@ -118,7 +118,24 @@ fn counted_in_threads(parts: &Parts) -> bool {
         && cs.threads[1..] == [1, 1]
         && crate::spill::is_spilled(parts.native)
         && (!parts.native.wave64 || host_max_wave() >= 64 || counted_wave64())
-        && !parts.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
+        && (parts.native.wave64 && counted_barriers()
+            || !parts.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier"))
+}
+
+/// Whether the structure builder's console wave64 programs with group barriers are counted in
+/// threads too (`VICTORY_COUNTED_BARRIERS=1`; off by default, which leaves their lanes past
+/// the count running as before). Their lanes cannot leave at entry, since the barriers wait
+/// for every thread of the group: they stay and are left out of memory, EXEC's ballots and the
+/// wave's reductions (`Lower::partial_active`), in every form, the paired one too. In the
+/// title's builder these are `LeafRehydration`, `RadixCount`, `RadixAlloc` and the three
+/// larger `PrefixSum`s; on a host of 32-lane waves they are counted only with
+/// `VICTORY_COUNTED_WAVE64=1` as well.
+/// shortcut: the builder's wave32 programs with barriers (the four bitonic sorts of 1,024
+/// threads) are left as they are; the same holds for them, but no run has asked for it yet.
+/// Part of the shader cache's key.
+fn counted_barriers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COUNTED_BARRIERS").is_some_and(|v| v == "1"))
 }
 
 /// Whether the structure builder's console wave64 programs are counted in threads on a host of
@@ -3032,9 +3049,11 @@ impl<'a> Lower<'a> {
             let runs = self.s.m.bin(original, Bin::Or, all, inside);
             // (the paired form: a host lane carries two console lanes, of which only the
             // lower may have been launched, and its branches are the console wave's)
-            if self.halves.is_some() || self.exchange.is_some() || PAIRED.get() {
+            let barrier = p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier");
+            if self.halves.is_some() || self.exchange.is_some() || PAIRED.get() || barrier {
                 // A console wave in two host waves exchanges through group
-                // barriers, which every thread must reach: the threads stay.
+                // barriers, which every thread must reach: the threads stay. So
+                // they do where the program's own barriers wait for them.
                 self.partial_active = Some(runs);
             } else {
                 let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
