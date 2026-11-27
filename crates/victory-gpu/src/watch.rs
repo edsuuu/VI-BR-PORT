@@ -1107,6 +1107,24 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
     j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)))
 }
 
+/// [`asked`] without the list made: the notes of `[start, end)` given to
+/// `each` in page order, each page once, with the journal held (a caller
+/// that holds a copy's `copied` takes the two in that order, as
+/// `Shadow::nothing_new` does). The standing asking's number, or `None`, and
+/// nothing given, if the kernel would have to be asked.
+pub(crate) fn asked_each(start: usize, end: usize, mut each: impl FnMut(usize, u64)) -> Option<u64> {
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let j = journal();
+    if !j.ahead.holds(first, last) {
+        return None;
+    }
+    j.notes.each(first, last, |page, write| {
+        each(page, write);
+        true
+    });
+    Some(j.ahead_asked)
+}
+
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
 /// this asking's number, which is higher than any in the list but those the
