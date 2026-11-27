@@ -33,12 +33,25 @@ function Show-LauncherUiProblem {
     (Get-LauncherUiElement 'StatusDot').Fill = Get-LauncherUiBrush 'rose'
 }
 
-# The saved file's last write, to see when another process changed it.
+# What a set of settings shows (options, executable, language), to compare what the window
+# shows with what is saved.
+function Get-LauncherSettingsFingerprint {
+    param([Parameter(Mandatory)]$Settings)
+    $shown = [ordered]@{}
+    foreach ($k in 'options', 'game_exe', 'language') { $shown[$k] = $Settings[$k] }
+    return (ConvertTo-LauncherJsonText -Data $shown)
+}
+
+# The saved file's last write and length: a cheap look to skip reading it when it did not move.
 function Get-LauncherConfigStamp {
-    $path = Get-LauncherConfigPath
-    if (-not (Test-Path -LiteralPath $path)) { return 'none' }
-    $item = Get-Item -LiteralPath $path
-    return ('{0}:{1}' -f $item.LastWriteTimeUtc.Ticks, $item.Length)
+    $item = New-Object System.IO.FileInfo (Get-LauncherConfigPath)
+    try {
+        if (-not $item.Exists) { return 'none' }
+        return ('{0}:{1}' -f $item.LastWriteTimeUtc.Ticks, $item.Length)
+    } catch [System.IO.IOException] {
+        # Being swapped in this moment: a stamp that matches nothing, so it is read.
+        return [guid]::NewGuid().ToString()
+    }
 }
 
 # Builds (or builds again, after the language changed) the window's content.
@@ -123,7 +136,9 @@ function Update-LauncherUi {
         $ui.Updating = $false
     }
     $ui.Settings = $Settings
-    $ui.ConfigStamp = Get-LauncherConfigStamp
+    # What is shown, not the file's stamp now: a save another process makes while this ran
+    # must still be seen by Sync-LauncherUiFromDisk.
+    $ui.Shown = Get-LauncherSettingsFingerprint -Settings $Settings
 }
 
 # The line under the Play button: ready, what the first launch does, or what stops Play.
@@ -169,8 +184,13 @@ function Select-LauncherGameExe {
 function Sync-LauncherUiFromDisk {
     $ui = $script:LauncherUi
     if ($null -ne $ui.Running) { return }
-    if ((Get-LauncherConfigStamp) -eq $ui.ConfigStamp) { return }
+    # The stamp is taken before the file is read: a save that lands after the read moves it
+    # again, and the next look reads once more.
+    $stamp = Get-LauncherConfigStamp
+    if ($stamp -eq $ui.ConfigStamp) { return }
+    $ui.ConfigStamp = $stamp
     $settings = Get-LauncherSettings
+    if ((Get-LauncherSettingsFingerprint -Settings $settings) -eq $ui.Shown) { return }
     if (-not $ui.LanguageFixed -and $settings['language'] -ne $ui.Language) {
         $view = $ui.View
         $ui.Language = $settings['language']
@@ -288,7 +308,7 @@ function New-LauncherWindow {
     $window.UseLayoutRounding = $true
     $script:LauncherUi = @{
         Window = $window; Root = $null; Context = $null; Language = $Language; LanguageFixed = $fixed
-        Settings = $null; Updating = $false; View = 'play'; ConfigStamp = $null; Running = $null
+        Settings = $null; Updating = $false; View = 'play'; ConfigStamp = $null; Shown = $null; Running = $null
         StepStates = @{}; PlayFailed = $false; PlayPlan = $null
     }
     Initialize-LauncherWindowContent
