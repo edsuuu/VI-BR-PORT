@@ -128,6 +128,8 @@ pub struct App {
     /// The key bindings as typed in their text box (read when first shown).
     bindings_text: Option<String>,
     bindings_note: Option<String>,
+    /// The logs panel open on the main screen (the Logs button).
+    logs_open: bool,
     /// After clearing the compiled shaders: what was freed (or why not).
     shaders_note: Option<String>,
     /// The clear button asks once more before deleting.
@@ -162,6 +164,7 @@ impl App {
             crash_text: None,
             bindings_text: None,
             bindings_note: None,
+            logs_open: false,
             shaders_note: None,
             shaders_confirm: false,
             tray: None,
@@ -186,6 +189,13 @@ impl App {
 
     fn go(&mut self, view: View) {
         if self.view != view {
+            // The logs show on the main screen, not on a page of their own.
+            if view == View::Logs {
+                self.logs_open = true;
+                self.logs.read_at = None;
+                self.view = View::Play;
+                return;
+            }
             if view == View::Logs {
                 self.logs.back = if self.view == View::Logs { View::Play } else { self.view };
                 self.logs.read_at = None;
@@ -327,7 +337,7 @@ impl App {
             }
         }
         if crashed {
-            self.crash_text = Some(run::recent_logs(std::time::Duration::from_secs(3600), 2 << 20));
+            self.crash_text = Some(mask_user(&strip_ansi(&run::recent_logs(std::time::Duration::from_secs(3600), 2 << 20))));
             self.go(View::Crash);
         }
         let next = match &self.update {
@@ -498,13 +508,16 @@ impl App {
 {m}"),
             None => status.clone(),
         };
-        let top = Rect::from_min_max(scene.min, pos2(scene.min.x + num("layout", "cardWidth").min(scene.width()), scene.max.y - num("size", "playHeight") - 40.0));
+        // As wide as the scene allows (the log needs the room), up to a readable width.
+        let top = Rect::from_min_max(scene.min, pos2(scene.min.x + scene.width().min(1200.0), scene.max.y - num("size", "playHeight") - 40.0));
         ui.scope_builder(UiBuilder::new().max_rect(top).layout(Layout::top_down(egui::Align::Min)), |ui| {
             ui.spacing_mut().item_spacing.y = 12.0;
             self.notice_card(ui);
             self.update_card(ui, ctx);
             if self.prep.is_some() {
                 self.prep_panel(ui);
+            } else if self.logs_open {
+                self.logs_panel(ui);
             } else if !status.is_empty() {
                 theme::panel().inner_margin(14.0).show(ui, |ui| {
                     ui.set_width(ui.available_width());
@@ -799,7 +812,6 @@ impl App {
         let Some(prep) = &self.prep else { return };
         let mut back = false;
         let mut cancel = false;
-        let mut logs = false;
         {
             {
                 theme::panel().inner_margin(num("layout", "cardPadding")).show(ui, |ui| {
@@ -844,15 +856,17 @@ impl App {
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     let tail = run::tail(&run::log_path(id), 24 * 1024);
-                                    let mut shown = strip_ansi(&tail);
-                                    egui::ScrollArea::vertical().max_height(220.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
+                                    let mut shown = mask_user(&strip_ansi(&tail));
+                                    egui::ScrollArea::vertical().max_height(260.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
                                         ui.add(egui::TextEdit::multiline(&mut shown).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).interactive(false));
                                     });
+                                    if theme::outline_button(ui, &text::get(lang, "logs.copy"), None, false).clicked() {
+                                        ui.ctx().copy_text(shown.clone());
+                                    }
                                 });
                             ui.ctx().request_repaint_after(Duration::from_millis(300));
                         }
                         ui.horizontal(|ui| {
-                            logs = theme::outline_button(ui, &text::get(lang, "prep.see_logs"), None, false).clicked();
                             ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                                 if prep.finished {
                                     back = theme::outline_button(ui, &text::get(lang, "prep.back"), None, false).clicked();
@@ -873,9 +887,6 @@ impl App {
             prep.cancelled.store(true, Ordering::SeqCst);
             run::cancel(&prep.running);
         }
-        if logs {
-            self.go(View::Logs);
-        }
         if back {
             self.prep = None;
             self.go(View::Play);
@@ -884,10 +895,66 @@ impl App {
 
     // ---- Logs -------------------------------------------------------------
 
+    /// The logs, as a panel at the top of the main screen: one tab a step, the
+    /// log (the user's folder hidden), Open the folder, Copy, Close.
+    fn logs_panel(&mut self, ui: &mut egui::Ui) {
+        let lang = self.language;
+        if self.logs.read_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
+            self.logs.text = mask_user(&strip_ansi(&run::tail(&run::log_path(self.logs.step), LOG_TAIL)));
+            self.logs.read_at = Some(Instant::now());
+        }
+        let mut close = false;
+        theme::panel().inner_margin(num("layout", "cardPadding")).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 12.0;
+            ui.horizontal(|ui| {
+                ui.label(theme::title(&text::get(lang, "logs.title"), theme::type_size("titleSmall")));
+                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                    close = theme::close_button(ui, &text::get(lang, "common.close")).clicked();
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                for id in run::LOG_STEPS {
+                    if !run::log_path(*id).is_file() {
+                        continue;
+                    }
+                    let name = text::get(lang, &format!("prep.step.{}", id.key()));
+                    if theme::segment(ui, &name, self.logs.step == *id, 170.0).clicked() {
+                        self.logs.step = *id;
+                        self.logs.follow = false;
+                        self.logs.read_at = None;
+                    }
+                }
+            });
+            let h = (ui.available_height() - num("size", "controlHeight") - 40.0).clamp(160.0, 520.0);
+            egui::Frame::new().fill(colour("night")).stroke(egui::Stroke::new(1.0, colour("stroke"))).corner_radius(theme::radius("control")).inner_margin(12.0).show(ui, |ui| {
+                egui::ScrollArea::both().max_height(h).stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+                    let shown = if self.logs.text.is_empty() { text::get(lang, "logs.empty") } else { self.logs.text.clone() };
+                    ui.add(egui::Label::new(RichText::new(shown).monospace().color(colour("textSoft"))).extend());
+                });
+            });
+            ui.horizontal(|ui| {
+                if theme::outline_button(ui, &text::get(lang, "logs.open_folder"), None, false).clicked() {
+                    open_folder(&paths::logs_dir());
+                }
+                if theme::outline_button(ui, &text::get(lang, "logs.copy"), None, false).clicked() {
+                    ui.ctx().copy_text(self.logs.text.clone());
+                }
+                let path = mask_user(&run::log_path(self.logs.step).display().to_string());
+                ui.add(egui::Label::new(theme::small(&path, "textMuted").size(theme::type_size("caption"))).truncate());
+            });
+        });
+        ui.ctx().request_repaint_after(Duration::from_millis(300));
+        if close {
+            self.logs_open = false;
+        }
+    }
+
     fn logs_view(&mut self, ui: &mut egui::Ui, full: Rect) {
         let lang = self.language;
         if self.logs.read_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
-            self.logs.text = strip_ansi(&run::tail(&run::log_path(self.logs.step), LOG_TAIL));
+            self.logs.text = mask_user(&strip_ansi(&run::tail(&run::log_path(self.logs.step), LOG_TAIL)));
             self.logs.read_at = Some(Instant::now());
         }
         let mut close = false;
@@ -954,7 +1021,7 @@ impl App {
             });
         });
         if copy {
-            ui.ctx().copy_text(self.crash_text.clone().unwrap_or_default());
+            ui.ctx().copy_text(mask_user(&self.crash_text.clone().unwrap_or_default()));
         }
         if folder {
             open_folder(&paths::logs_dir());
@@ -1347,4 +1414,49 @@ fn strip_ansi(text: &str) -> String {
         out.push(c);
     }
     out
+}
+
+/// A text with the player's own folder (USERPROFILE: C:Users<name>) written as
+/// %USERPROFILE%, so a log shown or copied does not carry their user name.
+fn mask_user(text: &str) -> String {
+    let Some(home) = std::env::var_os("USERPROFILE").map(|h| h.to_string_lossy().into_owned()).filter(|h| h.len() > 3) else {
+        return text.to_owned();
+    };
+    let mut out = text.to_owned();
+    for form in [home.clone(), home.replace('\\', "/")] {
+        out = replace_ignore_case(&out, &form, "%USERPROFILE%");
+    }
+    out
+}
+
+fn replace_ignore_case(text: &str, from: &str, to: &str) -> String {
+    let lower = text.to_lowercase();
+    let needle = from.to_lowercase();
+    if needle.is_empty() || lower.len() != text.len() {
+        return text.replace(from, to);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    while let Some(i) = lower[at..].find(&needle) {
+        out.push_str(&text[at..at + i]);
+        out.push_str(to);
+        at += i + needle.len();
+    }
+    out.push_str(&text[at..]);
+    out
+}
+
+#[cfg(test)]
+mod mask_tests {
+    #[test]
+    fn the_user_folder_is_hidden_in_either_slash_and_case() {
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        if home.len() <= 3 {
+            return;
+        }
+        let line = format!("{home}\\Desktop and {} and {}", home.replace('\\', "/"), home.to_uppercase());
+        let masked = super::mask_user(&line);
+        assert!(!masked.to_lowercase().contains(&home.to_lowercase()), "{masked}");
+        assert!(masked.starts_with("%USERPROFILE%\\Desktop"));
+    }
 }
