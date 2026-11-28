@@ -473,8 +473,8 @@ pub(crate) fn module() -> HleModule {
     }
 }
 
-/// The return addresses above the caller, as `module+rva`, for logs.
-#[cfg(feature = "diagnostics")]
+/// The return addresses above the caller, as `module+rva`, for logs (in
+/// release builds too: the runtime's once-only lines name their caller).
 pub(crate) fn callers() -> String {
     host::callers()
 }

@@ -261,6 +261,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// True the first time only. Where we knowingly differ from the documented
+/// behaviour in a way only some uses can notice, the first such use is
+/// said once (release logs included, with where it came from), so a run
+/// shows whether the difference can matter to the title at all.
+fn first(seen: &AtomicBool) -> bool {
+    !seen.swap(true, Ordering::Relaxed)
+}
+
 /// The process queue: `None` until first used (then a thread-pool queue),
 /// `Some(None)` once the title clears it.
 static PROCESS_QUEUE: Mutex<Option<Option<Arc<Queue>>>> = Mutex::new(None);
@@ -364,6 +372,21 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
         return false;
     };
     if port.mode != Mode::Manual {
+        // Documented: any port may be dispatched, the callback then running
+        // on the caller's thread, and the timeout is waited out when nothing
+        // is queued. Ours hand their callbacks to threads of their own, so
+        // there is never one to take here, and we do not wait: a title loop
+        // that dispatches such a port with a timeout spins instead of
+        // sleeping. https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuedispatch
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if first(&SEEN) {
+            tracing::info!(
+                mode = ?port.mode,
+                timeout_ms,
+                from = %super::kernel::callers(),
+                "XTaskQueueDispatch on a port that is not manual: false at once, the timeout not waited out (said once)"
+            );
+        }
         return false;
     }
     match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
@@ -390,15 +413,34 @@ pub fn XTaskQueueSubmitDelayedCallback(
 
 /// Cancels what is still queued or waiting out a delay (callbacks see
 /// `canceled`), refuses new work, then calls `callback`.
+///
+/// Documented, every pending callback of both ports is dispatched as
+/// canceled where its port dispatches (a manual port by the title's
+/// dispatch calls), the terminated callback comes from the completion port
+/// at the end, and `wait` makes the call return only once all that is
+/// done. Here the canceled callbacks and the terminated callback run on the
+/// calling thread before it returns, whatever `wait` says; callbacks
+/// already handed to the thread pool are neither canceled nor waited for.
+/// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueueterminate
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
-    _wait: bool,
+    wait: bool,
     context: *mut c_void,
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
     let Some(queue) = queue(handle) else {
         return E_INVALIDARG;
     };
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if first(&SEEN) {
+        tracing::info!(
+            wait,
+            work = ?queue.ports[WORK as usize].mode,
+            completion = ?queue.ports[COMPLETION as usize].mode,
+            from = %super::kernel::callers(),
+            "XTaskQueueTerminate: queued callbacks run canceled on this thread, thread-pool ones are not canceled (said once)"
+        );
+    }
     queue.terminated.store(true, Ordering::Release);
     for port in &queue.ports {
         let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
@@ -728,6 +770,13 @@ pub fn XAsyncCancel(block: *mut AsyncBlock) {
         if *lock(&call.done) {
             return;
         }
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if first(&SEEN) {
+            tracing::info!(
+                from = %super::kernel::callers(),
+                "XAsyncCancel on a call in flight: it ends with E_ABORT at once and its provider is cleaned up (said once)"
+            );
+        }
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
         complete_call(&call, block, E_ABORT, 0);
     }
@@ -757,6 +806,16 @@ pub fn XAsyncGetResult(
         return E_ILLEGAL_METHOD_CALL;
     };
     if call.identity != identity as usize {
+        // Documented as a call mismatch. Our result functions pass the
+        // identity their begin used, so for one of ours this is a mix-up of
+        // ours, not the title's.
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if first(&SEEN) {
+            tracing::warn!(
+                from = %super::kernel::callers(),
+                "XAsyncGetResult for another call than the block's: E_INVALIDARG (said once)"
+            );
+        }
         return E_INVALIDARG;
     }
     if buffer_size < size || buffer.is_null() {
@@ -1116,6 +1175,28 @@ mod tests {
             if canceled { 100 } else { context as u32 },
             Ordering::SeqCst,
         );
+    }
+
+    #[test]
+    fn a_difference_is_said_once() {
+        let seen = AtomicBool::new(false);
+        assert!(first(&seen));
+        assert!(!first(&seen));
+        assert!(!first(&seen));
+    }
+
+    /// What the first-use line says: a port that is not manual is never
+    /// dispatched here, and the timeout is not waited out.
+    #[test]
+    fn dispatching_a_thread_pool_port_returns_at_once() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let start = std::time::Instant::now();
+        for _ in 0..2 {
+            assert!(!XTaskQueueDispatch(q, WORK, 500));
+        }
+        assert!(start.elapsed() < Duration::from_millis(400));
+        XTaskQueueCloseHandle(q);
     }
 
     #[test]
