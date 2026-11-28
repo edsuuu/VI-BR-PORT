@@ -38,26 +38,45 @@ pub fn report(label: &str, p: &Program, st: Option<&Structured>) -> Vec<String> 
 /// The families whose walks are taken out of the programs and made host ray
 /// queries: `VICTORY_RT_QUERY`, a list of family names (`a0`, the only one
 /// taken out so far; the others are accepted and do nothing yet), or `all`.
+/// `a0f` is family A0 with the walks whose query must also give the hit's
+/// node fields, hit kind or barycentrics to the code after it (the GI
+/// walks, `recognize/fields.rs`): a superset of `a0`, which stays as it was.
 /// Off (empty) by default. `VICTORY_RT_MISS=1` wins: nothing is taken out.
 /// A program so translated needs the host's structure bound where the
 /// title's was (the user-data dword `USER_STRUCTURE`, `shader.rs`). Part of
 /// the translation: the shader cache keys on it.
 pub fn families() -> &'static [Family] {
-    static ON: std::sync::OnceLock<Vec<Family>> = std::sync::OnceLock::new();
+    &selection().0
+}
+
+/// Whether `VICTORY_RT_QUERY` names `a0f` (or `all`): the walks that need
+/// what [`Walk::extended`] lists are taken out too.
+pub fn extended() -> bool {
+    selection().1
+}
+
+fn selection() -> &'static (Vec<Family>, bool) {
+    static ON: std::sync::OnceLock<(Vec<Family>, bool)> = std::sync::OnceLock::new();
     ON.get_or_init(|| parse_families(std::env::var("VICTORY_RT_QUERY").ok().as_deref()))
 }
 
-/// `VICTORY_RT_QUERY`'s families. Pure, for testing.
-fn parse_families(value: Option<&str>) -> Vec<Family> {
+/// `VICTORY_RT_QUERY`'s families, and whether it names `a0f`. Pure, for
+/// testing.
+fn parse_families(value: Option<&str>) -> (Vec<Family>, bool) {
     let Some(value) = value else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     if value.trim().eq_ignore_ascii_case("all") {
-        return vec![Family::A0, Family::AF, Family::AA, Family::B0, Family::BF, Family::BA];
+        return (vec![Family::A0, Family::AF, Family::AA, Family::B0, Family::BF, Family::BA], true);
     }
-    let mut out: Vec<Family> = value.split(',').filter_map(Family::parse).collect();
+    let extended = value.split(',').any(|f| f.trim().eq_ignore_ascii_case("a0f"));
+    let mut out: Vec<Family> = value
+        .split(',')
+        .filter_map(|f| if f.trim().eq_ignore_ascii_case("a0f") { Some(Family::A0) } else { Family::parse(f) })
+        .collect();
+    out.sort_by_key(|f| f.name());
     out.dedup();
-    out
+    (out, extended)
 }
 
 thread_local! {
@@ -73,7 +92,7 @@ pub(crate) fn take_out(native: &NativeProgram, p: &Program, st: &Structured) -> 
     if families.is_empty() || native.stage != HwStage::Cs || crate::emit::rt_miss() {
         return None;
     }
-    replace::replace(p, st, families)
+    replace::replace(p, st, families, extended())
 }
 
 /// Runs `f` (a translation of a program [`take_out`] made) with the queries
@@ -98,10 +117,13 @@ mod tests {
 
     #[test]
     fn the_query_switch_parses_families() {
-        assert!(parse_families(None).is_empty());
-        assert!(parse_families(Some("")).is_empty());
-        assert_eq!(parse_families(Some("a0")), vec![Family::A0]);
-        assert_eq!(parse_families(Some("A0, b0,zz")), vec![Family::A0, Family::B0]);
-        assert_eq!(parse_families(Some("all")).len(), 6);
+        assert_eq!(parse_families(None), (vec![], false));
+        assert_eq!(parse_families(Some("")), (vec![], false));
+        assert_eq!(parse_families(Some("a0")), (vec![Family::A0], false));
+        assert_eq!(parse_families(Some("A0, b0,zz")), (vec![Family::A0, Family::B0], false));
+        assert_eq!(parse_families(Some("a0f")), (vec![Family::A0], true));
+        assert_eq!(parse_families(Some("a0,A0F")), (vec![Family::A0], true));
+        let all = parse_families(Some("all"));
+        assert_eq!((all.0.len(), all.1), (6, true));
     }
 }

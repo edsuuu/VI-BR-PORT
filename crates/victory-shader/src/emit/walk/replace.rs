@@ -19,8 +19,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::recognize::{Bound, ExitKind, Family, Mask, Role, Walk, recognize};
-use crate::gfx10::{Fields, Operand};
+use super::cfg::Loops;
+use super::recognize::{Bound, ExitKind, Family, Field, Mask, Role, Walk, recognize};
+use crate::gfx10::{Encoding, Fields, Instruction, Operand};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::structure::Structured;
 
@@ -87,11 +88,22 @@ pub(crate) enum OutKind {
     /// The entry value.
     Entry,
     Constant(u32),
+    /// The committed triangle's barycentrics (the weights of its second
+    /// and third vertices); a miss leaves the entry value.
+    BaryI,
+    BaryJ,
+    /// The DXR hit kind: 0xfe for the front face, 0xff for the back; a miss
+    /// leaves the entry value.
+    HitKind,
+    /// A field of the hit's nodes the code after the walk reads (not
+    /// [`Field::Blas`]), in a register of its own that the load of the
+    /// field now copies; a miss leaves the entry value.
+    Field(Field),
 }
 
 /// `p` with the walks of `families` that fit taken out, and the queries that
 /// stand for them; `None` when none is.
-pub(crate) fn replace(p: &Program, st: &Structured, families: &[Family]) -> Option<(Program, Vec<Query>)> {
+pub(crate) fn replace(p: &Program, st: &Structured, families: &[Family], extended: bool) -> Option<(Program, Vec<Query>)> {
     let mut q = p.clone();
     let mut own: Option<Structured> = None;
     let mut queries = Vec::new();
@@ -101,7 +113,11 @@ pub(crate) fn replace(p: &Program, st: &Structured, families: &[Family]) -> Opti
         let walks = recognize(&q, Some(st));
         let Some(w) = walks
             .into_iter()
-            .find(|w| w.fits() && families.contains(&w.family) && !tried.contains(&w.site_offsets[0]))
+            .find(|w| {
+                (w.fits() || extended && w.fits_extended())
+                    && families.contains(&w.family)
+                    && !tried.contains(&w.site_offsets[0])
+            })
         else {
             break;
         };
@@ -252,6 +268,9 @@ pub(crate) fn collapse(p: &Program, w: &Walk) -> Result<(Program, Query), &'stat
             }
             (Reg::V(_), Some(Role::Entry)) => OutKind::Entry,
             (Reg::V(_), Some(Role::Constant(k))) => OutKind::Constant(*k),
+            (Reg::V(_), Some(Role::BaryI)) => OutKind::BaryI,
+            (Reg::V(_), Some(Role::BaryJ)) => OutKind::BaryJ,
+            (Reg::V(_), Some(Role::HitKind)) => OutKind::HitKind,
             _ => return Err("an output a query does not give"),
         };
         if outputs.iter().any(|o: &(Output, Value, Value)| o.0.reg == live.reg) {
@@ -271,6 +290,39 @@ pub(crate) fn collapse(p: &Program, w: &Walk) -> Result<(Program, Query), &'stat
         let value = new_value();
         swap.insert(live.value, value);
         outputs.push((Output { reg: live.reg, kind }, value, entry));
+    }
+
+    // The hit's node fields the code after reads: each load becomes a copy
+    // of a register of its own past the program's (one a field), which the
+    // site writes; the bottom level's word, which the code only makes the
+    // other addresses of, becomes 0. The site dominates every such load.
+    let mut vgprs = p.vgprs;
+    let mut copies: HashMap<(usize, usize), Inst> = HashMap::new();
+    if !w.fields.is_empty() {
+        let loops = Loops::new(p);
+        let mut regs: HashMap<Field, (Reg, Value)> = HashMap::new();
+        for f in &w.fields {
+            if !loops.dominates(x, f.site.0) {
+                return Err("a node field read where the walk's exit does not dominate");
+            }
+            let from = match f.field {
+                Field::Blas => None,
+                field => Some(match regs.get(&field) {
+                    Some(&rv) => rv,
+                    None => {
+                        let n = u8::try_from(vgprs).map_err(|_| "no register left for a node field")?;
+                        vgprs += 1;
+                        let (r, value, entry) = (Reg::V(n), new_value(), new_value());
+                        inputs.push((r, entry));
+                        outputs.push((Output { reg: r, kind: OutKind::Field(field) }, value, entry));
+                        regs.insert(field, (r, value));
+                        (r, value)
+                    }
+                }),
+            };
+            let load = &p.blocks[f.site.0].insts[f.site.1];
+            copies.insert(f.site, copy(load, f.dst, from, p.wave64)?);
+        }
     }
 
     // The query.
@@ -412,6 +464,11 @@ pub(crate) fn collapse(p: &Program, w: &Walk) -> Result<(Program, Query), &'stat
                     *q = h;
                 }
             }
+            for (i, inst) in block.insts.iter_mut().enumerate() {
+                if let Some(c) = copies.get(&(b, i)) {
+                    *inst = c.clone();
+                }
+            }
             for phi in &mut block.phis {
                 let r = phi.reg;
                 for a in &mut phi.args {
@@ -438,6 +495,38 @@ pub(crate) fn collapse(p: &Program, w: &Walk) -> Result<(Program, Query), &'stat
     if blocks.iter().any(|b| b.exit.successors().contains(&usize::MAX)) {
         return Err("an edge into the region's body");
     }
-    let program = Program { wave64: p.wave64, vgprs: p.vgprs, blocks, inputs };
+    let program = Program { wave64: p.wave64, vgprs, blocks, inputs };
     Ok((program, query))
+}
+
+/// The instruction that stands for field load `load` (one dword into VGPR
+/// `dst`): `v_mov_b32 dst, from`, or `v_mov_b32 dst, 0` without a register,
+/// at the load's offset, reading the lanes and the register's old value as
+/// the load did.
+fn copy(load: &Inst, dst: u8, from: Option<(Reg, Value)>, wave64: bool) -> Result<Inst, &'static str> {
+    let Some(old) = load.read(Reg::V(dst)) else {
+        return Err("a field load without its register's old value");
+    };
+    let Some(result) = load.write(Reg::V(dst)) else {
+        return Err("a field load that writes no register");
+    };
+    if load.writes.len() != 1 {
+        return Err("a field load of more than one dword");
+    }
+    // VOP1 v_mov_b32 (opcode 1): src0 a VGPR (256 + n) or the inline 0 (128).
+    let src0 = match from {
+        Some((Reg::V(r), _)) => 256 + u32::from(r),
+        Some(_) => return Err("a field in no VGPR"),
+        None => 128,
+    };
+    let word = 0x7e00_0000 | u32::from(dst) << 17 | 1 << 9 | src0;
+    let machine = Instruction::new(load.machine.offset, Encoding::Vop1, 1, vec![word]);
+    let fields = machine.fields(wave64);
+    let mut reads: Vec<(Reg, Value)> =
+        load.reads.iter().copied().filter(|&(r, _)| matches!(r, Reg::S(c) if c == EXEC || c == EXEC + 1)).collect();
+    if let Some(f) = from {
+        reads.push(f);
+    }
+    reads.push((Reg::V(dst), old));
+    Ok(Inst { machine, fields, reads, writes: vec![(Reg::V(dst), result)] })
 }

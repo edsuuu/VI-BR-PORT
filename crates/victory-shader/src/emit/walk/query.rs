@@ -19,8 +19,12 @@
 
 use super::super::rayquery::{COMMITTED_TRIANGLE_HIT, InlineRay, State};
 use super::super::shader::{SLOT_STRUCTURE, USER_STRUCTURE};
+use super::super::walk::recognize::Field;
 use super::super::walk::replace::{OutKind, Query, TMin};
-use super::{Cast, Inst, Lower, Reg, RootType, Term, V, Why, pred};
+use super::{Bin, Cast, Inst, Lower, Reg, RootType, Term, V, Why, pred};
+
+/// DXR's `HIT_KIND_TRIANGLE_FRONT_FACE`; the back face is one more.
+const HIT_KIND_FRONT: u32 = 0xfe;
 
 impl<'a> Lower<'a> {
     /// The site at `(b, i)`, which stands for the walk `q` describes.
@@ -97,6 +101,36 @@ impl<'a> Lower<'a> {
                 }
                 OutKind::Entry => entry,
                 OutKind::Constant(k) => self.s.m.i32(k),
+                OutKind::BaryI | OutKind::BaryJ => {
+                    let c = u8::from(o.kind == OutKind::BaryJ);
+                    let x = self.s.ray_query_barycentric(after, query, true, c);
+                    let x = self.s.m.cast(after, Cast::Bitcast, x, i32t);
+                    self.s.m.select(after, hit, x, entry)
+                }
+                OutKind::HitKind => {
+                    let front = self.s.ray_query_state(after, query, State::CommittedTriangleFrontFace);
+                    let (fe, ff) = (self.s.m.i32(HIT_KIND_FRONT), self.s.m.i32(HIT_KIND_FRONT + 1));
+                    let k = self.s.m.select(after, front, fe, ff);
+                    self.s.m.select(after, hit, k, entry)
+                }
+                OutKind::Field(field) => {
+                    let x = match field {
+                        Field::InstanceIndex => self.s.ray_query_state(after, query, State::CommittedInstanceIndex),
+                        Field::PrimitiveIndex => self.s.ray_query_state(after, query, State::CommittedPrimitiveIndex),
+                        // The console's word: the geometry index in the high 24
+                        // bits, the geometry's flags in the low 8, which the
+                        // query does not give: OPAQUE (1), as the query takes
+                        // every geometry [inf].
+                        Field::GeometryWord => {
+                            let g = self.s.ray_query_state(after, query, State::CommittedGeometryIndex);
+                            let (eight, one) = (self.s.m.i32(8), self.s.m.i32(1));
+                            let g = self.s.m.bin(after, Bin::Shl, g, eight);
+                            self.s.m.bin(after, Bin::Or, g, one)
+                        }
+                        Field::Blas => return Err("a bottom level's word as a query output"),
+                    };
+                    self.s.m.select(after, hit, x, entry)
+                }
             };
             results.push((v, entry));
         }
