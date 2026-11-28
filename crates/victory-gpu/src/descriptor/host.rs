@@ -4397,6 +4397,19 @@ fn make_twinned(
                     let own_mips = u32::from(unsafe { texture.GetDesc() }.MipLevels);
                     from_base(desc, copy.base, own_mips);
                 }
+                // VICTORY_VIEW_CHECK=1 (off by default): the view fitted to
+                // the host copy, or left null if it cannot be.
+                if super::viewcheck::on()
+                    && let Some(desc) = &mut desc
+                {
+                    // SAFETY: a live resource.
+                    let own = unsafe { texture.GetDesc() };
+                    let before = *desc;
+                    let verdict = super::viewcheck::shader_view(&own, desc);
+                    if !super::viewcheck::note("texture shader view", verdict, Some(&own), &before, desc) {
+                        return None;
+                    }
+                }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
                     device.CreateShaderResourceView(
@@ -4458,6 +4471,18 @@ fn make_twinned(
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
             }
+            // VICTORY_VIEW_CHECK=1 (off by default), as for shader views.
+            if super::viewcheck::on()
+                && let Some(desc) = &mut desc
+            {
+                // SAFETY: a live resource.
+                let own = unsafe { texture.GetDesc() };
+                let before = *desc;
+                let verdict = super::viewcheck::unordered_view(&own, desc);
+                if !super::viewcheck::note("texture unordered view", verdict, Some(&own), &before, desc) {
+                    return None;
+                }
+            }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {
                 device.CreateUnorderedAccessView(
@@ -4471,11 +4496,18 @@ fn make_twinned(
         }
         View::Sampler(words) => {
             // SAFETY: 13 words in the host's layout.
-            let desc = unsafe {
+            let mut desc = unsafe {
                 std::ptr::from_ref(words)
                     .cast::<D3D12_SAMPLER_DESC>()
                     .read_unaligned()
             };
+            // VICTORY_VIEW_CHECK=1 (off by default): fitted to the host's
+            // limits (a sampler always can be).
+            if super::viewcheck::on() {
+                let before = desc;
+                let verdict = super::viewcheck::sampler(&mut desc);
+                super::viewcheck::note("sampler", verdict, None, &before, &desc);
+            }
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
@@ -4495,7 +4527,12 @@ fn make_twinned(
                     return Some(None);
                 }
             }
-            let desc = crate::sampler::console(words);
+            let mut desc = crate::sampler::console(words);
+            if super::viewcheck::on() {
+                let before = desc;
+                let verdict = super::viewcheck::sampler(&mut desc);
+                super::viewcheck::note("console sampler", verdict, None, &before, &desc);
+            }
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
             Some(None)
