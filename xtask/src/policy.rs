@@ -21,6 +21,9 @@ const ALLOWED_EXTENSIONS: &[&str] = &[
     // Drawings we wrote (the charts of docs/img): text, under the same checks as any text, so a
     // picture encoded into one is turned down by its long run.
     "svg",
+    // Settings we wrote (bindings.ini, the mouse and keyboard keys that play.ps1 -MouseKeyboard
+    // copies), plain lines of key = value.
+    "ini",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
