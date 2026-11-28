@@ -5715,6 +5715,9 @@ impl Host {
     /// `covers`: compares of pieces these flights owed ([`heat`]), which
     /// have run: what they flagged lands with them.
     fn relay_land(&self, items: Vec<Late>, covers: Vec<CardPlan>, fetch: &mut Option<RelayFetch>) {
+        // Diagnostics (`VICTORY_WRITE_STAMPS`): the writes from here on carry
+        // this landing's number.
+        crate::smash::landing_begins();
         let landing = std::time::Instant::now();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
         {

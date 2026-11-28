@@ -52,7 +52,7 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// `VICTORY_SMASH_WATCH`: 0 (unset) off, 1 the writes, 2 also the watch of
@@ -392,19 +392,109 @@ fn declared_over(at: usize) -> (Vec<u64>, Vec<(usize, usize)>) {
 /// The copy watched for block ends: start and bytes (the biggest landed
 /// through so far).
 static WATCHED: Mutex<(usize, usize)> = Mutex::new((0, 0));
-/// Per 64 KiB of the watched copy: who of ours wrote it last, and when
-/// (milliseconds << 8 | path + 1).
-static TOUCHED: OnceLock<Vec<AtomicU64>> = OnceLock::new();
-static TOUCHED_BASE: AtomicUsize = AtomicUsize::new(0);
-
-/// The most 64 KiB pieces the watch looks at (2 GiB).
+/// The most 64 KiB pieces stamped (2 GiB).
 const WATCH_MOST: usize = 32768;
 
-/// A copy is landed through (`crate::shadow`): with `2`, the biggest of
-/// them from 64 MiB on is watched (the title's 174 MiB heap, where the ring
-/// lies). The first one keeps the watch.
+/// `VICTORY_WRITE_STAMPS=1` (off by default): who of ours wrote each 64 KiB
+/// of the biggest copy landed through (the title's 174 MiB heap, where the
+/// ring lies) is kept, the last [`WRITERS`] of each: the path, when, and
+/// the landing under way then ([`landing_begins`]). Nothing is checked at
+/// the writes and no thread runs: a store or two per write. The crash
+/// report's note prints them for the 64 KiB of each register, and for the
+/// block a register's ring descriptor names ([`writers_note`]). The watch
+/// of block ends and `crate::ringcheck` use the same stamps.
+pub(crate) fn stamps() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_WRITE_STAMPS") && crate::safecopy::on())
+}
+
+/// Writers kept per 64 KiB.
+const WRITERS: usize = 4;
+
+/// Landings begun since the start (`crate::host`'s `relay_land`).
+static LANDINGS: AtomicU64 = AtomicU64::new(0);
+
+/// A landing begins: writes from here on carry its number.
+pub(crate) fn landing_begins() {
+    LANDINGS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The last writers of each 64 KiB of `[base, base + pieces * BLOCK)`: per
+/// piece [`WRITERS`] stamps (milliseconds << 32 | landing << 8 | path + 1,
+/// the landing's low 24 bits) and the count of stamps put, whose low bits
+/// say which slot is next.
+pub(crate) struct Stamps {
+    base: usize,
+    pieces: Vec<[AtomicU64; WRITERS]>,
+    next: Vec<AtomicU32>,
+}
+
+/// One writer: its path, when (milliseconds of [`ms`], low 32 bits) and the
+/// landing under way then (low 24 bits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Writer {
+    pub(crate) path: Path,
+    pub(crate) ms: u64,
+    pub(crate) landing: u64,
+}
+
+impl Stamps {
+    pub(crate) fn new(start: usize, len: usize) -> Stamps {
+        let n = (len / BLOCK + 2).min(WATCH_MOST);
+        Stamps {
+            base: start / BLOCK * BLOCK,
+            pieces: (0..n).map(|_| [const { AtomicU64::new(0) }; WRITERS]).collect(),
+            next: (0..n).map(|_| AtomicU32::new(0)).collect(),
+        }
+    }
+
+    fn piece(&self, at: usize) -> Option<usize> {
+        let piece = at.checked_sub(self.base)? / BLOCK;
+        (piece < self.pieces.len()).then_some(piece)
+    }
+
+    /// `path` writes `[at, at + len)` at `ms`, in landing `landing`.
+    pub(crate) fn stamp(&self, path: Path, at: usize, len: usize, ms: u64, landing: u64) {
+        let (Some(first), true) = (self.piece(at), len > 0) else {
+            return;
+        };
+        let last = self.piece(at + len - 1).unwrap_or(self.pieces.len() - 1);
+        let stamp = (ms & 0xffff_ffff) << 32 | (landing & 0xff_ffff) << 8 | (path.index() as u64 + 1);
+        for piece in first..=last.min(first + 64) {
+            let slot = self.next[piece].fetch_add(1, Ordering::Relaxed) as usize % WRITERS;
+            self.pieces[piece][slot].store(stamp, Ordering::Relaxed);
+        }
+    }
+
+    /// The writers kept for the 64 KiB at `at`, the last first.
+    pub(crate) fn writers(&self, at: usize) -> Vec<Writer> {
+        let Some(piece) = self.piece(at) else {
+            return Vec::new();
+        };
+        let mut all: Vec<Writer> = self.pieces[piece]
+            .iter()
+            .map(|s| s.load(Ordering::Relaxed))
+            .filter_map(|s| {
+                let path = Path::of(((s & 0xff) as u8).checked_sub(1)?)?;
+                Some(Writer { path, ms: s >> 32, landing: s >> 8 & 0xff_ffff })
+            })
+            .collect();
+        all.sort_by_key(|w| std::cmp::Reverse(w.ms));
+        all
+    }
+
+    fn holds(&self, at: usize) -> bool {
+        self.piece(at).is_some()
+    }
+}
+
+static STAMPS: OnceLock<Stamps> = OnceLock::new();
+
+/// A copy is landed through (`crate::shadow`): the biggest of them from 64
+/// MiB on (the title's 174 MiB heap, where the ring lies) is stamped with
+/// [`stamps`], and watched with `2` (the first one keeps both).
 pub(crate) fn seen_copy(start: usize, len: usize) {
-    if level() < 2 || len < 64 << 20 {
+    if level() < 2 && !stamps() || len < 64 << 20 {
         return;
     }
     {
@@ -425,6 +515,16 @@ pub(crate) fn seen_copy(start: usize, len: usize) {
         *watched = (start, len);
     }
     touch_range(start, len);
+    if stamps() {
+        tracing::info!(
+            start = format_args!("{start:#x}"),
+            len,
+            "write stamps (VICTORY_WRITE_STAMPS=1): the last 4 writers of ours of each 64 KiB of this copy are kept"
+        );
+    }
+    if level() < 2 {
+        return;
+    }
     tracing::info!(
         start = format_args!("{start:#x}"),
         len,
@@ -435,42 +535,74 @@ pub(crate) fn seen_copy(start: usize, len: usize) {
 }
 
 /// From now on [`touched`] notes who of ours writes each 64 KiB of `[start,
-/// start + len)`, for the watch of block ends and `crate::ringcheck` (the
-/// first range asked for is kept).
+/// start + len)`, for the watch of block ends, `crate::ringcheck` and the
+/// crash report (the first range asked for is kept).
 pub(crate) fn touch_range(start: usize, len: usize) {
-    if TOUCHED.get().is_some() {
-        return;
-    }
-    TOUCHED_BASE.store(start / BLOCK * BLOCK, Ordering::Relaxed);
-    let _ = TOUCHED.set((0..(len / BLOCK + 2).min(WATCH_MOST)).map(|_| AtomicU64::new(0)).collect());
+    let _ = STAMPS.set(Stamps::new(start, len));
 }
 
-/// A path of ours writes `[at, at + len)` of title memory: noted for the
-/// watch of block ends (with `2`, inside the watched copy).
+/// A path of ours writes `[at, at + len)` of title memory: noted, inside the
+/// stamped copy, with when and the landing under way.
 pub(crate) fn touched(path: Path, at: usize, len: usize) {
-    let Some(pieces) = TOUCHED.get() else {
+    let Some(stamps) = STAMPS.get() else {
         return;
     };
-    let base = TOUCHED_BASE.load(Ordering::Relaxed);
-    if len == 0 || at < base || at - base >= pieces.len() * BLOCK {
-        return;
-    }
-    let stamp = ms() << 8 | (path.index() as u64 + 1);
-    let (first, last) = ((at - base) / BLOCK, (at + len - 1 - base) / BLOCK);
-    for piece in first..=last.min(first + 64) {
-        if let Some(p) = pieces.get(piece) {
-            p.store(stamp, Ordering::Relaxed);
-        }
+    if stamps.holds(at) {
+        stamps.stamp(path, at, len, ms(), LANDINGS.load(Ordering::Relaxed));
     }
 }
 
 /// Who of ours wrote the 64 KiB at `at` last, and how long ago.
 pub(crate) fn last_touch(at: usize) -> Option<(Path, u64)> {
-    let pieces = TOUCHED.get()?;
-    let base = TOUCHED_BASE.load(Ordering::Relaxed);
-    let stamp = pieces.get(at.checked_sub(base)? / BLOCK)?.load(Ordering::Relaxed);
-    let path = Path::of(((stamp & 0xff) as u8).checked_sub(1)?)?;
-    Some((path, ms().saturating_sub(stamp >> 8)))
+    let w = *STAMPS.get()?.writers(at).first()?;
+    Some((w.path, (ms() & 0xffff_ffff).saturating_sub(w.ms)))
+}
+
+/// For the crash report: the last writers of the 64 KiB each register points
+/// into, and of the two 64 KiB of a 128 KiB block that a register's ring
+/// descriptor names (its qword at +0x10, `crate::ringcheck`); empty without
+/// stamps.
+fn writers_note(registers: &[u64; 16]) -> String {
+    let Some(stamps) = STAMPS.get() else {
+        return String::new();
+    };
+    writers_text(stamps, registers, ms() & 0xffff_ffff, LANDINGS.load(Ordering::Relaxed))
+}
+
+/// [`writers_note`] for `stamps`, at `now`, `landings` begun.
+fn writers_text(stamps: &Stamps, registers: &[u64; 16], now: u64, landings: u64) -> String {
+    const NAMES: [&str; 16] = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+    let mut text = format!(
+        "write stamps (VICTORY_WRITE_STAMPS): {landings} landings begun; the last writers of ours of each 64 KiB, the newest first:\n"
+    );
+    let line = |what: String, at: usize| -> String {
+        let writers: Vec<String> = stamps
+            .writers(at)
+            .iter()
+            .map(|w| format!("{} {} ms before the end (landing {})", w.path.short(), now.saturating_sub(w.ms), w.landing))
+            .collect();
+        let shown = if writers.is_empty() { "none".to_string() } else { writers.join(", ") };
+        format!("  {what} {at:#x}: {shown}\n")
+    };
+    for (name, &r) in NAMES.iter().zip(registers) {
+        let r = r as usize;
+        if stamps.holds(r) {
+            text.push_str(&line(format!("{name} in"), r));
+            continue;
+        }
+        // A ring descriptor: the block it names, both halves.
+        let mut block = [0u8; 8];
+        // SAFETY: into our own array; memory that is not there fails the
+        // copy.
+        if r != 0 && r.is_multiple_of(8) && unsafe { crate::safecopy::copy(block.as_mut_ptr(), r.wrapping_add(0x10) as *const u8, 8) } {
+            let block = u64::from_le_bytes(block) as usize;
+            if stamps.holds(block) && (block - stamps.base).is_multiple_of(2 * BLOCK) {
+                text.push_str(&line(format!("{name}'s ring block, first half"), block));
+                text.push_str(&line(format!("{name}'s ring block, second half (its last record)"), block + BLOCK));
+            }
+        }
+    }
+    text
 }
 
 /// What the watch of block ends makes of a qword that was `was` and is
@@ -752,10 +884,9 @@ pub(crate) fn log(frames: f64) {
 /// register's value first (the title faults on the pointer it read, and a
 /// register holds the record's address or the pointer).
 pub(crate) fn crash_note(registers: &[u64; 16]) -> String {
-    if !on() {
-        return String::new();
-    }
-    note_text(registers)
+    let mut text = if on() { note_text(registers) } else { String::new() };
+    text.push_str(&writers_note(registers));
+    text
 }
 
 /// [`crash_note`]'s text, whether the switch is on or not.
@@ -951,6 +1082,47 @@ mod tests {
             keep_title(at + 8, (held_at + 8) as *mut u8, 0x9_0418_cf18, 0x1_0418_cf18);
             assert_eq!(((at + 8) as *const u64).read_volatile(), 0x9_0418_d7e8);
         }
+    }
+
+    #[test]
+    fn the_stamps_keep_the_last_four_writers_of_each_64_kib_the_newest_first() {
+        // (No memory behind the range: stamps are only numbers.)
+        let base = 0x3744_0000;
+        let stamps = Stamps::new(base, 8 * BLOCK);
+        assert!(stamps.writers(base).is_empty());
+        for (i, path) in [Path::LandCard, Path::Descriptor, Path::Copy, Path::Value, Path::LandCard].into_iter().enumerate() {
+            stamps.stamp(path, base + BLOCK - 0x18, 0x18, 100 + i as u64, 7 + i as u64);
+        }
+        let w = stamps.writers(base);
+        assert_eq!(w.len(), 4);
+        assert_eq!(w[0], Writer { path: Path::LandCard, ms: 104, landing: 11 });
+        assert_eq!((w[1].path, w[2].path, w[3].path), (Path::Value, Path::Copy, Path::Descriptor));
+        // A write over two pieces stamps both; one outside stamps nothing.
+        stamps.stamp(Path::ReadBack, base + 2 * BLOCK - 8, 16, 200, 9);
+        assert_eq!(stamps.writers(base + 2 * BLOCK)[0].path, Path::ReadBack);
+        assert_eq!(stamps.writers(base + BLOCK)[0].path, Path::ReadBack);
+        stamps.stamp(Path::Copy, base - 16, 8, 300, 9);
+        assert!(stamps.writers(base - 16).is_empty());
+    }
+
+    #[test]
+    fn the_crash_note_names_the_writers_of_a_registers_64_kib_and_of_a_descriptors_block() {
+        if !crate::safecopy::on() {
+            return;
+        }
+        let base = 0x3744_0000usize;
+        let stamps = Stamps::new(base, 8 * BLOCK);
+        // The last record of block 1 (its second half) and a descriptor
+        // naming block 1, as `rdi` held it at barco-pg-3's crash.
+        stamps.stamp(Path::LandCard, base + 4 * BLOCK - 0x18, 8, 90, 321);
+        let descriptor = [0u64, 0, (base + 2 * BLOCK) as u64, 0];
+        let mut registers = [0u64; 16];
+        registers[7] = descriptor.as_ptr() as u64;
+        registers[15] = (base + 4 * BLOCK - 0x18) as u64;
+        let text = writers_text(&stamps, &registers, 100, 400);
+        assert!(text.contains("r15 in"), "{text}");
+        assert!(text.contains("rdi's ring block, second half"), "{text}");
+        assert!(text.contains("land-card 10 ms before the end (landing 321)"), "{text}");
     }
 
     #[test]
