@@ -334,4 +334,29 @@ mod tests {
         // position (`SPI_PS_INPUT_ENA` bit 15), which the lowering has not.
         assert!(refused.len() <= 1, "{translated} translated, refused: {refused:#?}");
     }
+
+    /// Every compute description of device method 0x218 dumped: its
+    /// program translates into DXIL the validator takes, or is refused as
+    /// something not supported (never as malformed).
+    #[test]
+    fn dumped_compute_descriptions_translate_or_are_refused_by_name() {
+        let mut refused = Vec::new();
+        let mut translated = 0;
+        for d in dumped::descriptions_of("218") {
+            let Some(container) = dumped::compute(&d) else {
+                continue;
+            };
+            let container = container.unwrap_or_else(|e| panic!("{d}: {e}"));
+            match translate(&container) {
+                Ok(shader) => {
+                    validate(&shader);
+                    translated += 1;
+                }
+                Err(ShaderError::Unsupported { what, .. }) => refused.push(format!("{d}: {what}")),
+                Err(e) => panic!("{d}: {e}"),
+            }
+        }
+        eprintln!("compute descriptions: {translated} translated, refused: {refused:#?}");
+        assert!(refused.len() <= translated, "{translated} translated, refused: {refused:#?}");
+    }
 }

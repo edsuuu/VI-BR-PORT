@@ -132,6 +132,16 @@ const PACKET_RSRC1: usize = 0x14;
 const PACKET_RSRC2: usize = 0x18;
 const FSPX_RECORDS: usize = 0x18;
 const FSPX_RECORD: usize = 32;
+/// The pipeline metadata entry of an `FSPX` part (a hash).
+const FSPX_PIPELINE_METADATA: u32 = 1;
+/// What a compute program's metadata starts with (`fspx_program`).
+const FSPX_META_TAG: u32 = 0x403;
+/// Bytes of a compute program's metadata its size field leaves out.
+const FSPX_META_UNCOUNTED: usize = 0x14;
+/// Where its record count sits.
+const FSPX_META_COUNT: usize = 0x14;
+/// Bytes of a compute pipeline's register packet.
+const FSPX_PACKET_SIZE: usize = 0x1c;
 /// The part of a container we make around a linked program.
 const LINKED_MAGIC: &[u8; 4] = b"VLNK";
 const LINKED_VERSION: u32 = 1;
@@ -593,6 +603,73 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }),
         code: code.to_vec(),
     })
+}
+
+/// A compute pipeline as device method 0x218 gets it, made a container of
+/// one `ACCC` part ([`fspx_program`] reads it like any other): the four
+/// blocks a deserialized compute pipeline names are the entries of an
+/// `FSPX` part, kinds 0 (`packet`), 1 (`pipeline_meta`), 6 (`code`) and 7
+/// (`meta`), in the same layout.
+///
+/// Everything [`fspx_program`] reads is checked first, and that code and
+/// metadata are one program's (the hash of the code's leading `v_nop`s is
+/// the metadata's 0x43 record, as in [`linked_program`]): a block that is
+/// something else is an error, not a container.
+pub fn deserialized_compute_container(
+    packet: &[u8],
+    pipeline_meta: &[u8],
+    code: &[u8],
+    meta: &[u8],
+) -> Result<Vec<u8>, ShaderError> {
+    if packet.len() != FSPX_PACKET_SIZE {
+        return Err(Malformed("a compute packet of another size"));
+    }
+    if u32_at(meta, 0)? != FSPX_META_TAG {
+        return Err(Malformed("unknown compute metadata"));
+    }
+    if u32_at(meta, 4)? as usize + FSPX_META_UNCOUNTED != meta.len() {
+        return Err(Malformed("compute metadata size disagrees"));
+    }
+    if u32_at(meta, 8)? as usize * 4 != code.len() {
+        return Err(Malformed("compute code size disagrees"));
+    }
+    let count = u32_at(meta, FSPX_META_COUNT)?;
+    if count & 0x7FFF != LINKED_MARK {
+        return Err(Malformed("unknown compute metadata"));
+    }
+    if FSPX_RECORDS + FSPX_RECORD * (count >> 15) as usize != meta.len() {
+        return Err(Malformed("compute metadata record count disagrees"));
+    }
+    let hash = match meta[FSPX_RECORDS..].as_chunks::<FSPX_RECORD>().0.last() {
+        Some(e) if e[0] == 0x43 => [le32(e, 4), le32(e, 8), le32(e, 12), le32(e, 16)],
+        _ => return Err(Malformed("compute metadata without a hash")),
+    };
+    if code_hash(code)? != hash {
+        return Err(Malformed("compute code and metadata of different programs"));
+    }
+    let entries = [
+        (FSPX_PACKET, packet),
+        (FSPX_PIPELINE_METADATA, pipeline_meta),
+        (FSPX_CODE, code),
+        (FSPX_METADATA, meta),
+    ];
+    let mut at = FSPX_HEADER + 16 * entries.len();
+    let total = at + entries.iter().map(|(_, b)| b.len()).sum::<usize>();
+    let mut part = b"FSPX".to_vec();
+    for v in [FSPX_VERSION, entries.len() as u32, total as u32] {
+        part.extend(v.to_le_bytes());
+    }
+    for (kind, block) in &entries {
+        for v in [*kind, at as u32, block.len() as u32, 0] {
+            part.extend(v.to_le_bytes());
+        }
+        at += block.len();
+    }
+    for (_, block) in &entries {
+        part.extend(*block);
+    }
+    fspx_program(&part)?;
+    Ok(crate::dxbc::build(&[(crate::FourCC::ACCC, &part)]))
 }
 
 /// The root parameters and used resources that the 32-byte records of a
@@ -1401,10 +1478,10 @@ fn bytes(data: &[u8], offset: u64, len: u64) -> Option<&[u8]> {
     data.get(start..start.checked_add(usize::try_from(len).ok()?)?)
 }
 
-/// What a run with `VICTORY_PSO_DUMP` wrote of device method 0x1c8's
-/// descriptions, when the worktree has it (`.agente/pso-dump`): the tests
-/// on the title's own blocks read them from there and pass without them,
-/// since no game data is kept in the repository.
+/// What a run with `VICTORY_PSO_DUMP` wrote of device methods 0x1c8's and
+/// 0x218's descriptions, when the worktree has it (`.agente/pso-dump`): the
+/// tests on the title's own blocks read them from there and pass without
+/// them, since no game data is kept in the repository.
 #[cfg(test)]
 pub(crate) mod dumped {
     use std::path::PathBuf;
@@ -1413,9 +1490,16 @@ pub(crate) mod dumped {
         PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.agente/pso-dump"))
     }
 
-    /// The block description `description` ("00001") names at `word`.
+    /// The block description `description` ("00001") of device method 0x1c8
+    /// names at `word`.
     pub(crate) fn block(description: &str, word: u32) -> Option<Vec<u8>> {
-        let prefix = format!("1c8-{description}-w{word}-");
+        block_of("1c8", description, word)
+    }
+
+    /// The block a description of the method `slot` ("1c8", "218") names at
+    /// `word`.
+    pub(crate) fn block_of(slot: &str, description: &str, word: u32) -> Option<Vec<u8>> {
+        let prefix = format!("{slot}-{description}-w{word}-");
         let entry = std::fs::read_dir(dir()).ok()?.flatten().find(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
@@ -1424,19 +1508,33 @@ pub(crate) mod dumped {
         std::fs::read(entry.path()).ok()
     }
 
-    /// Every description dumped, in order.
+    /// Every description of device method 0x1c8 dumped, in order.
     pub(crate) fn descriptions() -> Vec<String> {
+        descriptions_of("1c8")
+    }
+
+    /// Every description of the method `slot` dumped, in order.
+    pub(crate) fn descriptions_of(slot: &str) -> Vec<String> {
+        let prefix = format!("{slot}-");
         let mut out: Vec<String> = std::fs::read_dir(dir())
             .into_iter()
             .flatten()
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().into_owned();
-                Some(name.strip_prefix("1c8-")?.strip_suffix(".txt")?.to_owned())
+                Some(name.strip_prefix(&prefix)?.strip_suffix(".txt")?.to_owned())
             })
             .collect();
         out.sort();
         out
+    }
+
+    /// The compute container of a description of device method 0x218
+    /// (`super::deserialized_compute_container`), if all its blocks were
+    /// dumped.
+    pub(crate) fn compute(description: &str) -> Option<Result<Vec<u8>, crate::ShaderError>> {
+        let b = |word| block_of("218", description, word);
+        Some(super::deserialized_compute_container(&b(1)?, &b(3)?, &b(5)?, &b(7)?))
     }
 }
 
@@ -1444,7 +1542,10 @@ pub(crate) mod dumped {
 /// 0x1c8 gets them: for the tests here and of the translation.
 #[cfg(test)]
 pub(crate) mod fixture {
-    use super::{FSPX_RECORD, LINKED_CODE_EXTRA, LINKED_MARK, LINKED_RECORDS, LINKED_TAG};
+    use super::{
+        FSPX_META_TAG, FSPX_META_UNCOUNTED, FSPX_RECORD, FSPX_RECORDS, LINKED_CODE_EXTRA, LINKED_MARK, LINKED_RECORDS,
+        LINKED_TAG,
+    };
 
     pub(crate) const HASH: [u32; 4] = [0xD21D_A4DF, 0x1234_5678, 0x91FE_D799, 0x9ABC_DEF0];
 
@@ -1493,12 +1594,106 @@ pub(crate) mod fixture {
         meta.extend(words(&[0x43, hash[0], hash[1], hash[2], hash[3], 0, 0, 0]));
         meta
     }
+
+    /// Compute metadata for `code` (every dword of it counted) with
+    /// `records` and the hash record, as device method 0x218 gets it.
+    pub(crate) fn compute_meta(code: &[u8], records: &[[u8; FSPX_RECORD]], hash: [u32; 4]) -> Vec<u8> {
+        let size = FSPX_RECORDS + FSPX_RECORD * (records.len() + 1);
+        let mut meta = words(&[
+            FSPX_META_TAG,
+            (size - FSPX_META_UNCOUNTED) as u32,
+            (code.len() / 4) as u32,
+            0,
+            0,
+            LINKED_MARK | (records.len() as u32 + 1) << 15,
+        ]);
+        for r in records {
+            meta.extend_from_slice(r);
+        }
+        meta.extend(words(&[0x43, hash[0], hash[1], hash[2], hash[3], 0, 0, 0]));
+        meta
+    }
+
+    /// A compute pipeline's register packet: the thread-group size, the wave
+    /// size bit, `COMPUTE_PGM_RSRC1` and `COMPUTE_PGM_RSRC2`.
+    pub(crate) fn compute_packet(threads: [u16; 3], wave32: bool, rsrc1: u32, rsrc2: u32) -> Vec<u8> {
+        let [x, y, z] = threads.map(u32::from);
+        words(&[0, 0, 0, x | y << 16, z | u32::from(wave32) << 20, rsrc1, rsrc2])
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fixture::{HASH, linked_code, linked_meta, table_record, words};
+    use super::fixture::{HASH, compute_meta, compute_packet, linked_code, linked_meta, table_record, words};
     use super::*;
+
+    #[test]
+    fn deserialized_compute_blocks_make_a_container_of_their_program() {
+        // s_mov_b32 s9, 0 before the end; 64 threads of one wave of 32.
+        let code = linked_code(HASH, &[0xBE89_0380]);
+        let meta = compute_meta(&code, &[table_record(13, 0, 4)], HASH);
+        // RSRC1: 2 granules of VGPRs; RSRC2: 2 user SGPRs, group id x, 1 id VGPR.
+        let packet = compute_packet([64, 1, 1], true, 0x01, 0x84);
+        let pipeline_meta = words(&[0x1234_5678, 3, 0, 0, 0]);
+        let container = deserialized_compute_container(&packet, &pipeline_meta, &code, &meta).unwrap();
+        let c = crate::Container::parse(&container).unwrap();
+        let [p] = &native_programs(c.part(crate::FourCC::ACCC).unwrap().data).unwrap()[..] else {
+            panic!("one program");
+        };
+        assert_eq!((p.stage, p.wave64, p.vgprs), (HwStage::Cs, false, 16));
+        assert_eq!(p.code, code);
+        assert_eq!(p.io, StageIo::Cs(ComputeIo { rsrc2: 0x84, threads: [64, 1, 1] }));
+        let used: Vec<_> = p.used.iter().map(|u| (u.lower_bound, u.table_offset_dwords, u.dwords)).collect();
+        assert_eq!(used, [(13, 0, 4)]);
+        // Without the wave size bit: waves of 64, granules of 4 VGPRs.
+        let wave64 = compute_packet([8, 8, 1], false, 0x01, 0x84);
+        let container = deserialized_compute_container(&wave64, &pipeline_meta, &code, &meta).unwrap();
+        let c = crate::Container::parse(&container).unwrap();
+        let p = fspx_program(c.part(crate::FourCC::ACCC).unwrap().data).unwrap();
+        assert_eq!((p.wave64, p.vgprs), (true, 8));
+        assert_eq!(p.io, StageIo::Cs(ComputeIo { rsrc2: 0x84, threads: [8, 8, 1] }));
+
+        let refused = |packet: &[u8], code: &[u8], meta: &[u8]| {
+            deserialized_compute_container(packet, &pipeline_meta, code, meta).is_err()
+        };
+        assert!(refused(&packet[..0x18], &code, &meta), "packet size");
+        let other = linked_code([HASH[0] ^ 0x0100_0000, HASH[1], HASH[2], HASH[3]], &[0xBE89_0380]);
+        assert!(refused(&packet, &other, &meta), "another program's code");
+        assert!(refused(&packet, &code[..code.len() - 4], &meta), "code size");
+        assert!(refused(&packet, &code, &meta[..meta.len() - FSPX_RECORD]), "metadata size");
+        for (at, what) in [(0, "tag"), (4, "size"), (8, "code dwords"), (0x14, "mark"), (0x16, "count")] {
+            let mut bad = meta.clone();
+            bad[at] ^= 1;
+            assert!(refused(&packet, &code, &bad), "{what}");
+        }
+        let mut unhashed = meta.clone();
+        let last = unhashed.len() - FSPX_RECORD;
+        unhashed[last] = 0x42;
+        assert!(refused(&packet, &code, &unhashed), "no hash");
+        // Graphics metadata is not compute metadata.
+        let linked = linked_meta(&code, &[table_record(13, 0, 4)], HASH);
+        assert!(refused(&packet, &code, &linked), "linked metadata");
+    }
+
+    /// Every compute description dumped (`.agente/pso-dump`) makes a
+    /// container whose program has the packet's group size and wave size.
+    #[test]
+    fn dumped_compute_descriptions_make_containers() {
+        for d in dumped::descriptions_of("218") {
+            let Some(container) = dumped::compute(&d) else {
+                continue;
+            };
+            let container = container.unwrap_or_else(|e| panic!("{d}: {e}"));
+            let packet = dumped::block_of("218", &d, 1).unwrap();
+            let c = crate::Container::parse(&container).unwrap();
+            let p = fspx_program(c.part(crate::FourCC::ACCC).unwrap().data).unwrap();
+            let StageIo::Cs(cs) = &p.io else { panic!("{d}: not compute") };
+            let threads: Vec<u32> = (0..3).map(|i| u32::from(u16_at(&packet, 0xc + 2 * i).unwrap())).collect();
+            assert_eq!(cs.threads[..], threads[..], "{d}");
+            assert_eq!(p.wave64, u32_at(&packet, 0x10).unwrap() & 0x10_0000 == 0, "{d}");
+            assert!(cs.threads.iter().product::<u32>() > 0, "{d}");
+        }
+    }
 
     #[test]
     fn linked_programs_are_checked_against_their_metadata() {
