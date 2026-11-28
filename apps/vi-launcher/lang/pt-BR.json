@@ -87,5 +87,9 @@
   "shaders.clear.detail": "Apaga os shaders traduzidos e os pipelines. Na próxima vez em JOGAR eles são feitos de novo (alguns minutos).",
   "shaders.clear": "Limpar",
   "shaders.clear.confirm": "Confirmar limpeza",
-  "shaders.cleared": "Limpo: {0} GB. Na próxima vez em JOGAR eles são feitos de novo."
+  "shaders.cleared": "Limpo: {0} GB. Na próxima vez em JOGAR eles são feitos de novo.",
+  "engine.title": "Engine (VIctory)",
+  "engine.builtin": "A que vem dentro do launcher.",
+  "engine.choose": "Usar outro victory.exe",
+  "engine.use_builtin": "Usar a do launcher"
 }

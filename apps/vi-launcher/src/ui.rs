@@ -672,7 +672,7 @@ impl App {
             ui.label(theme::caption(&self.t("game.title")));
             ui.add_space(4.0);
             let (line, ink) = match &self.game {
-                Some(Ok(exe)) => (game::game_dir(exe).display().to_string(), "textSoft"),
+                Some(Ok(exe)) => (mask_user(&game::game_dir(exe).display().to_string()), "textSoft"),
                 Some(Err(p)) => (p.describe(lang), "gold"),
                 None => (text::fill(lang, "game.folder.hint", &[game::GAME_EXE]), "textMuted"),
             };
@@ -685,7 +685,7 @@ impl App {
             }
             // The saves: where the title keeps them (VICTORY_DATA_DIR).
             let (saves, ink) = match &self.config.saves_dir {
-                Some(dir) => (dir.clone(), "textSoft"),
+                Some(dir) => (mask_user(dir), "textSoft"),
                 None => (text::get(lang, "saves.default"), "textMuted"),
             };
             let (mut choose, mut open, mut reset) = (false, false, false);
@@ -707,6 +707,29 @@ impl App {
             if open {
                 let dir = self.config.saves_dir.as_ref().map(PathBuf::from).unwrap_or_else(default_saves_dir);
                 open_folder(&dir);
+            }
+            // The engine: the one inside the launcher, or a victory.exe of its own
+            // release (the engine and the launcher can be released apart).
+            let (engine, ink) = match &self.config.victory_exe {
+                Some(exe) => (mask_user(exe), "textSoft"),
+                None => (text::get(lang, "engine.builtin"), "textMuted"),
+            };
+            let (mut pick_engine, mut builtin) = (false, false);
+            setting_row(ui, h, 330.0, &self.t("engine.title"), &engine, ink, |ui| {
+                pick_engine = theme::outline_button(ui, &text::get(lang, "engine.choose"), None, false).clicked();
+                if self.config.victory_exe.is_some() {
+                    builtin = theme::outline_button(ui, &text::get(lang, "engine.use_builtin"), None, false).clicked();
+                }
+            });
+            if pick_engine
+                && let Some(exe) = rfd::FileDialog::new().set_title(self.t("engine.title")).add_filter("victory.exe", &["exe"]).pick_file()
+            {
+                self.config.victory_exe = Some(exe.display().to_string());
+                self.save();
+            }
+            if builtin {
+                self.config.victory_exe = None;
+                self.save();
             }
         });
     }

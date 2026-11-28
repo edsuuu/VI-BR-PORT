@@ -87,5 +87,9 @@
   "shaders.clear.detail": "Deletes the translated shaders and the pipelines. The next Play makes them again (a few minutes).",
   "shaders.clear": "Clear",
   "shaders.clear.confirm": "Confirm clearing",
-  "shaders.cleared": "Cleared: {0} GB. The next Play makes them again."
+  "shaders.cleared": "Cleared: {0} GB. The next Play makes them again.",
+  "engine.title": "Engine (VIctory)",
+  "engine.builtin": "The one inside the launcher.",
+  "engine.choose": "Use another victory.exe",
+  "engine.use_builtin": "Use the launcher's"
 }
