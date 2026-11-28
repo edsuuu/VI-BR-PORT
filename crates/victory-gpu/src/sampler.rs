@@ -121,6 +121,79 @@ pub(crate) fn console(words: &[u32; 27]) -> D3D12_SAMPLER_DESC {
     .host()
 }
 
+
+/// The console's sampler flag bits (`D3D12XBOX_SAMPLER_FLAG_*`, word 0).
+const FLAG_UNNORMALIZED: u32 = 0x1;
+/// Flags the host's sampler cannot express at all: truncated coordinates
+/// (0x2, 0x4), degamma override (0x8), no pre-clamp bias (0x10), no cube
+/// wrap (0x20), the min-mip filter (0x100) and the anisotropy override
+/// (0x200).
+const FLAGS_NO_HOST_EQUIVALENT: u32 = 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x100 | 0x200;
+
+/// Whether sampler flags are honoured where the host can: `VICTORY_SAMPLER_FLAGS=1`.
+/// Default off until measured; with it on, every flag combination a title
+/// creates is also logged once, so a run says which ones matter.
+pub(crate) fn flags_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLER_FLAGS").is_some_and(|v| v == "1"))
+}
+
+/// The flag word of a console sampler description.
+pub(crate) fn console_flags(words: &[u32; 27]) -> u32 {
+    words[0]
+}
+
+/// Logs a flag combination the first time it is seen.
+pub(crate) fn note_flags(flags: u32) {
+    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&flags) {
+        seen.push(flags);
+        tracing::info!(
+            flags = format_args!("{flags:#x}"),
+            unnormalized = flags & FLAG_UNNORMALIZED != 0,
+            no_host_equivalent = format_args!("{:#x}", flags & FLAGS_NO_HOST_EQUIVALENT),
+            "sampler created with console flags"
+        );
+    }
+}
+
+/// The description in the form the flags need (`D3D12_SAMPLER_DESC2`), when
+/// a flag has a host equivalent: only unnormalized coordinates do. The host
+/// accepts them with point or linear filtering, no mips, no anisotropy and
+/// clamp or border addressing, so the description is cut down to that.
+pub(crate) fn console2(words: &[u32; 27]) -> Option<D3D12_SAMPLER_DESC2> {
+    if console_flags(words) & FLAG_UNNORMALIZED == 0 {
+        return None;
+    }
+    let d = console(words);
+    let edge = |m: D3D12_TEXTURE_ADDRESS_MODE| {
+        if m == D3D12_TEXTURE_ADDRESS_MODE_BORDER {
+            m
+        } else {
+            D3D12_TEXTURE_ADDRESS_MODE_CLAMP
+        }
+    };
+    // Reduction bits stay; the mip bit goes; anisotropy becomes linear.
+    let reduction = d.Filter.0 & 0x180;
+    let xy = if d.Filter.0 & 0x40 != 0 { 0x14 } else { d.Filter.0 & 0x14 };
+    Some(D3D12_SAMPLER_DESC2 {
+        Filter: D3D12_FILTER(reduction | xy),
+        AddressU: edge(d.AddressU),
+        AddressV: edge(d.AddressV),
+        AddressW: edge(d.AddressW),
+        MipLODBias: 0.0,
+        MaxAnisotropy: 1,
+        ComparisonFunc: d.ComparisonFunc,
+        Anonymous: D3D12_SAMPLER_DESC2_0 {
+            FloatBorderColor: d.BorderColor,
+        },
+        MinLOD: 0.0,
+        MaxLOD: 0.0,
+        Flags: D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +298,31 @@ mod tests {
             ]
         );
         assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use super::*;
+
+    #[test]
+    fn unnormalized_flag_cuts_the_description_down_to_what_the_host_accepts() {
+        let mut w = [0u32; 27];
+        assert!(console2(&w).is_none());
+        w[0] = 0x8; // degamma only: nothing the host can do
+        assert!(console2(&w).is_none());
+        w[0] = 0x1;
+        w[1] = 3; // anisotropic bilinear
+        w[2] = 3;
+        w[3] = 2; // linear mips
+        w[6..9].copy_from_slice(&[1, 2, 3]); // wrap, mirror, clamp
+        w[10] = 12.0f32.to_bits();
+        w[13] = 8;
+        let d = console2(&w).expect("flag 0x1 has a host form");
+        assert_eq!(d.Filter.0, 0x14, "linear minification and magnification, no mips");
+        assert_eq!((d.MinLOD, d.MaxLOD, d.MaxAnisotropy), (0.0, 0.0, 1));
+        assert_eq!(d.AddressU, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        assert_eq!(d.AddressV, D3D12_TEXTURE_ADDRESS_MODE_CLAMP);
+        assert_eq!(d.Flags, D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES);
     }
 }

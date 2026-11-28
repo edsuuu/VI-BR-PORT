@@ -2135,6 +2135,27 @@ extern "system" fn draw(_: This) {
     count_draw();
 }
 
+/// Whether a single-pass dispatch (type 105) carries flags the host cannot
+/// honour and `VICTORY_INDIRECT_FLAGS_STRICT=1` says to refuse it rather
+/// than run its counts as groups. Any flags at all are logged once.
+#[cfg(windows)]
+fn single_pass_flags_refused(kind: u32, flags: u32) -> bool {
+    if kind != 105 || flags == 0 {
+        return false;
+    }
+    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.contains(&flags) {
+        seen.push(flags);
+        tracing::info!(
+            flags = format_args!("{flags:#x}"),
+            unmet = format_args!("{:#x}", crate::signature::dispatch_flags_unmet(flags)),
+            "indirect single-pass dispatch with flags"
+        );
+    }
+    crate::signature::flags_strict() && crate::signature::dispatch_flags_unmet(flags) != 0
+}
+
 /// `ExecuteIndirect(signature, max count, arguments, offset, count buffer,
 /// offset)`. The title's signatures (title+0x2479466, 2026-11-24)
 /// hold one argument each: draw (stride 16), indexed draw (20), dispatch
@@ -2161,8 +2182,9 @@ extern "system" fn execute_indirect(
     let counter = crate::resource::buffer_bytes(count).map(|(p, _)| p as u64 + count_offset);
     let mut ran = false;
     #[cfg(windows)]
-    if let ([[kind, ..]], Some(address)) = (args, address)
+    if let ([[kind, flags, ..]], Some(address)) = (args, address)
         && (count.is_null() || counter.is_some())
+        && !single_pass_flags_refused(*kind, *flags)
     {
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
@@ -2192,6 +2214,7 @@ extern "system" fn execute_indirect(
             max,
             address = ?address.map(|a| format!("{a:#x}")),
             counted = !count.is_null(),
+            not_run = %crate::signature::not_run(args),
             "indirect execution dropped (first time for this signature)"
         );
     }
