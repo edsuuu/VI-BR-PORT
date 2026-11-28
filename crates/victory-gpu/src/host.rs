@@ -2759,6 +2759,51 @@ fn fetch_regions<T>(copies: &[(T, usize, usize, u64)], join: bool, same: impl Fn
     out
 }
 
+/// In how many parts a fetch from copies in the card's memory comes down,
+/// each merged as soon as it is there while the next ones are on their way
+/// (`VICTORY_FETCH_SPLIT=<parts>`, 2 to 8; off by default). Only on the
+/// card's copy queue (`VICTORY_RELAY_COPY=1`), with `crate::land` and
+/// without `VICTORY_FETCH_CHECK`.
+///
+/// A landing fetched everything, waited for all of it, then merged all of
+/// it: in the prison 5.2 ms a frame of waiting for 45 MB to come down, then
+/// 6.2 ms of merging on four threads, one after the other, on the thread
+/// whose landing the title's fences wait for. In parts the merge of the
+/// first is done while the rest come down. Parts end where a job of
+/// `crate::land` ends, so the pieces of one 64 KiB block of title memory
+/// stay in one part, in order; every part comes down behind the same
+/// flights and sends (the copy queue's fetch is behind those it landed), and
+/// the merge of the copies in the PC's memory still comes after the last.
+fn fetch_split() -> usize {
+    static PARTS: OnceLock<usize> = OnceLock::new();
+    *PARTS.get_or_init(|| {
+        std::env::var("VICTORY_FETCH_SPLIT").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(1, |n| n.clamp(1, 8))
+    })
+}
+
+/// `jobs` (of `crate::land::jobs`, over pieces of `bytes` each) cut into at
+/// most `parts` runs of about the same bytes, whole jobs each: ranges of
+/// jobs.
+fn split_jobs(jobs: &[std::ops::Range<usize>], bytes: &[usize], parts: usize) -> Vec<std::ops::Range<usize>> {
+    let sizes: Vec<usize> = jobs.iter().map(|j| bytes[j.clone()].iter().sum()).collect();
+    let all: usize = sizes.iter().sum();
+    let parts = parts.clamp(1, jobs.len().max(1));
+    let mut out = Vec::with_capacity(parts);
+    let (mut from, mut done) = (0, 0);
+    for (j, size) in sizes.iter().enumerate() {
+        done += size;
+        // The end of part `out.len()`: its share of all the bytes.
+        if out.len() + 1 < parts && done * parts >= all * (out.len() + 1) {
+            out.push(from..j + 1);
+            from = j + 1;
+        }
+    }
+    if from < jobs.len() {
+        out.push(from..jobs.len());
+    }
+    out
+}
+
 /// Whether compares read only the declared pieces found changed lately
 /// ([`heat`], `VICTORY_CARD_COMPARE_HOT=<D>`; off by default). Only with
 /// [`relay`], whose landing thread holds back the flights that owe pieces.
@@ -2885,7 +2930,7 @@ fn chosen_parts(shadow: &crate::shadow::Shadow, span: &crate::shadow::CardSpan, 
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{fetch_regions, flagged_pieces, landable};
+    use super::{fetch_regions, flagged_pieces, landable, split_jobs};
 
     /// Pieces of one copy that follow one another there and in the fetch's
     /// memory are one region; another copy, a gap in either, or the switch
@@ -2914,6 +2959,26 @@ mod relay_tests {
         assert_eq!(fetch_regions(&apart, true, same).len(), 2);
     }
 
+    /// Parts are whole jobs, in order, of about the same bytes, and never
+    /// more than asked for or than there are jobs.
+    #[test]
+    fn split_jobs_cuts_whole_jobs_evenly() {
+        let bytes = vec![4usize; 10];
+        let jobs: Vec<std::ops::Range<usize>> = (0..10).map(|i| i..i + 1).collect();
+        let split = split_jobs(&jobs, &bytes, 2);
+        assert_eq!(split, vec![0..5, 5..10]);
+        let split = split_jobs(&jobs, &bytes, 3);
+        assert_eq!(split.len(), 3);
+        assert_eq!(split.first().map(|r| r.start), Some(0));
+        assert_eq!(split.last().map(|r| r.end), Some(10));
+        assert!(split.windows(2).all(|w| w[0].end == w[1].start && !w[0].is_empty()));
+        // One big job and small ones: the big one alone.
+        let bytes = [100usize, 1, 1, 1];
+        let jobs = vec![0..1, 1..2, 2..3, 3..4];
+        assert_eq!(split_jobs(&jobs, &bytes, 2), vec![0..1, 1..4]);
+        // Fewer jobs than parts.
+        assert_eq!(split_jobs(&jobs[..1], &bytes, 4), vec![0..1]);
+    }
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -3763,6 +3828,9 @@ struct RelayFetch {
     list: Prelude,
     /// With [`relay_copy`]: the card's copy queue, which `list` is for.
     queue: Option<ID3D12CommandQueue>,
+    /// With [`fetch_split`]: the lists of the parts after the first, for
+    /// the copy queue.
+    more: Vec<Prelude>,
     fence: ID3D12Fence,
     event: HANDLE,
     /// The last value signalled on `fence`.
@@ -5498,6 +5566,7 @@ impl Host {
             Some(RelayFetch {
                 list,
                 queue,
+                more: Vec::new(),
                 fence,
                 event,
                 sent: 0,
@@ -5506,6 +5575,122 @@ impl Host {
                 had: crate::land::Had::default(),
             })
         }
+    }
+
+    /// A list for the card's copy queue, closed ([`fetch_split`]).
+    fn make_copy_list(&self) -> Option<Prelude> {
+        // SAFETY: plain object creation.
+        let made = unsafe {
+            (|| -> windows::core::Result<Prelude> {
+                let allocator: ID3D12CommandAllocator = self.device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY)?;
+                let list: ID3D12GraphicsCommandList = self.device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, &allocator, None)?;
+                list.Close()?;
+                Ok((allocator, list))
+            })()
+        };
+        made.map_err(|e| tracing::warn!(error = %e, "no list for a part of a fetch (VICTORY_FETCH_SPLIT): fetched whole")).ok()
+    }
+
+    /// [`fetch_split`]: the fetched `pieces` come down on the copy queue in
+    /// the parts `split` (ranges of `jobs`), one list and one signal each,
+    /// and each part is merged once it is there, while the later ones are on
+    /// their way. `meanwhile` is called once all are sent. The bytes put.
+    #[allow(clippy::too_many_arguments)]
+    fn relay_fetch_parts(
+        &self,
+        f: &mut RelayFetch,
+        pieces: &[Fetched],
+        jobs: &[std::ops::Range<usize>],
+        split: &[std::ops::Range<usize>],
+        buffer: &ID3D12Resource,
+        data: usize,
+        behind: u64,
+        meanwhile: &mut dyn FnMut(),
+    ) -> u64 {
+        let Some(queue) = f.queue.clone() else {
+            fail(format_args!("a fetch in parts without the copy queue (VICTORY_FETCH_SPLIT)"));
+        };
+        let first = f.sent + 1;
+        let last = f.sent + split.len() as u64;
+        let fetching = crate::timeline::span("landing: fetching pieces in parts");
+        // SAFETY: each list's last run was waited for by this thread (every
+        // part of a fetch is, before the next fetch); live buffers (the
+        // copies are held by the plans); the fence is this thread's.
+        let ran = unsafe {
+            (|| -> windows::core::Result<()> {
+                for (k, part) in split.iter().enumerate() {
+                    let (allocator, list) = if k == 0 { f.list.clone() } else { f.more[k - 1].clone() };
+                    allocator.Reset()?;
+                    list.Reset(&allocator, None)?;
+                    let from = jobs[part.start].start;
+                    let mine = &pieces[from..jobs[part.end - 1].end];
+                    let regions = fetch_regions(mine, fetch_join(), std::sync::Arc::ptr_eq);
+                    for &(i, lo, hi, at) in &regions {
+                        list.CopyBufferRegion(buffer, at, &mine[i].0.buffer, lo as u64, (hi - lo) as u64);
+                    }
+                    backmin::add(backmin::k::REGIONS, regions.len() as u64);
+                    list.Close()?;
+                    queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>()?)]);
+                    queue.Signal(&f.fence, first + k as u64)?;
+                }
+                Ok(())
+            })()
+        };
+        if let Err(e) = ran {
+            fail(format_args!("what shaders wrote to the card's memory could not be fetched in parts ({e}, VICTORY_FETCH_SPLIT)"));
+        }
+        f.sent = last;
+        meanwhile();
+        fetching.end();
+        let (mut waited, mut merged, mut beside, mut written) = (0u64, 0u64, 0u64, 0u64);
+        for (k, part) in split.iter().enumerate() {
+            let value = first + k as u64;
+            let waiting = std::time::Instant::now();
+            // SAFETY: this thread's fence and event.
+            unsafe {
+                if f.fence.GetCompletedValue() < value {
+                    #[cfg(feature = "diagnostics")]
+                    let _card = crate::timeline::card_wait(None);
+                    if f.fence.SetEventOnCompletion(value, f.event).is_ok() {
+                        WaitForSingleObject(f.event, INFINITE);
+                    }
+                    while f.fence.GetCompletedValue() < value {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                }
+            }
+            waited += backmin::us(waiting);
+            let merging = std::time::Instant::now();
+            let _merging = crate::timeline::span("landing: merging a fetched part");
+            // SAFETY: the part's copy has run (its signal is reached), and
+            // nothing else writes the mapping before the next fetch.
+            written += unsafe { land_fetched(pieces, &jobs[part.clone()], data, behind, None) };
+            let us = backmin::us(merging);
+            merged += us;
+            // SAFETY: a plain query.
+            if unsafe { f.fence.GetCompletedValue() } < last {
+                beside += us;
+            }
+        }
+        let total: u64 = pieces.iter().map(|p| (p.2 - p.1) as u64).sum();
+        RELAY_STATS[3].fetch_add(waited, Ordering::Relaxed);
+        {
+            use crate::shadow::CARD_STATS;
+            CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+            CARD_STATS[4].fetch_add(total, Ordering::Relaxed);
+            CARD_STATS[5].fetch_add(1, Ordering::Relaxed);
+            CARD_STATS[6].fetch_add(waited, Ordering::Relaxed);
+        }
+        crate::land::count(crate::land::stat::CARD, merged);
+        backmin::add(backmin::k::FETCHES, 1);
+        backmin::add(backmin::k::PIECES, pieces.len() as u64);
+        backmin::add(backmin::k::FETCHED, total);
+        backmin::add(backmin::k::FETCH_US, waited);
+        backmin::add(backmin::k::CARD_MERGE_US, merged);
+        backmin::add(backmin::k::CARD_PUT, written);
+        backmin::add(backmin::k::SPLIT, 1);
+        backmin::add(backmin::k::SPLIT_OVERLAP_US, beside);
+        written
     }
 
     /// [`relay`], on the thread that lands flights: for the plans of the
@@ -5683,6 +5868,29 @@ impl Host {
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
         };
+        let parts = fetch_split();
+        if parts > 1 && f.queue.is_some() && land::on() && check.is_none() && pieces.len() > 1 {
+            let titles: Vec<(usize, usize)> =
+                pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
+            let jobs = land::jobs(&titles);
+            let bytes: Vec<usize> = titles.iter().map(|t| t.1).collect();
+            let split = split_jobs(&jobs, &bytes, parts);
+            while f.more.len() + 1 < split.len() {
+                let Some(list) = self.make_copy_list() else {
+                    break;
+                };
+                f.more.push(list);
+            }
+            if split.len() > 1 && f.more.len() + 1 >= split.len() {
+                let written = self.relay_fetch_parts(f, &pieces, &jobs, &split, &buffer, data, behind, meanwhile);
+                COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+                // As below: on the copy queue the fetch is behind the
+                // flights landed here and the sends they ran behind.
+                f.had.fetched(0, pieces.iter().map(|(shadow, lo, hi, _)| (shadow.id(), shadow.span().0 as usize + lo, hi - lo)));
+                crate::shadow::relay_fetched(behind);
+                return;
+            }
+        }
         f.sent += 1;
         let ((allocator, list), fence, event, sent) = (f.list.clone(), f.fence.clone(), f.event, f.sent);
         let copy_queue = f.queue.clone();
