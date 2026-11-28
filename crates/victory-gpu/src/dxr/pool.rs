@@ -154,7 +154,7 @@ impl Drop for Lease {
 }
 
 /// A buffer of ours on the card for the pool's kind.
-fn chunk_buffer(device: &ID3D12Device, kind: Kind, size: u64) -> Option<ID3D12Resource> {
+pub(super) fn chunk_buffer(device: &ID3D12Device, kind: Kind, size: u64) -> Option<ID3D12Resource> {
     let desc = D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: size,

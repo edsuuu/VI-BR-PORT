@@ -461,6 +461,10 @@ pub(crate) struct Stage {
     /// Root UAVs: one-view tables like the SRVs (or root descriptors with
     /// `VICTORY_ROOT_SRV_DIRECT=1`).
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// The root parameter of the host's ray-tracing structure, a root SRV
+    /// `t<SLOT_STRUCTURE>`, for a shader whose walks the translation made
+    /// host ray queries (`crate::dxr::query`).
+    pub(crate) structure: Option<u32>,
 }
 
 impl Stage {
@@ -577,6 +581,7 @@ impl HostPipeline {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                structure: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -666,6 +671,24 @@ impl HostPipeline {
                         ShaderVisibility: visibility,
                     });
                 }
+            }
+            // The host's ray-tracing structure a ray query of the
+            // translation reads (only `VICTORY_RT_QUERY` makes one): ours, a
+            // root descriptor (an acceleration structure has no size to
+            // bound).
+            if crate::dxr::query::asked(t).is_some() {
+                stage.structure = Some(params.len() as u32);
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: u32::from(victory_shader::emit::SLOT_STRUCTURE),
+                            RegisterSpace: ROOT_CBV_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
             }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {

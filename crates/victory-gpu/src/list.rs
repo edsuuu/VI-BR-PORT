@@ -208,7 +208,9 @@ pub(crate) fn external(this: This, work: External) -> bool {
 #[cfg(windows)]
 fn run_external(this: This, work: External) {
     with_state(this, |host, state| {
-        if work(host) {
+        // (What it builds is read by what this recording records after it.)
+        let mark = state.structures_mark();
+        if crate::dxr::in_recording(mark, || work(host)) {
             state.replay(host);
         }
     });

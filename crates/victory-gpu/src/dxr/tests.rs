@@ -245,6 +245,69 @@ fn ray_queries_of_our_writer_hit_what_the_host_built() {
     assert!(wrong.is_empty(), "rays {wrong:?} committed what they should not");
 }
 
+/// The probe's rays `cases` shot at the structure at `structure` (built
+/// before the list runs), and the dwords each ray committed.
+fn shoot(gpu: &Gpu, structure: u64, cases: &[Case], before: impl FnOnce(&ID3D12GraphicsCommandList4)) -> Vec<Vec<u32>> {
+    let mut rays = Vec::new();
+    for c in cases {
+        let mut words: Vec<u32> = [c.origin.as_slice(), &[c.t_min], &c.direction, &[c.t_max]]
+            .concat()
+            .iter()
+            .map(|f| f.to_bits())
+            .collect();
+        words.extend([c.mask, c.refused, u32::from(c.abort), 0]);
+        rays.extend(words.iter().flat_map(|w| w.to_le_bytes()));
+    }
+    let rays = gpu.resident(&rays);
+    let hit_bytes = u64::from(PROBE_HIT_DWORDS * 4) * cases.len() as u64;
+    let hits = gpu.buffer(
+        hit_bytes,
+        D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    );
+    let dxil = ray_query_probe(cases.len() as u32);
+    let root = probe_root(gpu);
+    let pso = probe_pipeline(gpu, &root, &dxil);
+    gpu.run(|list| unsafe {
+        // SAFETY: everything recorded lives until `run` has waited.
+        before(list);
+        list.SetComputeRootSignature(&root);
+        list.SetPipelineState(&pso);
+        list.SetComputeRootShaderResourceView(u32::from(PROBE_RAYS), rays.GetGPUVirtualAddress());
+        list.SetComputeRootShaderResourceView(u32::from(PROBE_STRUCTURE), structure);
+        list.SetComputeRootUnorderedAccessView(u32::from(PROBE_HITS), hits.GetGPUVirtualAddress());
+        list.Dispatch((cases.len() as u32).div_ceil(PROBE_GROUP), 1, 1);
+        list.ResourceBarrier(&[uav_barrier(&hits)]);
+    });
+    let out = gpu.read(&hits, hit_bytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    let words: Vec<u32> = out.chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    words.chunks(PROBE_HIT_DWORDS as usize).map(<[u32]>::to_vec).collect()
+}
+
+/// The empty top level a translated program's ray query reads where the
+/// host has no structure of its own (`super::query`): built once on a queue
+/// of its own and waited for, then read by a list on another queue; every
+/// ray misses, the ones that hit the scene above too.
+#[test]
+fn the_empty_top_level_is_built_on_its_own_queue_and_every_ray_misses() {
+    let Some(gpu) = Gpu::new() else {
+        eprintln!("no hardware adapter with ray tracing tier 1.1; skipped");
+        return;
+    };
+    let device: windows::Win32::Graphics::Direct3D12::ID3D12Device =
+        windows::core::Interface::cast(&gpu.device).expect("a device");
+    let (empty, at) = super::query::empty_on(&device).expect("the empty top level");
+    // SAFETY: a plain query of a buffer of ours.
+    assert_eq!(at, unsafe { empty.GetGPUVirtualAddress() });
+    assert!(at.is_multiple_of(256));
+    let cases = cases();
+    let hits = shoot(&gpu, at, &cases, |_| {});
+    for (n, hit) in hits.iter().enumerate() {
+        assert_eq!(hit[0], COMMITTED_NOTHING, "ray {n} committed something in the empty structure");
+    }
+}
+
 /// A grid of `quads` squares (two triangles each) in the plane z = `z`, as
 /// vertices and `u32` indices.
 fn grid(quads: u32, z: f32) -> (Vec<f32>, Vec<u32>) {

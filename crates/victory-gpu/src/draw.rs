@@ -484,6 +484,13 @@ pub(crate) struct State {
     /// This recording, for [`crate::descriptor::host::HostHeap::make_listed`]
     /// (0: it has none yet).
     recording: u64,
+    /// This recording, for the host's ray-tracing structures
+    /// ([`State::structures_mark`]; 0: none asked yet).
+    structures_mark: u64,
+    /// The host structures this recording's draws and dispatches read
+    /// (`crate::dxr::query`), held as long as the state: until the list has
+    /// run or is reset.
+    structures_held: Vec<crate::dxr::query::Hold>,
 }
 
 impl Drop for State {
@@ -1050,6 +1057,18 @@ impl State {
         self.pipeline = pipeline as usize;
     }
 
+    /// A number of this recording of the title list, no other recording's
+    /// (a reset or a submission starts a new state): the host's structures
+    /// built at a place of the list are read by what is recorded after them
+    /// in the same recording ([`crate::dxr::in_recording`]).
+    pub(crate) fn structures_mark(&mut self) -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        if self.structures_mark == 0 {
+            self.structures_mark = NEXT.fetch_add(1, Ordering::Relaxed);
+        }
+        self.structures_mark
+    }
+
     /// The title's topology; console-only ones become host lists (see
     /// [`crate::primitive`]).
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
@@ -1347,6 +1366,10 @@ impl State {
         }
         // All of every group, unless the dispatch says otherwise.
         if kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
+            return 0;
+        }
+        // Set where the structure is bound (`bind`); the shader reads nothing.
+        if kind == victory_shader::emit::USER_STRUCTURE {
             return 0;
         }
         if kind == USER_ROOT_ADDRESS || kind == USER_ROOT_ADDRESS + 1 {
@@ -1666,6 +1689,23 @@ impl State {
             } else {
                 None
             };
+            // The host's structure where a ray query of the translation
+            // reads the title's (`VICTORY_RT_QUERY`, `crate::dxr::query`).
+            let structure = match (stage.structure, crate::dxr::query::asked(&t.host)) {
+                (Some(param), Some((slot, dword))) => {
+                    let view = self.view_address(compute, slot, dword);
+                    let mark = self.structures_mark();
+                    let Some(mut bound) = crate::dxr::query::bind(view, mark) else {
+                        once!("a program that asks for the host's ray-tracing structure gets none: the draw is dropped");
+                        return false;
+                    };
+                    if let Some(hold) = bound.hold.take() {
+                        self.structures_held.push(hold);
+                    }
+                    Some((param, bound))
+                }
+                _ => None,
+            };
             if let Some((param, dwords)) = stage.user_data {
                 // (A root signature holds 64 dwords.)
                 let mut room = [0u32; 64];
@@ -1678,6 +1718,11 @@ impl State {
                     }
                 };
                 for u in &t.host.user_data {
+                    if u.root == RootType::Other(victory_shader::emit::USER_STRUCTURE) {
+                        // 1: the host's own top level; 0: the empty one.
+                        values[u.index as usize] = structure.as_ref().map_or(0, |(_, b)| u32::from(b.own));
+                        continue;
+                    }
                     if let RootType::Other(kind) = u.root {
                         values[u.index as usize] =
                             self.host_word(compute, kind, u.slot, u.dword, memory.as_ref());
@@ -1809,6 +1854,17 @@ impl State {
                 };
                 if !self.root_uav(list, address, param, compute, writes) {
                     return false;
+                }
+            }
+            if let Some((param, bound)) = &structure {
+                // SAFETY: an open list; the structure is built before the
+                // list runs and held while it may (`crate::dxr::query`).
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(*param, bound.gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(*param, bound.gpu);
+                    }
                 }
             }
         }

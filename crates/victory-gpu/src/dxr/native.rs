@@ -63,6 +63,9 @@ pub(super) const ALLOW_COMPACTION: u32 = 0x2;
 pub(super) struct Structure {
     pub(crate) lease: Arc<Lease>,
     submitted: AtomicBool,
+    /// The recording of the title list its build was recorded in
+    /// ([`in_recording`]; 0: none known).
+    recording: u64,
     /// Of a top level: the bottom levels its instances named when it was
     /// submitted, held as long as it is.
     #[allow(dead_code)]
@@ -76,13 +79,43 @@ impl table::Version for Structure {
 }
 
 impl Structure {
+    /// A structure built in the recording [`in_recording`] runs in.
     pub(super) fn new(lease: Arc<Lease>) -> Arc<Structure> {
-        Arc::new(Structure { lease, submitted: AtomicBool::new(false), named: Mutex::default() })
+        Arc::new(Structure {
+            lease,
+            submitted: AtomicBool::new(false),
+            recording: RECORDING.get(),
+            named: Mutex::default(),
+        })
     }
 
     pub(crate) fn gpu(&self) -> u64 {
         self.lease.gpu
     }
+
+    /// Whether its build was recorded in the title list recording `mark`
+    /// (not 0): what is recorded after it there runs after it.
+    pub(super) fn recorded_in(&self, mark: u64) -> bool {
+        mark != 0 && self.recording == mark
+    }
+}
+
+thread_local! {
+    /// The title list recording work at a place of the list runs for
+    /// ([`in_recording`]).
+    static RECORDING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `f` (work of ours at a place of a title list, `crate::list::external`)
+/// with the structures it makes marked as built in the title list recording
+/// `mark` (`crate::draw::State::structures_mark`): a dispatch recorded later
+/// in the same recording reads them, whenever the list is submitted
+/// (`super::query`).
+pub(crate) fn in_recording<R>(mark: u64, f: impl FnOnce() -> R) -> R {
+    let was = RECORDING.replace(mark);
+    let r = f();
+    RECORDING.set(was);
+    r
 }
 
 static TABLE: LazyLock<Mutex<Table<Structure>>> = LazyLock::new(Default::default);

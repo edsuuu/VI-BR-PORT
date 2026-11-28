@@ -112,6 +112,21 @@ pub(crate) struct Entry<V> {
     pub previous: Option<Arc<V>>,
 }
 
+/// Which version of a destination a program recorded now reads
+/// ([`Table::read_now`]).
+#[derive(Debug)]
+pub(crate) enum Reading<V> {
+    /// The current version: its build was submitted, or it was recorded
+    /// earlier in the same recording of the same title list (it runs first).
+    Current(Arc<V>),
+    /// The newest version before it whose build was submitted: the current
+    /// one is recorded in another list that is not submitted yet.
+    Previous(Arc<V>),
+    /// Only a version recorded in another list that is not submitted yet:
+    /// nothing built that the program can read.
+    Pending,
+}
+
 /// Destinations to their host structures.
 pub(crate) struct Table<V> {
     entries: HashMap<u64, Entry<V>>,
@@ -198,6 +213,28 @@ impl<V: Version> Table<V> {
             return Some(entry.current.clone());
         }
         entry.previous.clone()
+    }
+
+    /// The version of `dest` a program recorded now reads (a dispatch whose
+    /// root view the host binds when it is recorded, `super::query`):
+    /// [`Reading`]. `here` says whether a version was recorded earlier in the
+    /// same recording of the dispatch's title list (it runs before the
+    /// dispatch whatever is submitted when). A version recorded in another
+    /// list that is not submitted yet is never read: the list may be
+    /// submitted after this one, and its structure would be read unbuilt.
+    /// Names the destination as used in `frame`, and gives its shape.
+    pub(crate) fn read_now(&mut self, dest: u64, frame: u64, here: impl Fn(&V) -> bool) -> Option<(Reading<V>, &Shape)> {
+        let entry = self.entries.get_mut(&dest)?;
+        entry.last_used = entry.last_used.max(frame);
+        let reading = if entry.current.submitted() || here(&entry.current) {
+            Reading::Current(entry.current.clone())
+        } else {
+            match &entry.previous {
+                Some(p) => Reading::Previous(p.clone()),
+                None => Reading::Pending,
+            }
+        };
+        Some((reading, &entry.shape))
     }
 
     /// The destination's structure is gone (the title built over it at
@@ -325,6 +362,37 @@ mod tests {
         with.transform = true;
         let transformed = Shape::Bottom(vec![with, tri(50)]);
         assert_eq!(decide(true, 0x1000, 0x1000, up, &transformed, &t), Decision::Rebuild(Why::OtherShape));
+    }
+
+    #[test]
+    fn a_program_recorded_now_reads_only_a_version_that_runs_before_it() {
+        let mut t = Table::<Fake>::default();
+        let shape = Shape::Top(3);
+        let nowhere = |_: &Fake| false;
+        assert!(t.read_now(0x1000, 1, nowhere).is_none());
+        // The first build, recorded in another list not submitted yet:
+        // nothing built to read.
+        let first = version(1);
+        t.built(0x1000, 0, shape.clone(), first.clone(), 1);
+        let (r, s) = t.read_now(0x1000, 1, nowhere).unwrap();
+        assert!(matches!(r, Reading::Pending));
+        assert_eq!(*s, Shape::Top(3));
+        // Recorded earlier in the same list's recording: it runs first.
+        let here = |v: &Fake| v.n == 1;
+        assert!(matches!(t.read_now(0x1000, 1, here).unwrap().0, Reading::Current(v) if v.n == 1));
+        // Submitted: read from anywhere.
+        first.sent.store(true, Ordering::Relaxed);
+        assert!(matches!(t.read_now(0x1000, 2, nowhere).unwrap().0, Reading::Current(v) if v.n == 1));
+        // A newer build in a list not submitted yet: the one before it.
+        let second = version(2);
+        t.built(0x1000, 0, shape, second.clone(), 3);
+        assert!(matches!(t.read_now(0x1000, 3, nowhere).unwrap().0, Reading::Previous(v) if v.n == 1));
+        assert!(matches!(t.read_now(0x1000, 3, |v: &Fake| v.n == 2).unwrap().0, Reading::Current(v) if v.n == 2));
+        second.sent.store(true, Ordering::Relaxed);
+        assert!(matches!(t.read_now(0x1000, 4, nowhere).unwrap().0, Reading::Current(v) if v.n == 2));
+        // Reading names the destination as used (the sweep keeps it).
+        assert_eq!(t.get(0x1000).unwrap().last_used, 4);
+        assert!(t.sweep(200, 256).is_empty());
     }
 
     #[test]

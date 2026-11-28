@@ -32,7 +32,9 @@
 //! - `probe` (`VICTORY_DXR_PROBE=1`): a picture of a host top level made with
 //!   ray queries of our own writer, and the same rays walked on the CPU
 //!   through the console's structure read back from the card (`walk`),
-//!   compared ray by ray.
+//!   compared ray by ray;
+//! - [`query`] (`VICTORY_RT_QUERY`): the host's top level bound where a
+//!   translated program's ray query reads it (`t252`), or an empty one.
 //!
 //! The tests prove the host side end to end on the card with programs of
 //! our own writer (`victory_shader::emit::ray_query_probe`) and measure
@@ -47,12 +49,26 @@ mod count;
 mod native;
 mod pool;
 mod probe;
+pub(crate) mod query;
 mod stamps;
 mod table;
 mod top;
 mod walk;
 
-pub(crate) use native::{frame, line};
+pub(crate) use native::in_recording;
+
+/// A presented frame.
+pub(crate) fn frame() {
+    native::frame();
+    query::frame();
+}
+
+/// The five-second lines: the host's builds (with [`native_on`]) and what
+/// programs that ask the host's hardware were given (once one asked).
+pub(crate) fn line() {
+    native::line();
+    query::line();
+}
 
 /// `D3D12_RAYTRACING_TIER_1_1`: inline ray tracing (ray queries in any
 /// program), which a translated program needs to ask the host's hardware.
