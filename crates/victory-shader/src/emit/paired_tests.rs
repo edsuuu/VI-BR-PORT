@@ -409,3 +409,48 @@ fn the_paired_form_is_taken_when_asked_for() {
         "ran on the hardware device: the first lane of two console waves, and the loop's rounds, in every case"
     );
 }
+
+/// Lane 40 of the wave stored by every thread to dword t: a wave64 program whose plain
+/// translation already runs in 32-lane waves (the two host waves of a console wave exchange
+/// the lane), so naming it alone does not give it the paired form; with
+/// `VICTORY_WAVE_PAIRED_EVEN=1` ([`super::super::TEST_PAIRED_EVEN`]) a named one takes it, one
+/// not named does not.
+#[test]
+fn a_named_program_with_a_plain_form_of_32_lanes_is_paired_only_when_asked_even_then() {
+    let native = native_of(
+        &[
+            0xD760_0006,
+            0x0001_5100, // v_readlane_b32 s6, v0, 40
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0x7E06_0206, // v_mov_b32 v3, s6
+            0xE070_1000,
+            0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+        ],
+        true,
+        64,
+    );
+    let emit = |named: bool, even: bool| {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res =
+            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, &native).expect("io::raise");
+        let bytes = super::super::container::build(&[]);
+        let c = super::super::Container::parse(&bytes).expect("container");
+        let was = lower::TEST_HOST_WAVE.replace(Some(32));
+        let was_even = super::super::TEST_PAIRED_EVEN.replace(Some(even));
+        let r = super::super::with_paired_first(named, || {
+            super::super::emit(&c, &native, &p, &st, &io, &res)
+        });
+        super::super::TEST_PAIRED_EVEN.set(was_even);
+        lower::TEST_HOST_WAVE.set(was);
+        r.expect("emit")
+    };
+    let plain = emit(false, false);
+    let paired = paired(&native).dxil;
+    assert_ne!(plain.dxil, paired);
+    // (were the plain form stuck, the name alone would give the paired one)
+    assert_eq!(emit(true, false).dxil, plain.dxil, "named alone: the plain form");
+    assert_eq!(emit(false, true).dxil, plain.dxil, "not named: the plain form");
+    assert_eq!(emit(true, true).dxil, paired, "named, and the switch: the paired form");
+}
