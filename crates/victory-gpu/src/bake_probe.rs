@@ -486,6 +486,10 @@ pub fn streamed(at: usize, len: usize, how: u32) {
         return;
     }
     let frame = crate::frame::current();
+    // The same pages at other addresses (a streaming pool's view and the
+    // tiled heap where the textures' views lie): written there too. Asked
+    // before the record is locked.
+    let elsewhere = crate::inplace::ranges_elsewhere(at, len);
     let mut streams = STREAMS.lock().unwrap_or_else(|e| e.into_inner());
     let streams = streams.get_or_insert_with(Streams::default);
     // (Bounded: a range per request at most, and one forgotten when another
@@ -496,6 +500,9 @@ pub fn streamed(at: usize, len: usize, how: u32) {
         FULL.call_once(|| tracing::warn!("bake probe: the record of DirectStorage writes was full and starts again"));
     }
     streams.note(at as u64, (at + len) as u64, how, frame);
+    for (other, bytes) in elsewhere {
+        streams.note(other as u64, (other + bytes) as u64, how, frame);
+    }
 }
 
 fn stream_text(c: Covered, len: u64, frame: u64) -> String {
