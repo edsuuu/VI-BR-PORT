@@ -473,6 +473,7 @@ type Array = *mut Instance<StatusArray>;
 /// The result of the requests before entry `index`: pending, the first
 /// failure, or success.
 extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
+    release_held();
     // SAFETY: an array we created and the title still holds.
     let entries = &unsafe { &*this }.state.entries;
     entries
@@ -789,6 +790,11 @@ fn work(scheduler: &'static Scheduler) {
             scheduler.work.notify_all();
         }
         scheduler.finished.notify_all();
+        if HELD_ANY.load(Ordering::Relaxed) {
+            drop(lanes);
+            release_held();
+            lanes = scheduler.lock();
+        }
     }
 }
 
@@ -948,11 +954,62 @@ impl Lane {
                 stream_log::line(format_args!("S\t{:x}\t{seq}\t{}\t{at}", status.array as usize, status.enqueued));
                 status.written().store(at, Ordering::Relaxed);
             }
-            status
-                .entry()
-                .store(first.unwrap_or(S_OK), Ordering::Release);
+            tell(status, first.unwrap_or(S_OK));
         }
     }
+}
+
+/// A status entry whose requests are done, not told yet: its result.
+struct Told(Status, HRESULT);
+
+// SAFETY: as for `Lane`: the entry holds a reference on its array.
+unsafe impl Send for Told {}
+
+/// Status entries held back while our side catches up with a load
+/// (`victory_gpu::load_hold`, `VICTORY_LOAD_HOLD`), in the order they were
+/// due; and whether there are any, for the title's polling.
+static HELD: Mutex<VecDeque<Told>> = Mutex::new(VecDeque::new());
+static HELD_ANY: AtomicBool = AtomicBool::new(false);
+
+fn held() -> MutexGuard<'static, VecDeque<Told>> {
+    HELD.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Writes a status entry, or holds it back while a load hold is on. Once
+/// one is held, the later ones wait behind it, so that the title is told
+/// in queue order.
+fn tell(status: Status, result: HRESULT) {
+    if victory_gpu::load_hold::on() {
+        let mut held = held();
+        if !held.is_empty() || victory_gpu::load_hold::holding() {
+            victory_gpu::load_hold::note_held();
+            held.push_back(Told(status, result));
+            HELD_ANY.store(true, Ordering::Release);
+            return;
+        }
+    }
+    status.entry().store(result, Ordering::Release);
+}
+
+/// Writes the held status entries, in order, once the hold is over. The
+/// title's polling calls this (cheap while nothing is held), as do the
+/// workers and the title's submits.
+fn release_held() {
+    if !HELD_ANY.load(Ordering::Acquire) || victory_gpu::load_hold::holding() {
+        return;
+    }
+    // Written under the lock, so that an entry due meanwhile (`tell`) is
+    // not written ahead of them; their arrays are let go after it.
+    let told: Vec<Told> = {
+        let mut held = held();
+        HELD_ANY.store(false, Ordering::Release);
+        let told: Vec<Told> = held.drain(..).collect();
+        for Told(status, result) in &told {
+            status.entry().store(*result, Ordering::Release);
+        }
+        told
+    };
+    drop(told);
 }
 
 /// Staging bytes a request holds while it runs: what it buffers between
@@ -1354,6 +1411,8 @@ extern "system" fn submit(this: QueueRef) {
     tracing::debug!(commands = pending, "dstorage: submit");
     lanes.submit(id, false);
     scheduler.work.notify_all();
+    drop(lanes);
+    release_held();
 }
 
 /// Ends the queue whatever its reference count: what was not started never
