@@ -1655,6 +1655,9 @@ impl State {
             if stage.shader.lut == Some(crate::lutwatch::Role::ToneMap) && crate::lutwatch::probing() {
                 crate::lutwatch::note_tone_map(self.lut_bindings(&stage.shader.hash, &t.used, compute));
             }
+            if crate::lutwatch::null_3d_linear() {
+                self.null_samplers_linear(&t.used, compute);
+            }
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -3637,6 +3640,47 @@ impl State {
             let _ = write!(text, " {register}{}={what};", u.lower_bound);
         }
         text
+    }
+
+    /// `VICTORY_NULL_SAMPLER_3D_LINEAR=1`: the sampler slots a stage reads
+    /// whose title record holds no sampler get a linear sampler instead of
+    /// the plain point one, if the stage reads a 3D texture. A colour
+    /// grading table read by point gives every channel its own steps, over
+    /// the whole picture. (Which sampler a sample pairs with which view is
+    /// not known here: a stage reading a 3D texture is the whole test.)
+    fn null_samplers_linear(&self, used: &[UsedResource], compute: bool) {
+        let handle = |u: &UsedResource| match self.roots_ref(compute).get(usize::from(u.slot)) {
+            Some(Root::Table(table)) if u.root == RootType::Table => Some(table + u64::from(u.table_offset_dwords) * 4),
+            _ => None,
+        };
+        // Cheap first: most stages have a sampler in every slot they read.
+        let mut empty = used
+            .iter()
+            .filter(|u| u.kind == ResourceType::Sampler)
+            .filter_map(handle)
+            .filter(|&h| crate::descriptor::view(h).is_none())
+            .peekable();
+        if empty.peek().is_none() {
+            return;
+        }
+        let reads_3d = used
+            .iter()
+            .filter(|u| u.kind == ResourceType::Srv)
+            .filter_map(handle)
+            .filter_map(crate::descriptor::view)
+            .any(|view| srv_dimension(&view).is_some_and(|(d, _)| d == D3D12_SRV_DIMENSION_TEXTURE3D.0 as u32));
+        if !reads_3d {
+            return;
+        }
+        for h in empty {
+            let Some(heap) = self.heap_of(h) else {
+                continue;
+            };
+            if let (Some(host), Some(index)) = (heap.host(), heap.index(h)) {
+                once!("a sampler slot without a sampler, read with a 3D texture, made linear (VICTORY_NULL_SAMPLER_3D_LINEAR=1)");
+                host.linear_sampler(index);
+            }
+        }
     }
 
     /// The descriptors a shader reads through tables. Tables holding a

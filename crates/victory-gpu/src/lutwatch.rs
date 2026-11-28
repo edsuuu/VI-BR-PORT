@@ -66,6 +66,20 @@ pub(crate) fn bake_wait() -> bool {
     })
 }
 
+/// Whether a sampler slot without a sampler, read by a program that reads
+/// a 3D texture, gets a linear sampler instead of the plain point one
+/// (`VICTORY_NULL_SAMPLER_3D_LINEAR=1`; off by default).
+pub(crate) fn null_3d_linear() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_NULL_SAMPLER_3D_LINEAR").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("sampler slots without a sampler read with a 3D texture are made linear (VICTORY_NULL_SAMPLER_3D_LINEAR=1)");
+        }
+        on
+    })
+}
+
 /// A bake dispatch ran (`ran`) or was dropped without a host pipeline.
 pub(crate) fn note_bake(ran: bool, hashes: impl FnOnce() -> String) {
     if ran {
@@ -114,6 +128,7 @@ pub(crate) fn presented(frame: u64, world: bool) {
         bakes_dropped = dropped,
         dropped_bakes = %hashes,
         bake_wait = bake_wait(),
+        null_3d_linear = null_3d_linear(),
         "colour grading at the world's first frame: the tone map's LUT view and sampler, and the LUT bakes"
     );
 }

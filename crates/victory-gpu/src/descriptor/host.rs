@@ -1745,6 +1745,30 @@ impl HostHeap {
         null_sampler(self.at(index));
         self.put(index);
     }
+
+    /// A plain trilinear sampler at slot `index` of a sampler heap, for a
+    /// slot without a view that a program reads a 3D texture with
+    /// (`VICTORY_NULL_SAMPLER_3D_LINEAR=1`). It stays until the title
+    /// writes the slot (or lets go of what it held).
+    pub(crate) fn linear_sampler(&self, index: u32) {
+        let Some(host) = host() else { return };
+        if !self.sampler || index >= self.count() {
+            return;
+        }
+        let desc = D3D12_SAMPLER_DESC {
+            Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+            AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+            MaxAnisotropy: 1,
+            ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+            MaxLOD: f32::MAX,
+            ..Default::default()
+        };
+        // SAFETY: a slot of a sampler heap of ours.
+        unsafe { host.device.CreateSampler(&desc, self.at(index)) };
+        self.put(index);
+    }
 }
 
 /// A plain point sampler at `at`.
