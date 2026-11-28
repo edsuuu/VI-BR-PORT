@@ -6,8 +6,8 @@
 #               (its shaders are another translation: run `victory shaders` without VICTORY_RT_MISS)
 # -Build        target\release (what the README's benchmark is of) or target\diag (the default)
 # -Console      series-s (the default: the profile for 8 GB cards) or series-x
-# -LowVram      for 6 GB cards (RTX 2060): 720p, textures capped at 1.5 GB, 512 MB for buffers,
-#               idle textures leave the card sooner (the pause menu ran out of card memory at 1080p)
+# -LowVram      for 6 GB cards (RTX 2060, RTX 3060 Laptop): 720p, no texture pool, 256 lists in
+#               flight (the pause menu ran out of card memory at 1080p). Warm the pipelines first.
 # -More         other settings, or other values for these: -More @{VICTORY_THIN='0'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -47,8 +47,10 @@ if ($Safe) {
 # cache is keyed on this one: `victory shaders` has to run with the same value.
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' } else { $settings.VICTORY_RT_MISS = '1' }
 if ($LowVram) {
-    $settings.VICTORY_DISPLAY_MODE = '1280x720'; $settings.VICTORY_TEXTURE_BUDGET_MB = '1536'
-    $settings.VICTORY_MEMORY_CARD_MB = '512'; $settings.VICTORY_TEXTURE_KEEP = '0'; $settings.VICTORY_TEXTURE_AWAY_MS = '1500'
+    # One allocation per texture: on 6 GB the pool's 64 MiB blocks held ~3 GB committed but empty,
+    # so the card went over budget and new textures were refused (Marvisak/VIctory#3552).
+    $settings.VICTORY_DISPLAY_MODE = '1280x720'; $settings.VICTORY_TEXTURE_POOL = '0'
+    $settings.VICTORY_LATE_WAIT_LISTS = '256'; $settings.VICTORY_AMBIENT_AIR = '0.3'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
