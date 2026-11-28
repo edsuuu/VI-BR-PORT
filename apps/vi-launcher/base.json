@@ -1,0 +1,58 @@
+{
+  "format": 1,
+  "comment": "The switches every run starts from: scripts/play.ps1's own, so a run from this launcher is the run the README measures. 'base' is always set, 'fast' unless the run is the safe one, 'safe' only then; 'ray_tracing' and 'no_ray_tracing' follow the option. A test compares this file with scripts/play.ps1.",
+  "base": {
+    "VICTORY_UPSCALER": "6",
+    "VICTORY_MEMORY_CARD_MB": "1024",
+    "VICTORY_DISPLAY_MODE": "1920x1080",
+    "VICTORY_PIPELINE_BOOK": "1",
+    "VICTORY_NO_WATCHDOG": "1",
+    "VICTORY_D3D12_DRED": "light",
+    "VICTORY_SKIP_PIPELINES": "none",
+    "VICTORY_TEXTURE_NO_WAIT": "1",
+    "VICTORY_RELAY": "2",
+    "VICTORY_WIDE_BACK": "1",
+    "VICTORY_CARD_REHASH_RUNS": "1",
+    "VICTORY_JOIN_COPIES": "1",
+    "VICTORY_INDIRECT_WINDOW": "1",
+    "VICTORY_RELAY_COPY": "1",
+    "VICTORY_CARD_STEPS": "2",
+    "VICTORY_INDIRECT_BATCH": "2",
+    "VICTORY_MAP_THREADS": "1",
+    "VICTORY_TITLE_PRIORITIES": "0",
+    "VICTORY_CARD_AWAKE": "0",
+    "VICTORY_SHOW_AFTER": "1",
+    "VICTORY_CARD_BUFFERS_MIN_KB": "64",
+    "VICTORY_PORT_CONSTANTS": "0",
+    "VICTORY_AMBIENT": "constant:0.1:0.5",
+    "VICTORY_AMBIENT_OUTSIDE": "1:0.16",
+    "VICTORY_AMBIENT_KEY": "0.2:8:room:air:geo",
+    "VICTORY_AMBIENT_AIR": "0.8",
+    "VICTORY_AMBIENT_DAY": "0.5:2",
+    "VICTORY_AMBIENT_CONTRAST": "4:8",
+    "VICTORY_AMBIENT_CUT": "3",
+    "VICTORY_AMBIENT_AIR_SOFT": "1",
+    "VICTORY_AMBIENT_EDGE": "4",
+    "VICTORY_WAVE_PAIRED_FOR": "5dc3b25986622949,6f225b641c5b0708,1aa247ed3653b616,a1bf269d5b19f025",
+    "VICTORY_EARLY_DEPTH_FOR": "d16aa6328e7f5025"
+  },
+  "fast": {
+    "VICTORY_THIN": "1",
+    "VICTORY_JOIN_PARTS": "8",
+    "VICTORY_UPLOAD_AHEAD": "1",
+    "VICTORY_PORT_GUARD": "1",
+    "VICTORY_PORT_JOURNAL": "1",
+    "VICTORY_CARD_TOUCHED": "1",
+    "VICTORY_CARD_COMPARE_EVERY": "30"
+  },
+  "safe": {
+    "VICTORY_UNDER_WIDE": "0",
+    "VICTORY_LAND_ECHO": "0"
+  },
+  "ray_tracing": {
+    "VICTORY_BVH_BUILDER": "1"
+  },
+  "no_ray_tracing": {
+    "VICTORY_RT_MISS": "1"
+  }
+}

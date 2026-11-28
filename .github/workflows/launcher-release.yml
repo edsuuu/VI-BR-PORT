@@ -1,0 +1,193 @@
+name: Launcher release
+
+# Started by hand only. Builds victory.exe and, if asked, the launcher with it:
+#   VIctory-<version>-windows-x64.zip     victory.exe alone (always)
+#   VI-BR-PORT-<version>-windows-x64.zip  vi-launcher.exe and victory\victory.exe
+#   VI-BR-PORT-<version>-linux-x64.zip    vi-launcher and victory/victory.exe
+#                                         (started through Wine or Proton)
+# and latest.json, which names each bundle's address, size and SHA-256. With
+# publish off (the default) they are only kept as artifacts to look at. With
+# publish on, the GitHub release v<version> is made with them, and, when the
+# launcher was built, latest.json goes to GitHub Pages, where the launcher
+# looks first.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, without the v (for example 0.2.0)"
+        required: true
+        type: string
+      launcher:
+        description: "Build the launcher too (the bundles with it and the manifest it updates from)"
+        required: true
+        type: boolean
+        default: true
+      publish:
+        description: "Make the release and update GitHub Pages"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Version
+        shell: pwsh
+        run: |
+          if ($env:VERSION -notmatch '^\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?$') { throw "not a version: $env:VERSION" }
+          (Get-Content Cargo.toml -Raw) -replace '(?m)^(\[workspace\.package\][^\[]*?version\s*=\s*")[^"]+', "`${1}$env:VERSION" | Set-Content Cargo.toml -NoNewline
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Build
+        shell: pwsh
+        run: |
+          $packages = @('-p', 'victory')
+          if ('${{ inputs.launcher }}' -eq 'true') { $packages += @('-p', 'vi-launcher') }
+          cargo build --release @packages
+      - name: Bundles
+        shell: pwsh
+        run: |
+          scripts\build-bundle.ps1 -Version $env:VERSION -Built -Out bundle -NoLauncher
+          if ('${{ inputs.launcher }}' -eq 'true') { scripts\build-bundle.ps1 -Version $env:VERSION -Built -Out bundle }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: bundle/*.zip
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.launcher }}
+        with:
+          name: victory-exe
+          path: target/release/victory.exe
+
+  linux:
+    if: ${{ inputs.launcher }}
+    needs: windows
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - name: Version
+        run: |
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'
+          sed -i "/^\[workspace.package\]/,/^\[/ s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Linux libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev
+      - name: Build
+        run: cargo build --release -p vi-launcher
+      - uses: actions/download-artifact@v4
+        with:
+          name: victory-exe
+          path: victory-exe
+      - name: Bundle
+        run: |
+          out=bundle/linux-x64
+          mkdir -p "$out/victory"
+          cp target/release/vi-launcher "$out/"
+          cp victory-exe/victory.exe "$out/victory/"
+          cp victory.example.toml LICENSE README.md "$out/"
+          (cd "$out" && zip -r "../VI-BR-PORT-$VERSION-linux-x64.zip" .)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64
+          path: bundle/VI-BR-PORT-${{ inputs.version }}-linux-x64.zip
+          if-no-files-found: error
+
+  manifest:
+    needs: [windows, linux]
+    if: ${{ !cancelled() && needs.windows.result == 'success' && (needs.linux.result == 'success' || needs.linux.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: bundles
+          pattern: "*-x64"
+          merge-multiple: true
+      - name: latest.json
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          base="https://github.com/$REPO/releases/download/v$VERSION"
+          entries=()
+          entry() {
+            f="bundles/$2-$VERSION-$1.zip"
+            [ -f "$f" ] || return 0
+            entries+=("$(printf '"%s":{"url":"%s/%s","sha256":"%s","size":%s}' "$3" "$base" "$(basename "$f")" \
+              "$(sha256sum "$f" | cut -d' ' -f1)" "$(stat -c %s "$f")")")
+          }
+          entry windows-x64 VI-BR-PORT windows-x64
+          entry linux-x64 VI-BR-PORT linux-x64
+          entry windows-x64 VIctory victory-windows-x64
+          assets=$(IFS=,; echo "${entries[*]}")
+          printf '{"format":1,"version":"%s","published":"%s","notes_url":"https://github.com/%s/releases/tag/v%s","assets":{%s}}\n' \
+            "$VERSION" "$(date -u +%F)" "$REPO" "$VERSION" "$assets" > latest.json
+          python3 -m json.tool latest.json
+          sha256sum bundles/*.zip > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manifest
+          path: |
+            latest.json
+            SHA256SUMS
+
+  publish:
+    if: ${{ inputs.publish && !cancelled() && needs.manifest.result == 'success' }}
+    needs: manifest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v$VERSION" --repo "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "VI-BR-PORT $VERSION" --generate-notes \
+            out/*.zip out/latest.json out/SHA256SUMS
+
+  # Pages tells the launchers about the release: only when there is a launcher
+  # bundle for them to take.
+  pages:
+    if: ${{ inputs.publish && inputs.launcher && !cancelled() && needs.publish.result == 'success' }}
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: manifest
+          path: site
+      - run: rm -f site/SHA256SUMS
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,193 @@
+{
+  "format": 1,
+  "comment": "Every option of the launcher. An effect is what a value adds to a run: 'play' are scripts/play.ps1 parameters, 'env' are switches handed to play.ps1 through -More (an empty string removes the switch), 'jobs' is the --jobs of the preparing steps. 'available': false marks an option whose code is not on this branch: it is shown disabled and never sent. 'requires' ties a toggle to another option's value: turning the toggle on sets that value, another value turns the toggle off. Ids are stable: the MCP server takes them.",
+  "translation_switches": {
+    "comment": "The switches the shader cache is keyed on (crates/victory-gpu/src/shader_cache.rs). The launcher translates the shaders again when one of them changes. The self-check compares this list with that file.",
+    "names": [
+      "VICTORY_WAVE_WIDE",
+      "VICTORY_WAVE_DEEP_SKIPS",
+      "VICTORY_WAVE_OWN_BITS",
+      "VICTORY_WAVE_LOCAL",
+      "VICTORY_GUARDED_DESCRIPTORS",
+      "VICTORY_WAVE_WIDE_FOR",
+      "VICTORY_WAVE_EARLY_OUTS",
+      "VICTORY_WAVE_SELECTIVE_SKIPS",
+      "VICTORY_WAVE_EARLY_OUTS_EXCHANGE",
+      "VICTORY_WAVE_ATOMICS",
+      "VICTORY_F16_NEAREST",
+      "VICTORY_HELPER_OWN",
+      "VICTORY_FIRSTLANE_OWN",
+      "VICTORY_FIRST_HALF",
+      "VICTORY_STRICT_JOINS",
+      "VICTORY_MESH_OUTPUT_STRICT",
+      "VICTORY_BVH_FENCES",
+      "VICTORY_BVH_BOUNDS",
+      "VICTORY_LDS_ANALYZE",
+      "VICTORY_LDS_WRITE_ONLY_OK",
+      "VICTORY_RT_MISS"
+    ]
+  },
+  "options": [
+    {
+      "id": "profile",
+      "kind": "choice",
+      "group": "profile",
+      "main": true,
+      "available": true,
+      "default": "series-s",
+      "values": [
+        { "value": "series-s", "effect": { "play": { "Console": "series-s" } } },
+        { "value": "series-x", "effect": { "play": { "Console": "series-x" } } }
+      ]
+    },
+    {
+      "id": "image",
+      "kind": "choice",
+      "group": "image",
+      "main": true,
+      "available": true,
+      "default": "native",
+      "values": [
+        { "value": "native", "effect": {} },
+        { "value": "dlss", "available": false, "note": "NVIDIA DLSS is on another branch", "effect": { "env": { "VICTORY_DLSS": "1", "VICTORY_UPSCALER": "" } } }
+      ]
+    },
+    {
+      "id": "frame_generation",
+      "kind": "toggle",
+      "group": "image",
+      "main": true,
+      "available": false,
+      "note": "needs NVIDIA DLSS, which is on another branch",
+      "default": false,
+      "requires": { "option": "image", "value": "dlss" },
+      "on": { "env": { "VICTORY_FRAMEGEN": "1" } },
+      "off": {}
+    },
+    {
+      "id": "reflex",
+      "kind": "toggle",
+      "group": "image",
+      "main": false,
+      "available": false,
+      "note": "NVIDIA Reflex is on another branch",
+      "default": false,
+      "on": { "env": { "VICTORY_REFLEX": "on" } },
+      "off": {}
+    },
+    {
+      "id": "ray_tracing",
+      "kind": "toggle",
+      "group": "image",
+      "main": true,
+      "available": true,
+      "default": false,
+      "on": { "play": { "RayTracing": true } },
+      "off": {}
+    },
+    {
+      "id": "light_day_night",
+      "kind": "toggle",
+      "group": "light",
+      "main": false,
+      "available": false,
+      "note": "the ambient switches of day and night are not merged into this branch yet",
+      "default": true,
+      "on": { "env": { "VICTORY_AMBIENT_DAY": "0.5:2", "VICTORY_AMBIENT_CONTRAST": "4:8", "VICTORY_AMBIENT_CUT": "3", "VICTORY_AMBIENT_AIR_SOFT": "1", "VICTORY_AMBIENT_EDGE": "4" } },
+      "off": {}
+    },
+    {
+      "id": "water_light",
+      "kind": "toggle",
+      "group": "light",
+      "main": false,
+      "available": true,
+      "default": true,
+      "on": {},
+      "off": { "env": { "VICTORY_WATER_LIGHT": "0" } }
+    },
+    {
+      "id": "outdoor_brightness",
+      "kind": "choice",
+      "group": "light",
+      "main": false,
+      "available": true,
+      "default": "default",
+      "values": [
+        { "value": "default", "effect": { "env": { "VICTORY_AMBIENT_OUTSIDE": "1:0.16" } } },
+        { "value": "darker", "effect": { "env": { "VICTORY_AMBIENT_OUTSIDE": "1:0.08" } } },
+        { "value": "brighter", "effect": { "env": { "VICTORY_AMBIENT_OUTSIDE": "1:0.25" } } }
+      ]
+    },
+    {
+      "id": "thin_lists",
+      "kind": "toggle",
+      "group": "performance",
+      "main": false,
+      "available": true,
+      "default": true,
+      "on": { "env": { "VICTORY_THIN": "1" } },
+      "off": { "env": { "VICTORY_THIN": "0" } }
+    },
+    {
+      "id": "card_memory",
+      "kind": "choice",
+      "group": "performance",
+      "main": false,
+      "available": true,
+      "default": "1024",
+      "values": [
+        { "value": "512", "effect": { "env": { "VICTORY_MEMORY_CARD_MB": "512" } } },
+        { "value": "1024", "effect": { "env": { "VICTORY_MEMORY_CARD_MB": "1024" } } },
+        { "value": "2048", "effect": { "env": { "VICTORY_MEMORY_CARD_MB": "2048" } } }
+      ]
+    },
+    {
+      "id": "jobs",
+      "kind": "choice",
+      "group": "performance",
+      "main": false,
+      "available": true,
+      "default": "20",
+      "values": [
+        { "value": "8", "effect": { "jobs": 8 } },
+        { "value": "12", "effect": { "jobs": 12 } },
+        { "value": "20", "effect": { "jobs": 20 } }
+      ]
+    },
+    {
+      "id": "build",
+      "kind": "choice",
+      "group": "diagnostics",
+      "main": false,
+      "available": true,
+      "default": "release",
+      "values": [
+        { "value": "release", "effect": { "play": { "Build": "release" } } },
+        { "value": "diag", "effect": { "play": { "Build": "diag" } } }
+      ]
+    },
+    {
+      "id": "capture_frames",
+      "kind": "toggle",
+      "group": "diagnostics",
+      "main": false,
+      "available": true,
+      "default": false,
+      "requires": { "option": "build", "value": "diag" },
+      "on": { "env": { "VICTORY_CAPTURE": "{capture_dir}" } },
+      "off": {}
+    },
+    {
+      "id": "detailed_log",
+      "kind": "toggle",
+      "group": "diagnostics",
+      "main": false,
+      "available": true,
+      "default": false,
+      "note": "debug lines exist only in the diag build; the default filter is info",
+      "on": { "env": { "VICTORY_LOG": "debug" } },
+      "off": {}
+    }
+  ]
+}

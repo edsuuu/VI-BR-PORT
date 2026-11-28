@@ -1,0 +1,37 @@
+[package]
+name = "vi-launcher"
+description = "The launcher: picks the game's folder and the VIctory build, sets the switches, prepares and starts the game, and keeps both up to date from the fork's releases."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "vi-launcher"
+path = "src/main.rs"
+
+[dependencies]
+eframe.workspace = true
+rfd.workspace = true
+ureq.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+zip.workspace = true
+semver.workspace = true
+self-replace.workspace = true
+directories.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Threading"] }
+tray-icon.workspace = true
+
+[dev-dependencies]
+egui_kittest.workspace = true
+tiny_http.workspace = true
+png.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

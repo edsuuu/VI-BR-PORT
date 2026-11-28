@@ -43,6 +43,27 @@ walkdir = "2.5.1"
 tempfile = "3.27.0"
 # Opus decoding for the console's audio decoder (BSD-3-Clause, pure Rust).
 opus-pure = "0.2.4"
+# The launcher (apps/vi-launcher) only: nothing else depends on these, so a
+# build of `victory` does not compile them. Its window (egui over OpenGL, no
+# wgpu), the native folder dialog (the desktop portal on Linux: no GTK), HTTPS
+# with rustls and bundled roots, the release manifest, its archives, and the
+# launcher replacing its own executable.
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "wayland", "x11"] }
+rfd = { version = "0.18.0", default-features = false, features = ["xdg-portal"] }
+ureq = { version = "3.5.2", default-features = false, features = ["rustls"] }
+serde_json = { version = "1.0.145", features = ["preserve_order"] }
+sha2 = "0.10.9"
+zip = { version = "9.9.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+semver = "1.0.28"
+self-replace = "1.5.1"
+directories = "6.0.0"
+# The launcher's tray icon while the game is open (Windows only).
+tray-icon = { version = "0.25.1", default-features = false }
+# Tests of the launcher: its window driven off screen, and a local HTTP server
+# for the download.
+egui_kittest = "0.37.0"
+tiny_http = "0.12.0"
+png = "0.18.1"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
