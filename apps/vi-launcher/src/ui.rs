@@ -374,9 +374,9 @@ impl App {
             });
         });
 
-        // Above the scene: the game's folder and any notice, on dark panels.
+        // Above the scene: any notice, on dark panels. (The game's folder is
+        // chosen in the settings.)
         ui.scope_builder(UiBuilder::new().max_rect(scene).layout(Layout::top_down(egui::Align::Min)), |ui| {
-            self.game_card(ui);
             self.notice_card(ui);
             self.update_card(ui, ctx);
         });
@@ -517,30 +517,37 @@ impl App {
         }
     }
 
-    fn game_card(&mut self, ui: &mut egui::Ui) {
+    /// The first section of the settings: the folder the game was extracted
+    /// to, which has to hold the title's executable.
+    fn game_section(&mut self, ui: &mut egui::Ui) {
         let lang = self.language;
-        theme::panel().inner_margin(16.0).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 8.0;
+        let h = num("layout", "rowHeight");
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
             ui.label(theme::caption(&self.t("game.title")));
-            let (line, colour_name) = match &self.game {
-                Some(Ok(exe)) => (text::fill(lang, "game.ok", &[&exe.display().to_string()]), "textSoft"),
-                Some(Err(p)) => (p.describe(lang), "gold"),
-                None => (self.t("game.none"), "textSoft"),
-            };
-            ui.add(egui::Label::new(theme::small(&line, colour_name)).truncate());
-            ui.horizontal(|ui| {
-                if theme::outline_button(ui, &self.t("game.choose"), None, false).clicked()
-                    && let Some(dir) = rfd::FileDialog::new().set_title(self.t("game.choose")).pick_folder()
-                {
-                    self.pick_game(dir);
-                }
-                if theme::outline_button(ui, &self.t("game.choose_exe"), None, false).clicked()
-                    && let Some(file) = rfd::FileDialog::new().add_filter("exe", &["exe"]).pick_file()
-                {
-                    self.pick_game(file);
-                }
+            ui.add_space(4.0);
+            let r = ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_height(h);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.set_max_width(ui.available_width() - 190.0);
+                    ui.label(theme::label(&self.t("game.folder")));
+                    let (line, ink) = match &self.game {
+                        Some(Ok(exe)) => (game::game_dir(exe).display().to_string(), "textSoft"),
+                        Some(Err(p)) => (p.describe(lang), "gold"),
+                        None => (text::fill(lang, "game.folder.hint", &[game::GAME_EXE]), "textMuted"),
+                    };
+                    ui.add(egui::Label::new(theme::small(&line, ink).size(theme::type_size("caption"))).truncate());
+                });
+                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                    if theme::outline_button(ui, &self.t("game.choose"), None, false).clicked()
+                        && let Some(dir) = rfd::FileDialog::new().set_title(self.t("game.choose")).pick_folder()
+                    {
+                        self.pick_game(dir);
+                    }
+                });
             });
+            theme::row_line(ui, r.response.rect);
         });
     }
 
@@ -799,7 +806,8 @@ impl App {
         self.big_card(ui, full, &text::get(lang, "more.title"), &mut close, |app, ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = num("layout", "sectionGap");
-                // One section under the other.
+                // One section under the other, the game's folder first.
+                app.game_section(ui);
                 for g in options::GROUPS {
                     app.group_section(ui, g);
                 }
