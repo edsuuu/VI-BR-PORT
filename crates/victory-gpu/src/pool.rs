@@ -47,7 +47,11 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        // Empty blocks are card memory no texture uses: an eighth of the
+        // budget at most (6 GB card, ~4.3 GB budget: 8 blocks, not 64).
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            SPARE_KEPT.min((budget / BLOCK / 8) as usize).max(SPARE)
+        }
         _ => SPARE,
     }
 }
@@ -146,6 +150,16 @@ impl Ranges {
         self.0.insert(start, len);
     }
 
+    /// Whether `len` bytes at a multiple of `align` fit, as [`Ranges::take`]
+    /// would find them.
+    fn fits(&self, len: u64, align: u64) -> bool {
+        self.0.iter().any(|(&start, &size)| start.next_multiple_of(align) + len <= start + size)
+    }
+
+    fn free_bytes(&self) -> u64 {
+        self.0.values().sum()
+    }
+
     fn whole(&self, size: u64) -> bool {
         self.0.get(&0) == Some(&size)
     }
@@ -209,15 +223,25 @@ impl<B: Clone> Pool<B> {
             return None;
         }
         self.rested(now);
+        // The fullest ripe block it fits in, so that pieces gather in few
+        // blocks and the others empty and go: the first with room spread
+        // them, and blocks holding a few textures each kept ~3 GB of a 6 GB
+        // card committed and empty (Marvisak/VIctory#3552).
+        let fullest = self
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| {
+                let b = b.as_ref()?;
+                (ripe.is(b) && b.free.fits(len, align)).then(|| (b.free.free_bytes(), i))
+            })
+            .min()
+            .map(|(_, i)| i);
         let mut found = None;
-        for (i, block) in self.blocks.iter_mut().enumerate() {
-            if let Some(block) = block
-                && ripe.is(block)
-                && let Some(start) = block.free.take(len, align)
-            {
-                found = Some((i, start));
-                break;
-            }
+        if let Some(i) = fullest
+            && let Some(start) = self.blocks[i].as_mut().and_then(|b| b.free.take(len, align))
+        {
+            found = Some((i, start));
         }
         if found.is_none() && ripe.ahead > 0 {
             // The one that has been there the longest.
@@ -554,10 +578,38 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
-        assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
-        assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
+        const GB: u64 = 1 << 30;
+        assert_eq!(spares(Some([100 * GB, 84 * GB, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([100 * GB, 85 * GB, 0, 0]), true), SPARE);
+        assert_eq!(spares(Some([100 * GB, 10 * GB, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+        // A small card keeps an eighth of its budget in empty blocks.
+        assert_eq!(spares(Some([4 * GB, GB, 0, 0]), true), 8);
+        assert_eq!(spares(Some([GB / 4, 0, 0, 0]), true), SPARE);
+    }
+
+    #[test]
+    fn pieces_go_to_the_fullest_block_so_the_others_empty() {
+        let mut pool: Pool<u32> = Pool::new(SPARE);
+        let made = std::cell::Cell::new(0);
+        let make = || {
+            made.set(made.get() + 1);
+            Some(made.get())
+        };
+        let mb = 1 << 20;
+        // Two blocks: the first full but for 4 MiB, the second nearly empty.
+        let a = pool.take(BLOCK / 2, mb, 0, make).unwrap().0;
+        let b = pool.take(BLOCK / 2 - 4 * mb, mb, 0, make).unwrap().0;
+        let c = pool.take(BLOCK / 2, mb, 0, make).unwrap().0;
+        assert_eq!((a.block, b.block), (0, 0));
+        assert_ne!(c.block, 0);
+        // A small piece fills the first, not the emptier second.
+        let d = pool.take(2 * mb, mb, 0, make).unwrap().0;
+        assert_eq!(d.block, 0);
+        // Once the second's piece is back, that block is wholly empty.
+        pool.give(c, 0);
+        pool.rested(REST);
+        assert!(pool.blocks[c.block].as_ref().is_none_or(|bl| bl.free.whole(BLOCK)));
     }
 
     #[test]
