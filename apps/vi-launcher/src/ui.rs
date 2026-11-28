@@ -587,7 +587,7 @@ impl App {
         let foot_h: f32 = ui.ctx().data(|d| d.get_temp(foot_id)).unwrap_or(200.0);
         let options_h = (ui.available_height() - foot_h - 18.0).max(60.0);
         egui::ScrollArea::vertical().id_salt("options-list").max_height(options_h).auto_shrink([false, true]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 18.0;
+            ui.spacing_mut().item_spacing.y = 10.0;
             let mut toggles = Vec::new();
             for opt in options::catalog().options.iter().filter(|o| o.main) {
                 match opt.kind {
