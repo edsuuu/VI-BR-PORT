@@ -766,6 +766,29 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 /// Asks the provider to cancel; the call fails with `E_ABORT` unless the
 /// provider completed it first. A completed call is left alone.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
+    cancel(block, cancel_by_provider());
+}
+
+/// `VICTORY_XASYNC_CANCEL=provider`: a cancel only asks the provider, and
+/// the call ends when the provider completes it, as documented: with
+/// `E_ABORT` if it can cancel, at once or later, else with its own result
+/// when its work is done. Off by default: the call then ends with `E_ABORT`
+/// right after the provider was asked, and the provider is cleaned up at
+/// once, even while work of its own is still under way (its later
+/// completion is dropped, or ends a call begun since on the same block).
+/// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasynccancel
+/// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/enums/xasyncop
+fn cancel_by_provider() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_XASYNC_CANCEL").is_ok_and(|v| v.trim() == "provider");
+        tracing::info!(on, "XAsyncCancel leaves the call to its provider (VICTORY_XASYNC_CANCEL=provider)");
+        on
+    })
+}
+
+/// [`XAsyncCancel`], the provider left to end the call or not.
+fn cancel(block: *mut AsyncBlock, by_provider: bool) {
     if let Some(call) = call(block) {
         if *lock(&call.done) {
             return;
@@ -773,12 +796,15 @@ pub fn XAsyncCancel(block: *mut AsyncBlock) {
         static SEEN: AtomicBool = AtomicBool::new(false);
         if first(&SEEN) {
             tracing::info!(
+                by_provider,
                 from = %super::kernel::callers(),
-                "XAsyncCancel on a call in flight: it ends with E_ABORT at once and its provider is cleaned up (said once)"
+                "XAsyncCancel on a call in flight (said once)"
             );
         }
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
-        complete_call(&call, block, E_ABORT, 0);
+        if !by_provider {
+            complete_call(&call, block, E_ABORT, 0);
+        }
     }
 }
 
@@ -1557,6 +1583,66 @@ mod tests {
             "the next call was ended by the canceled one"
         );
         XAsyncComplete(&mut block, E_ABORT, 0);
+    }
+
+    /// With the cancel left to the provider (`VICTORY_XASYNC_CANCEL=
+    /// provider`), the call ends as its provider ends it: one that cannot
+    /// cancel finishes with its own result, one that can with `E_ABORT`.
+    #[test]
+    fn a_cancel_left_to_the_provider_ends_the_call_as_the_provider_does() {
+        static CANCELS: AtomicU32 = AtomicU32::new(0);
+        static CLEANUPS: AtomicU32 = AtomicU32::new(0);
+        /// Goes on working when asked to cancel; its result is one byte.
+        extern "system" fn stubborn(op: u32, data: *const ProviderData) -> HRESULT {
+            match op {
+                OP_CANCEL => drop(CANCELS.fetch_add(1, Ordering::SeqCst)),
+                OP_CLEANUP => drop(CLEANUPS.fetch_add(1, Ordering::SeqCst)),
+                // SAFETY: the runtime passes valid provider data and checked
+                // the buffer holds the one byte.
+                OP_GET_RESULT => unsafe { (*data).buffer.cast::<u8>().write(0x42) },
+                _ => {}
+            }
+            S_OK
+        }
+        let (none, identity) = (std::ptr::null_mut(), 0x7c as *const c_void);
+        let begin_stubborn = |block: &mut AsyncBlock| {
+            XAsyncBegin(block, none, identity, std::ptr::null(), Some(stubborn))
+        };
+
+        let mut block = fresh();
+        assert_eq!(begin_stubborn(&mut block), S_OK);
+        cancel(&mut block, true);
+        assert_eq!(CANCELS.load(Ordering::SeqCst), 1);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING, "still working");
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 0, "cleaned up while working");
+        XAsyncComplete(&mut block, S_OK, 1);
+        let mut byte = 0u8;
+        assert_eq!(result(&mut block, identity, &mut byte), S_OK);
+        assert_eq!(byte, 0x42);
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 1);
+
+        // One that cancels.
+        let mut block = fresh();
+        assert_eq!(begin(&mut block, none, ends_itself), S_OK);
+        cancel(&mut block, true);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        assert!(call(&mut block).is_none());
+
+        // Ours, whose work cannot be stopped, ends its call itself.
+        let mut block = fresh();
+        let (answer, answered) = std::sync::mpsc::channel::<()>();
+        let work = move || answered.recv().map(|()| vec![1]).map_err(|_| E_ABORT);
+        assert_eq!(pending_with(&mut block, identity, work), S_OK);
+        cancel(&mut block, true);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        answer.send(()).unwrap();
+
+        // The default: E_ABORT and cleanup at once, whatever the provider does.
+        let mut block = fresh();
+        assert_eq!(begin_stubborn(&mut block), S_OK);
+        cancel(&mut block, false);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 2);
     }
 
     #[test]
