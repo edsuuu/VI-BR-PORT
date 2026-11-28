@@ -6,7 +6,8 @@
 #               (its shaders are another translation: run `victory shaders` without VICTORY_RT_MISS)
 # -Build        target\release (what the README's benchmark is of) or target\diag (the default)
 # -Console      series-s (the default: the profile for 8 GB cards) or series-x
-# -LowVram      for 6 GB cards (RTX 2060, RTX 3060 Laptop): 720p, no texture pool, 256 lists in
+# -LowVram      for 6 GB cards (RTX 2060, RTX 3060 Laptop, GTX 1660): 720p, no texture pool,
+#               1 GB of title buffers on the card, textures one mip level down, 256 lists in
 #               flight (the pause menu ran out of card memory at 1080p). Warm the pipelines first.
 # -More         other settings, or other values for these: -More @{VICTORY_THIN='0'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
@@ -51,6 +52,10 @@ if ($LowVram) {
     # so the card went over budget and new textures were refused (Marvisak/VIctory#3552).
     $settings.VICTORY_DISPLAY_MODE = '1280x720'; $settings.VICTORY_TEXTURE_POOL = '0'
     $settings.VICTORY_LATE_WAIT_LISTS = '256'; $settings.VICTORY_AMBIENT_AIR = '0.3'
+    # Title buffers and memory windows on the card, room made by one mip level less of large
+    # sampled textures: ~280 -> ~100 ms a frame on a GTX 1660 6 GB (Impre-visible/victory-gtx1660).
+    $settings.VICTORY_CARD_BUFFERS_MB = '1024'; $settings.VICTORY_CARD_WINDOWS_MB = '256'
+    $settings.VICTORY_TEXTURE_MIP_DROP = '1'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
