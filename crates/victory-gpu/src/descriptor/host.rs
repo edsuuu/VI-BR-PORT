@@ -4369,7 +4369,28 @@ fn make_twinned(
                 // and has memory, if the title's view starts before it (a
                 // level without memory reads zeros: a black texture). The
                 // title's own view mostly starts there already.
-                if let Some(first) = crate::resource::first_shown(resource)
+                // `VICTORY_TEX_TRUTH` counts the view against the texture's
+                // first level the title still holds pages for, and
+                // `VICTORY_CLAMP_RESIDENT` (off) starts it there (`crate::truth`).
+                let resident = if crate::truth::wanted() {
+                    let (most, min_lod) = match desc.as_ref().map(|d| (d.ViewDimension, d)) {
+                        // SAFETY: the member `ViewDimension` names.
+                        Some((D3D12_SRV_DIMENSION_TEXTURE2D, d)) => unsafe {
+                            (d.Anonymous.Texture2D.MostDetailedMip, d.Anonymous.Texture2D.ResourceMinLODClamp)
+                        },
+                        // SAFETY: as above.
+                        Some((D3D12_SRV_DIMENSION_TEXTURE2DARRAY, d)) => unsafe {
+                            (d.Anonymous.Texture2DArray.MostDetailedMip, d.Anonymous.Texture2DArray.ResourceMinLODClamp)
+                        },
+                        // Other dimensions, and a view without a description
+                        // (its dimension is the texture's), are left alone.
+                        _ => (u32::MAX, 0.0),
+                    };
+                    (most != u32::MAX).then(|| crate::truth::view_made(resource, most, min_lod)).flatten()
+                } else {
+                    None
+                };
+                if let Some(first) = crate::resource::first_shown(resource).into_iter().chain(resident).max()
                     && first > 0
                 {
                     // SAFETY: a live resource.
