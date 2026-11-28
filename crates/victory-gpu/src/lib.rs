@@ -19,6 +19,8 @@
 mod ambient;
 #[cfg(windows)]
 mod bake;
+#[cfg(windows)]
+mod bake_probe;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
@@ -117,6 +119,10 @@ pub fn frame_phase() -> u32 {
 }
 #[cfg(windows)]
 pub use host::set_title_dir;
+/// The decoration bake's probe (`VICTORY_BAKE_PROBE=1`): whether it is on,
+/// and where DirectStorage requests wrote title memory and how.
+#[cfg(windows)]
+pub use bake_probe::{on as bake_probe_on, streamed as title_memory_streamed};
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]

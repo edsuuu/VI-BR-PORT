@@ -1364,8 +1364,46 @@ extern "system" fn close(this: QueueRef) {
     close_lane(unsafe { &*this }.state.id);
 }
 
-/// Reads, inflates and/or unpacks, and writes one request.
+/// Reads, inflates and/or unpacks, and writes one request; with the decoration
+/// bake's probe on (`VICTORY_BAKE_PROBE=1`), says where in title memory it
+/// wrote and how, or that it failed ([`tell_streamed`]).
 fn execute(request: &Request) -> Result<(), HRESULT> {
+    let result = execute_request(request);
+    if victory_gpu::bake_probe_on() {
+        tell_streamed(request, result.is_ok());
+    }
+    result
+}
+
+/// The title memory `request` wrote (`done`) or was to write, told to the
+/// bake probe with how: bits 0-3 the BC format BCPack unpacked, then zlib, a
+/// destination of physical pages, a source in memory, failed. A failed
+/// request leaves its destination as it was, and the title never learns of
+/// it: a texture there holds another one's bytes.
+fn tell_streamed(request: &Request, done: bool) {
+    if request.destination.is_null() {
+        return;
+    }
+    let options = request.options;
+    let how = ((options & BCPACK) >> 1) as u32
+        | u32::from(options & ZLIB != 0) << 4
+        | u32::from(options & PAGE_DESTINATION != 0) << 5
+        | u32::from(options & MEMORY_SOURCE != 0) << 6
+        | u32::from(!done) << 7;
+    let len = if options & (ZLIB | BCPACK) == 0 { request.source_size } else { request.destination_size } as usize;
+    if options & PAGE_DESTINATION == 0 {
+        victory_gpu::title_memory_streamed(request.destination as usize, len, how);
+        return;
+    }
+    let offset = (request.page_offset & 0xffff) as usize;
+    let pages = read_list(request.destination.cast(), offset, len);
+    for (at, bytes) in super::xmem::shown_at(&pages, offset, len) {
+        victory_gpu::title_memory_streamed(at, bytes, how);
+    }
+}
+
+/// [`execute`] itself.
+fn execute_request(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(

@@ -2896,6 +2896,9 @@ impl Drop for Resource {
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
             let address = std::ptr::from_ref::<Resource>(self) as usize;
+            // (The bake probe looks at its results under a lock of its own,
+            // `crate::bake_probe::tick`.)
+            crate::bake_probe::released(address);
             crate::texback::released(address);
             textures().remove(&address);
             if !fills(&self.desc) {

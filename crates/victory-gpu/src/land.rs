@@ -522,6 +522,13 @@ impl Notes {
             return;
         }
         let noting = std::time::Instant::now();
+        // Where landings wrote, for the decoration bake's probe
+        // (`VICTORY_BAKE_PROBE=1`): a texture filled there after a bake read it.
+        if crate::bake_probe::on() {
+            for &(at, len) in &self.spans {
+                crate::bake_probe::landed(at, len);
+            }
+        }
         let (now, blocks) = crate::watch::landed_beside(&self.pages, &self.spans);
         TAKEN[0].fetch_add(blocks.len() as u64, Ordering::Relaxed);
         if taken() {

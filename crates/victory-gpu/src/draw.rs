@@ -2107,6 +2107,58 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
+        self.early_texture_pass(list, p, compute);
+        if !compute && crate::bake_probe::on() && p.stages.iter().any(|s| bake_shader(&s.shader)) {
+            self.probe_bake(list, p);
+        }
+    }
+
+    /// The bake probe's look at a bake draw (`VICTORY_BAKE_PROBE=1`,
+    /// `crate::bake_probe`), after its texture pass: every slot the dwords of
+    /// what it binds name that holds a texture view other than its targets'.
+    fn probe_bake(&self, list: &HostList, p: &HostPipeline) {
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return;
+        };
+        let Some(host) = heap.host() else {
+            return;
+        };
+        let targets: Vec<u64> = self
+            .targets
+            .iter()
+            .filter_map(|&t| crate::resource::texture_memory(t as This).map(|(memory, _)| memory as u64))
+            .collect();
+        let is_texture = |index: u32| match heap.handle(index).and_then(crate::descriptor::view) {
+            Some(View::Placed(false, resource, desc)) if resource[0] != 1 => {
+                !targets.contains(&(u64::from(desc[10]) | u64::from(desc[11]) << 32))
+            }
+            Some(View::Shader(object, _)) => {
+                crate::resource::buffer_bytes(object as This).is_none() && !self.targets.contains(&object)
+            }
+            _ => false,
+        };
+        let (slots, cut) = Self::bake_slots(&self.graphics, p, host.count(), is_texture);
+        let pixel = p.stages.iter().find(|s| bake_shader(&s.shader)).map_or("", |s| s.shader.hash.as_str());
+        crate::bake_probe::bake_draw(
+            list,
+            heap,
+            host,
+            &slots,
+            cut,
+            pixel,
+            self.targets.first().copied(),
+            self.viewports.first().copied(),
+        );
+    }
+
+    /// The texture pass of [`State::early_textures`].
+    fn early_texture_pass(&self, list: &HostList, p: &HostPipeline, compute: bool) {
         let (early_ms, bake_ms) = early_budgets();
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
@@ -2218,9 +2270,6 @@ impl State {
     /// longer than that, and the dwords left once [`crate::bake::MOST`]
     /// sources were found (one).
     fn bake_sources(roots: &[Root], p: &HostPipeline, heap: &crate::descriptor::Heap, count: u32) -> (Vec<u32>, u32) {
-        let mut out = Vec::new();
-        let mut cut = 0;
-        let mut words: Vec<u32> = Vec::new();
         let is_source = |index: u32| match heap.handle(index).and_then(crate::descriptor::view) {
             Some(View::Placed(false, resource, desc)) if resource[0] != 1 => crate::bake::is_source(
                 true,
@@ -2228,6 +2277,15 @@ impl State {
             ),
             _ => false,
         };
+        Self::bake_slots(roots, p, count, is_source)
+    }
+
+    /// [`State::bake_sources`] with the slots `is_source` takes (the bake
+    /// probe takes every texture view, `crate::bake_probe`).
+    fn bake_slots(roots: &[Root], p: &HostPipeline, count: u32, is_source: impl Fn(u32) -> bool + Copy) -> (Vec<u32>, u32) {
+        let mut out = Vec::new();
+        let mut cut = 0;
+        let mut words: Vec<u32> = Vec::new();
         for stage in p.stages.iter().filter(|s| bake_shader(&s.shader)) {
             for u in &stage.translated().used {
                 let root = roots.get(usize::from(u.slot));
@@ -2375,6 +2433,10 @@ impl State {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
+        }
+        // The bake probe's read-backs that have run, and its later looks.
+        if crate::bake_probe::on() {
+            crate::bake_probe::tick(list, heap, host);
         }
         let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
@@ -3035,17 +3097,27 @@ impl State {
 
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+        let ran = self.dispatch_run(list, x, y, z, flags);
+        // After a bake draw of the list: a compression that did not run
+        // leaves its scratch texture as it was (`crate::bake_probe`).
+        if crate::bake_probe::on() {
+            crate::bake_probe::dispatched(list, self.pipeline, ran);
+        }
+    }
+
+    /// [`State::dispatch`]: whether it was recorded.
+    fn dispatch_run(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) -> bool {
         // It may write the arguments a window holds clamped.
         self.window = None;
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         }
         if crate::pipeline::skips_rt_skin(self.pipeline as This) {
             once!("passes that only serve rays are left out (VICTORY_RT_MISS=1, builder off; VICTORY_RT_SKIN, VICTORY_RT_RESOLVE, VICTORY_ACTIVATE_RAYS =1 run them)");
-            return;
+            return false;
         }
         // The ray-tracing structure builder's stages run all or none.
         if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
@@ -3055,7 +3127,7 @@ impl State {
                 crate::pipeline::note_why("a stage of the ray-tracing structure builder, which is off".to_owned());
                 self.list_dropped_roots([x, y, z]);
             }
-            return;
+            return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
@@ -3068,11 +3140,11 @@ impl State {
                 crate::pipeline::note_drop(self.pipeline as This);
                 self.list_dropped_roots([x, y, z]);
             }
-            return;
+            return false;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
-            return;
+            return false;
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -3081,7 +3153,7 @@ impl State {
             if crate::pipeline::is_builder(self.pipeline as This) {
                 crate::pipeline::builder_rests("one of its dispatches could not be bound");
             }
-            return;
+            return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
@@ -3114,6 +3186,7 @@ impl State {
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         self.after_dispatch(list, p);
+        true
     }
 
     /// The pass of ours that follows a dispatch of `p`, if one does
@@ -3488,6 +3561,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        self.probe_drawn(list, ran);
     }
 
     /// The walls trace (`crate::host::walls_trace`): one log line per
@@ -4027,6 +4101,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        self.probe_drawn(list, ran);
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the
@@ -4132,6 +4207,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        self.probe_drawn(list, ran);
     }
 }
 
@@ -4147,6 +4223,19 @@ impl State {
 
     /// A draw with the pipeline `p` was recorded (as [`State::buffers_written`]
     /// if its shaders can store to buffers).
+    /// The bake probe (`crate::bake_probe`): a draw of the bound pipeline
+    /// was recorded into `list` (`ran`) or dropped.
+    fn probe_drawn(&self, list: &HostList, ran: bool) {
+        if !crate::bake_probe::on() || !crate::pipeline::shaders_any(self.pipeline as This, bake_shader) {
+            return;
+        }
+        if ran {
+            crate::bake_probe::drawn(list, self.targets.first().copied(), self.viewports.first().copied());
+        } else {
+            crate::bake_probe::not_drawn(list);
+        }
+    }
+
     fn drew(&mut self, p: Option<&HostPipeline>) {
         if p.is_none_or(|p| p.stages.iter().any(|stage| stage.translated().stores)) {
             self.batch = None;
@@ -4452,6 +4541,7 @@ impl State {
             self.buffers_written();
         } else {
             self.drew(Some(p));
+            self.probe_drawn(list, true);
         }
         // The scratch buffer stays readable as arguments: the next draw of
         // the window reads it with no barrier, and the next clamp moves it

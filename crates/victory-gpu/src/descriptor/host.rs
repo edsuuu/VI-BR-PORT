@@ -384,6 +384,11 @@ fn neutral() -> Option<&'static ID3D12Resource> {
         .as_ref()
 }
 
+/// Whether `texture` is the neutral grey [`neutral`] (`crate::bake_probe`).
+pub(crate) fn is_neutral(texture: &ID3D12Resource) -> bool {
+    neutral().is_some_and(|n| windows::core::Interface::as_raw(n) == windows::core::Interface::as_raw(texture))
+}
+
 /// Makes the descriptor of [`neutral`] for a slot of `view` at `at`, if the
 /// view is a 2D texture's or an array's; else a null one of its kind.
 fn neutral_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<ID3D12Resource> {
@@ -3009,6 +3014,21 @@ impl HostHeap {
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// The host resource host slot `index` shows now, if any: what a shader
+    /// that picks the slot samples (`crate::bake_probe`).
+    pub(crate) fn shown_texture(&self, index: u32) -> Option<ID3D12Resource> {
+        if index >= self.count {
+            return None;
+        }
+        self.kept_in(index)
+    }
+
+    /// The slots whose placed texture views lie in `[start, end)` of title
+    /// memory (`crate::bake_probe`).
+    pub(crate) fn placed_slots_in(&self, start: u64, end: u64) -> Vec<u32> {
+        self.placed.lock().unwrap_or_else(|e| e.into_inner()).slots_in(start, end)
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes

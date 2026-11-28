@@ -877,6 +877,11 @@ fn buffer_copy(this: This, list: &crate::host::HostList, to: *mut u8, from: *con
     if len == 0 {
         return;
     }
+    // Where the title copies to, for the decoration bake's probe
+    // (`VICTORY_BAKE_PROBE=1`): a texture a bake reads may be filled so.
+    if crate::bake_probe::on() {
+        crate::bake_probe::title_copy(to as usize, len);
+    }
     if list.place_copy(to as usize, from as usize, len) {
         with_state(this, |_, state| state.copied());
     } else {
@@ -1383,6 +1388,11 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        // A decoration bake's result, copied from its compressed scratch
+        // texture (`VICTORY_BAKE_PROBE=1`, `crate::bake_probe`).
+        if crate::bake_probe::on() && dst.kind != FOOTPRINT && src.kind != FOOTPRINT {
+            crate::bake_probe::copied(list, dst.resource, to, dst.footprint.offset as u32, src.resource);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -1645,6 +1655,10 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
+        // (For the decoration bake's probe, as `buffer_copy`.)
+        if crate::bake_probe::on() {
+            crate::bake_probe::title_copy(dst as usize, len);
+        }
         if list.place_copy(dst as usize, src as usize, len) {
             with_state(this, |_, state| state.copied());
             return;
