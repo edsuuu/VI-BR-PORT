@@ -969,6 +969,9 @@ extern "system" fn present(
     // The room kept for render targets, and its line.
     #[cfg(windows)]
     crate::resource::targets_presented(frame);
+    // Whether the title's loads are told complete later (VICTORY_LOAD_HOLD).
+    #[cfg(windows)]
+    crate::load_hold::presented(frame);
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]
