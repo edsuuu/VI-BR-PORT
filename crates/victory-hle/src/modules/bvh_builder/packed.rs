@@ -26,34 +26,15 @@
 //! structure's nodes (`desc::Placement`) and before its `Transform3x4`.
 
 use super::desc::Memory;
+use victory_gpu::dxr::packed as layout;
 
-/// The index format of the packed indices.
-pub const INDEX_53: u32 = 53;
-/// The vertex format of the quantized positions.
-pub const QUANTIZED: u32 = 16;
-/// The bit of `StrideInBytes` that flips the winding with [`INDEX_53`].
-pub const FLIP: u64 = 0x8000;
-/// The stride bits the stages use.
-pub const STRIDE: u64 = 0x7fff;
-
-/// The header of packed indices, and a block entry, in bytes.
-pub const HEADER: u64 = 12;
-pub const BLOCK: u64 = 16;
+/// The constants and bit layouts are the host's expansion's
+/// (`victory_gpu::dxr::packed`, `VICTORY_DXR_EXPAND`): one definition for
+/// what the samples here try and what the host builds from.
+pub use layout::{BLOCK, FLIP, HEADER, INDEX_53, QUANTIZED, STRIDE, block_base, fields, record};
 
 fn u32_le(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap_or_default())
-}
-
-/// A triangle record: its block (bits 21..31) and the three 7-bit offsets
-/// of its corners (bits 0..6, 7..13, 14..20), in corner order.
-pub fn record(w: u32) -> (u32, [u32; 3]) {
-    (w >> 21, [w & 0x7f, (w >> 7) & 0x7f, (w >> 14) & 0x7f])
-}
-
-/// Where a block's indices begin, in 16-bit indices: bit 14 of its first
-/// dword above the low 16 bits of its second.
-pub fn block_base(e0: u32, e1: u32) -> u32 {
-    ((e0 << 2) & 0x1_0000) | (e1 & 0xffff)
 }
 
 /// Packed indices at a title address.
@@ -66,11 +47,11 @@ pub struct Indices53 {
 
 impl Indices53 {
     pub fn read(memory: &dyn Memory, at: u64) -> Option<Indices53> {
-        let h = memory.bytes(at, 8)?;
+        let (blocks, records) = layout::header(&memory.bytes(at, 8)?)?;
         Some(Indices53 {
             at,
-            blocks: u32_le(&h, 0) & 0x1_ffff,
-            records: u32_le(&h, 4),
+            blocks,
+            records,
         })
     }
 
@@ -113,21 +94,18 @@ pub struct Quantization {
     pub scale: [f32; 3],
 }
 
-/// The three quantized fields of a vertex's two dwords: 24 bits at the top
-/// of the first, 24 bits of the second's low half above the first's low
-/// byte, 16 bits at the top of the second.
-pub fn fields(d0: u32, d1: u32) -> [u32; 3] {
-    [d0 >> 8, ((d1 & 0xffff) << 8) | (d0 & 0xff), d1 >> 16]
-}
-
 impl Quantization {
     pub fn read(memory: &dyn Memory, vertices: u64) -> Option<Quantization> {
-        let b = memory.bytes(vertices.checked_sub(0x20)?, 0x20)?;
-        let f = |at| f32::from_bits(u32_le(&b, at));
+        let b = memory.bytes(vertices.checked_sub(layout::QUANTIZATION)?, 0x20)?;
+        let layout::Quantization {
+            offset,
+            order,
+            scale,
+        } = layout::Quantization::parse(&b)?;
         Some(Quantization {
-            offset: [f(0), f(4), f(8)],
-            order: u32_le(&b, 12),
-            scale: [f(16), f(20), f(24)],
+            offset,
+            order,
+            scale,
         })
     }
 
@@ -136,13 +114,17 @@ impl Quantization {
     /// field is x and the first z; 1: the second is x, the third y; any
     /// other: in field order).
     pub fn position(&self, d0: u32, d1: u32) -> [f32; 3] {
-        let q = fields(d0, d1);
-        let p: [f32; 3] = std::array::from_fn(|k| self.scale[k] * q[k] as f32 + self.offset[k]);
-        match self.order {
-            0 => [p[2], p[1], p[0]],
-            1 => [p[1], p[2], p[0]],
-            _ => p,
+        let &Quantization {
+            offset,
+            order,
+            scale,
+        } = self;
+        layout::Quantization {
+            offset,
+            order,
+            scale,
         }
+        .position(d0, d1)
     }
 
     /// Vertex `i` of a buffer at `vertices` with `stride` (its bit 15 and
@@ -280,5 +262,59 @@ mod tests {
         assert_eq!(first.position(d0, d1), [p[1], p[2], p[0]]);
         // Nothing before address 0x20.
         assert_eq!(Quantization::read(&memory, 0x10), None);
+    }
+
+    /// What the samples here decode through title memory is what the
+    /// host's expansion makes of the same bytes (`victory_gpu::dxr::packed`,
+    /// `VICTORY_DXR_EXPAND`): the same triangles, flipped or not, and the
+    /// same positions, in every axis order.
+    #[test]
+    fn the_samples_and_the_hosts_expansion_read_the_same() {
+        let data = packed();
+        let mut memory = Fake::default();
+        memory.0.insert(0x10_0000, data.clone());
+        let p = Indices53::read(&memory, 0x10_0000).unwrap();
+        assert_eq!(layout::indices_span(&data, 3), Some(data.len() as u64));
+        let mut out = vec![0u32; 9];
+        for flip in [false, true] {
+            let odd = layout::expand_indices(&data, 3, flip, 2000, &mut out);
+            assert_eq!(odd, layout::Odd::default());
+            for t in 0..3u32 {
+                let k = 3 * t as usize;
+                assert_eq!(
+                    p.triangle(&memory, t, flip).map(|v| v.to_vec()),
+                    Some(out[k..k + 3].to_vec())
+                );
+            }
+        }
+        for order in [0u32, 1, 2] {
+            let mut b = Vec::new();
+            for w in [1.5f32, -2.0, 7.0] {
+                put(&mut b, w.to_bits());
+            }
+            put(&mut b, order);
+            for w in [0.125f32, 0.5, 3.0] {
+                put(&mut b, w.to_bits());
+            }
+            put(&mut b, 0);
+            for (d0, d1) in [
+                (0x1234_56ef, 0x8001_abcd),
+                (0xffff_ffff, 0xffff_ffff),
+                (0, 0),
+            ] {
+                put(&mut b, d0);
+                put(&mut b, d1);
+            }
+            memory.0.insert(0x40_0000 - 0x20, b.clone());
+            let q = Quantization::read(&memory, 0x40_0000).unwrap();
+            let mut expanded = vec![0f32; 9];
+            let odd = layout::expand_positions(&b, 8 | FLIP, 3, &mut expanded);
+            assert_eq!(odd, layout::Odd::default());
+            for i in 0..3u32 {
+                let k = 3 * i as usize;
+                let v = q.vertex(&memory, 0x40_0000, 8 | FLIP, i).unwrap();
+                assert_eq!(v.to_vec(), expanded[k..k + 3].to_vec());
+            }
+        }
     }
 }
