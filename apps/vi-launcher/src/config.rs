@@ -20,6 +20,10 @@ pub struct Config {
     pub game_exe: Option<String>,
     #[serde(default)]
     pub language: Option<String>,
+    /// Where the title's saves (and its other data) go: `VICTORY_DATA_DIR`
+    /// of the run. None: the build's own place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saves_dir: Option<String>,
     /// `VICTORY_*` switches typed by the player, after the options' own.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flags: Vec<Flag>,
@@ -49,6 +53,7 @@ impl Default for Config {
             options: Map::new(),
             game_exe: None,
             language: None,
+            saves_dir: None,
             flags: Vec::new(),
             victory_exe: None,
             runner: None,

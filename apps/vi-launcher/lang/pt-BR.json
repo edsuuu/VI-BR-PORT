@@ -12,12 +12,12 @@
   "game.problem.no_exe": "Não há {1} em {0}. Escolha a pasta onde o jogo foi extraído.",
   "game.problem.not_exe": "{0} não é um executável válido (cópia incompleta?).",
 
-  "build.missing": "Não achei o victory.exe. Procurei em:\n{0}\nIndique outro em Mais opções > Avançado.",
+  "build.missing": "Não achei o victory.exe. Procurei em:\n{0}\nUse o pacote completo (launcher com a engine) ou rode o launcher de dentro do repositório.",
   "build.found": "Build: {0}",
-  "build.missing_short": "Não achei o victory.exe. Indique em Mais opções > Avançado.",
+  "build.missing_short": "Não achei o victory.exe ao lado do launcher. Use o pacote completo.",
 
   "flags.title": "FLAGS DO VICTORY",
-  "flags.hint": "Qualquer chave VICTORY_* com o seu valor. Entram depois das opções acima e valem mais que elas; um valor vazio tira a chave.",
+  "flags.hint": "Uma por linha, NOME=valor. Uma linha com # na frente fica desligada. Valem mais que as opções acima; valor vazio tira a chave.",
   "flags.value": "valor",
   "flags.add": "Adicionar",
   "flags.remove": "Tirar esta flag",
@@ -73,5 +73,18 @@
   "advanced.victory.hint": "O que vem no pacote, ou outro que você indicar",
   "advanced.updates_now": "Atualização",
 
-  "common.close": "Fechar"
+  "common.close": "Fechar",
+
+  "flags.save": "Salvar",
+  "flags.saved": "Salvo: {0} flags.",
+  "flags.saved_skipped": "Salvo: {0} flags. {1} linhas não eram NOME=valor e ficaram de fora.",
+  "auto.card_memory": "Memória da placa",
+  "auto.card_memory.found": "Automática: placa de {0} GB, {1} MB para o jogo",
+  "auto.card_memory.unknown": "Automática: placa não identificada, {0} MB",
+  "auto.threads": "Threads para preparar",
+  "auto.threads.value": "Automático: todas as {0} do processador",
+  "saves.folder": "Pasta dos saves",
+  "saves.default": "A pasta padrão do VIctory (%LOCALAPPDATA%\\victory\\data)",
+  "saves.reset": "Usar a padrão",
+  "tray.show": "Mostrar o launcher"
 }

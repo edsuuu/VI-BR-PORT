@@ -53,6 +53,8 @@ pub struct Plan {
     /// Handed to the build as `VICTORY_GAME_DIR` unless that is already set
     /// (a bundle has no `victory.toml` naming it).
     pub game_dir: PathBuf,
+    /// Where the saves go (`VICTORY_DATA_DIR`), when chosen in the settings.
+    pub data_dir: Option<PathBuf>,
     /// The repository `victory.exe` is built in, when the launcher runs from
     /// a checkout of it.
     pub checkout: Option<PathBuf>,
@@ -162,6 +164,7 @@ pub fn plan(
     Ok(Plan {
         victory,
         game_dir: game_path,
+        data_dir: None,
         checkout,
         runner: runner_command(runner),
         run,
@@ -383,6 +386,10 @@ fn spawn(plan: &Plan, step: &Step, log: &Path) -> std::io::Result<Child> {
         apply_env(&mut cmd, &plan.run.env);
         if std::env::var_os("VICTORY_GAME_DIR").is_none() {
             cmd.env("VICTORY_GAME_DIR", &plan.game_dir);
+        }
+        // The saves folder chosen in the settings wins over one inherited.
+        if let Some(dir) = &plan.data_dir {
+            cmd.env("VICTORY_DATA_DIR", dir);
         }
         cmd
     };

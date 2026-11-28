@@ -14,11 +14,13 @@
 mod config;
 mod flags;
 mod game;
+mod hardware;
 mod options;
 mod paths;
 mod run;
 mod text;
 mod theme;
+mod tray;
 mod ui;
 mod update;
 

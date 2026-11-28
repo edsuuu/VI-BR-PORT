@@ -25,16 +25,6 @@ pub enum NameProblem {
     Kept,
 }
 
-impl NameProblem {
-    pub fn key(self) -> &'static str {
-        match self {
-            Self::Empty => "flags.problem.empty",
-            Self::NotVictory => "flags.problem.prefix",
-            Self::BadCharacter => "flags.problem.characters",
-            Self::Kept => "flags.problem.kept",
-        }
-    }
-}
 
 /// The switches that say where the files are: never cleared, never typed.
 pub const KEPT_PATHS: &[&str] = &["VICTORY_CONFIG", "VICTORY_GAME_DIR", "VICTORY_CACHE_DIR", "VICTORY_DATA_DIR"];
@@ -73,8 +63,48 @@ pub fn parse_pasted(text: &str) -> Vec<Flag> {
     out
 }
 
+/// The flags as the settings' text box shows them: one `NAME=value` a line,
+/// a switched-off one behind `# `.
+pub fn to_text(flags: &[Flag]) -> String {
+    flags
+        .iter()
+        .map(|f| format!("{}{}={}", if f.enabled { "" } else { "# " }, f.name, f.value))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The text box read back: the flags it holds (a line behind `#` is kept
+/// switched off) and how many non-empty lines were not a flag.
+pub fn from_text(text: &str) -> (Vec<Flag>, usize) {
+    let mut out: Vec<Flag> = Vec::new();
+    let mut skipped = 0;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let (enabled, body) = match line.strip_prefix('#') {
+            Some(rest) => (false, rest.trim()),
+            None => (true, line),
+        };
+        match parse_pasted(body).into_iter().next() {
+            Some(mut f) => {
+                f.enabled = enabled;
+                out.retain(|o| o.name != f.name);
+                out.push(f);
+            }
+            None if enabled => skipped += 1,
+            None => {}
+        }
+    }
+    (out, skipped)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_text_box_round_trips() {
+        let (flags, skipped) = super::from_text("VICTORY_A=1\n# VICTORY_B=x\n\nnot a flag\n# a comment\nVICTORY_A=2");
+        assert_eq!(skipped, 1);
+        assert_eq!(super::to_text(&flags), "# VICTORY_B=x\nVICTORY_A=2");
+    }
+
     use super::*;
 
     #[test]

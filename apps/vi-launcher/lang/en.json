@@ -12,12 +12,12 @@
   "game.problem.no_exe": "There is no {1} in {0}. Choose the folder the game was extracted to.",
   "game.problem.not_exe": "{0} is not a valid executable (an unfinished copy?).",
 
-  "build.missing": "victory.exe was not found. Looked in:\n{0}\nName another one in More options > Advanced.",
+  "build.missing": "victory.exe was not found. Looked in:\n{0}\nUse the full bundle (the launcher with the engine) or run the launcher from the repository.",
   "build.found": "Build: {0}",
-  "build.missing_short": "victory.exe was not found. Name it in More options > Advanced.",
+  "build.missing_short": "victory.exe is not next to the launcher. Use the full bundle.",
 
   "flags.title": "VICTORY FLAGS",
-  "flags.hint": "Any VICTORY_* switch with its value. They come after the options above and win over them; an empty value removes the switch.",
+  "flags.hint": "One per line, NAME=value. A line starting with # is off. They win over the options above; an empty value removes the switch.",
   "flags.value": "value",
   "flags.add": "Add",
   "flags.remove": "Remove this flag",
@@ -73,5 +73,18 @@
   "advanced.victory.hint": "The bundle's own, or another one you name",
   "advanced.updates_now": "Updates",
 
-  "common.close": "Close"
+  "common.close": "Close",
+
+  "flags.save": "Save",
+  "flags.saved": "Saved: {0} flags.",
+  "flags.saved_skipped": "Saved: {0} flags. {1} lines were not NAME=value and were left out.",
+  "auto.card_memory": "Card memory",
+  "auto.card_memory.found": "Automatic: a {0} GB card, {1} MB for the game",
+  "auto.card_memory.unknown": "Automatic: card not identified, {0} MB",
+  "auto.threads": "Threads to prepare",
+  "auto.threads.value": "Automatic: all {0} of the processor",
+  "saves.folder": "Saves folder",
+  "saves.default": "VIctory's default folder (%LOCALAPPDATA%\\victory\\data)",
+  "saves.reset": "Use the default",
+  "tray.show": "Show the launcher"
 }

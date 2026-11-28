@@ -57,6 +57,8 @@ zip = { version = "9.9.0", default-features = false, features = ["deflate-flate2
 semver = "1.0.28"
 self-replace = "1.5.1"
 directories = "6.0.0"
+# The launcher's tray icon while the game is open (Windows only).
+tray-icon = { version = "0.25.1", default-features = false }
 # Tests of the launcher: its window driven off screen, and a local HTTP server
 # for the download.
 egui_kittest = "0.37.0"

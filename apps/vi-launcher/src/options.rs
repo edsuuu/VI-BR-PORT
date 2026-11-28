@@ -73,8 +73,6 @@ pub struct Effect {
     pub play: Map<String, Value>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    #[serde(default)]
-    pub jobs: Option<u32>,
 }
 
 fn yes() -> bool {
@@ -101,6 +99,11 @@ fn base() -> &'static Base {
 }
 
 pub const GROUPS: &[&str] = &["profile", "image", "light", "performance", "diagnostics"];
+
+/// Options this launcher does not show: the preparing steps' threads and the
+/// card memory are set from the PC ([`crate::hardware`]), the detailed log is
+/// always on, and frames are never captured from here.
+pub const AUTOMATIC: &[&str] = &["jobs", "card_memory", "detailed_log", "capture_frames"];
 
 impl Opt {
     /// The value in the settings, if it is one this option takes and can use
@@ -174,10 +177,16 @@ pub fn run(saved: &Map<String, Value>, typed: &[Flag], capture_dir: &str) -> Run
     let mut console = "series-s".to_owned();
     let mut build = "release".to_owned();
     let mut ray_tracing = false;
-    let mut jobs = std::thread::available_parallelism().map_or(8, |n| n.get() as u32);
-    let mut more: Vec<(String, String)> = Vec::new();
+    // Set from the PC, not chosen: every CPU thread, and the card memory
+    // from the card's size.
+    let jobs = crate::hardware::threads();
+    let mut more: Vec<(String, String)> = vec![
+        ("VICTORY_MEMORY_CARD_MB".to_owned(), crate::hardware::card_memory_mb(crate::hardware::vram()).to_string()),
+        // The detailed log, always (its debug lines exist in the diag build).
+        ("VICTORY_LOG".to_owned(), "debug".to_owned()),
+    ];
     for opt in &cat.options {
-        if !opt.available {
+        if !opt.available || AUTOMATIC.contains(&opt.id.as_str()) {
             continue;
         }
         let value = opt.value(saved);
@@ -190,9 +199,6 @@ pub fn run(saved: &Map<String, Value>, typed: &[Flag], capture_dir: &str) -> Run
         }
         if effect.play.get("RayTracing").and_then(Value::as_bool) == Some(true) {
             ray_tracing = true;
-        }
-        if let Some(j) = effect.jobs {
-            jobs = j;
         }
         for (k, v) in &effect.env {
             more.push((k.clone(), v.replace("{capture_dir}", capture_dir)));
@@ -250,6 +256,7 @@ mod tests {
     fn options_and_typed_switches() {
         let mut saved = Map::new();
         set(&mut saved, "ray_tracing", Value::Bool(true));
+        // Chosen card memory is not used: it comes from the card.
         set(&mut saved, "card_memory", Value::String("2048".into()));
         let typed = [
             Flag { name: "VICTORY_RT_QUERY".into(), value: "a0".into(), enabled: true },
@@ -260,7 +267,9 @@ mod tests {
         assert!(r.ray_tracing);
         assert_eq!(r.env["VICTORY_BVH_BUILDER"], "1");
         assert!(!r.env.contains_key("VICTORY_RT_MISS"));
-        assert_eq!(r.env["VICTORY_MEMORY_CARD_MB"], "2048");
+        let auto = crate::hardware::card_memory_mb(crate::hardware::vram()).to_string();
+        assert_eq!(r.env["VICTORY_MEMORY_CARD_MB"], auto);
+        assert_eq!(r.jobs, crate::hardware::threads());
         assert_eq!(r.env["VICTORY_RT_QUERY"], "a0");
         assert!(!r.env.contains_key("VICTORY_THIN"), "an empty value removes the switch");
         assert!(!r.env.contains_key("VICTORY_OFF"));

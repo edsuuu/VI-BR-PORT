@@ -15,7 +15,7 @@ use eframe::egui::{self, FontFamily, FontId, Layout, Rect, RichText, UiBuilder, 
 use serde_json::Value;
 
 use crate::config::{self, Config};
-use crate::flags::{self, Flag};
+use crate::flags;
 use crate::game::{self, GameProblem};
 use crate::options::{self, Kind, Opt};
 use crate::paths;
@@ -35,8 +35,7 @@ pub fn start() -> ExitCode {
             .with_title("VI-BR-PORT")
             .with_inner_size(size)
             .with_min_inner_size(size)
-            .with_resizable(false)
-            .with_maximize_button(false),
+            .with_maximized(true),
         ..Default::default()
     };
     match eframe::run_native("VI-BR-PORT", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
@@ -114,8 +113,11 @@ pub struct App {
     prep: Option<Prep>,
     update: Update,
     logs: Logs,
-    new_flag: (String, String),
-    pasted: String,
+    /// The flags as typed in their text box, saved by its button.
+    flags_text: String,
+    flags_note: Option<String>,
+    /// The tray icon while the game is open.
+    tray: Option<crate::tray::Tray>,
 }
 
 impl App {
@@ -139,9 +141,11 @@ impl App {
             prep: None,
             update: Update::Idle,
             logs: Logs { step: StepId::Open, follow: true, text: String::new(), read_at: None, back: View::Play },
-            new_flag: (String::new(), String::new()),
-            pasted: String::new(),
+            flags_text: String::new(),
+            flags_note: None,
+            tray: None,
         };
+        app.flags_text = flags::to_text(&app.config.flags);
         if app.config.updates_on() {
             app.check_updates(ctx);
         }
@@ -210,7 +214,8 @@ impl App {
     }
 
     fn play(&mut self, ctx: &egui::Context) {
-        let Ok(plan) = self.make_plan() else { return };
+        let Ok(mut plan) = self.make_plan() else { return };
+        plan.data_dir = self.config.saves_dir.as_ref().map(PathBuf::from);
         let (tx, rx) = channel();
         let running: run::Running = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -301,6 +306,43 @@ impl App {
         }
     }
 
+    /// While the game is open the launcher waits in the tray (minimized
+    /// where there is no tray); it comes back when the game closes, or from
+    /// the icon.
+    fn tray_logic(&mut self, ctx: &egui::Context) {
+        use crate::tray::{Action, HIDES, Tray};
+        let open = self.game_open();
+        if open && self.tray.is_none() {
+            let lang = self.language;
+            self.tray = Tray::new(ctx, "VI-BR-PORT", &text::get(lang, "tray.show"), &text::get(lang, "prep.close_game"));
+            if self.tray.is_some() {
+                ctx.send_viewport_cmd(if HIDES {
+                    egui::ViewportCommand::Visible(false)
+                } else {
+                    egui::ViewportCommand::Minimized(true)
+                });
+            }
+        }
+        let show = |ctx: &egui::Context| {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        };
+        if !open && self.tray.take().is_some() {
+            show(ctx);
+        }
+        match self.tray.as_ref().and_then(Tray::poll) {
+            Some(Action::Show) => show(ctx),
+            Some(Action::CloseGame) => {
+                if let Some(prep) = &self.prep {
+                    prep.cancelled.store(true, Ordering::SeqCst);
+                    run::cancel(&prep.running);
+                }
+            }
+            None => {}
+        }
+    }
+
     fn busy(&self) -> bool {
         self.prep.as_ref().is_some_and(|p| !p.finished)
     }
@@ -323,8 +365,13 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    /// Runs while the window is hidden too: the run's events, and the tray.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        self.tray_logic(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let full = ui.max_rect();
         let fade_ms = num("motion", "backgroundFadeMs").max(1.0);
@@ -497,7 +544,7 @@ impl App {
     }
 
     /// A toggle as a whole clickable row with its switch.
-    fn switch(&mut self, ui: &mut egui::Ui, opt: &'static Opt, height: f32) {
+    fn switch(&mut self, ui: &mut egui::Ui, opt: &'static Opt, height: f32) -> Rect {
         let lang = self.language;
         let label = text::get(lang, &format!("option.{}.label", opt.id));
         let hint = if !opt.available {
@@ -508,6 +555,7 @@ impl App {
         };
         let mut on = opt.value(&self.config.options).as_bool().unwrap_or(false);
         let r = ui.add_enabled_ui(opt.available, |ui| theme::switch_row(ui, &label, &hint, &mut on, height)).inner;
+        let rect = r.rect;
         if let Some(note) = &opt.note {
             r.on_disabled_hover_text(note.as_str());
         }
@@ -515,6 +563,7 @@ impl App {
             options::set(&mut self.config.options, &opt.id, Value::Bool(on));
             self.save();
         }
+        rect
     }
 
     /// The first section of the settings: the folder the game was extracted
@@ -526,28 +575,43 @@ impl App {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.label(theme::caption(&self.t("game.title")));
             ui.add_space(4.0);
-            let r = ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.set_min_height(h);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.set_max_width(ui.available_width() - 190.0);
-                    ui.label(theme::label(&self.t("game.folder")));
-                    let (line, ink) = match &self.game {
-                        Some(Ok(exe)) => (game::game_dir(exe).display().to_string(), "textSoft"),
-                        Some(Err(p)) => (p.describe(lang), "gold"),
-                        None => (text::fill(lang, "game.folder.hint", &[game::GAME_EXE]), "textMuted"),
-                    };
-                    ui.add(egui::Label::new(theme::small(&line, ink).size(theme::type_size("caption"))).truncate());
-                });
-                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::outline_button(ui, &self.t("game.choose"), None, false).clicked()
-                        && let Some(dir) = rfd::FileDialog::new().set_title(self.t("game.choose")).pick_folder()
-                    {
-                        self.pick_game(dir);
-                    }
-                });
+            let (line, ink) = match &self.game {
+                Some(Ok(exe)) => (game::game_dir(exe).display().to_string(), "textSoft"),
+                Some(Err(p)) => (p.describe(lang), "gold"),
+                None => (text::fill(lang, "game.folder.hint", &[game::GAME_EXE]), "textMuted"),
+            };
+            let mut pick = false;
+            setting_row(ui, h, 190.0, &self.t("game.folder"), &line, ink, |ui| {
+                pick = theme::outline_button(ui, &text::get(lang, "game.choose"), None, false).clicked();
             });
-            theme::row_line(ui, r.response.rect);
+            if pick && let Some(dir) = rfd::FileDialog::new().set_title(self.t("game.choose")).pick_folder() {
+                self.pick_game(dir);
+            }
+            // The saves: where the title keeps them (VICTORY_DATA_DIR).
+            let (saves, ink) = match &self.config.saves_dir {
+                Some(dir) => (dir.clone(), "textSoft"),
+                None => (text::get(lang, "saves.default"), "textMuted"),
+            };
+            let (mut choose, mut open, mut reset) = (false, false, false);
+            setting_row(ui, h, 330.0, &self.t("saves.folder"), &saves, ink, |ui| {
+                choose = theme::outline_button(ui, &text::get(lang, "game.choose"), None, false).clicked();
+                open = theme::outline_button(ui, &text::get(lang, "logs.open_folder"), None, false).clicked();
+                if self.config.saves_dir.is_some() {
+                    reset = theme::outline_button(ui, &text::get(lang, "saves.reset"), None, false).clicked();
+                }
+            });
+            if choose && let Some(dir) = rfd::FileDialog::new().set_title(self.t("saves.folder")).pick_folder() {
+                self.config.saves_dir = Some(dir.display().to_string());
+                self.save();
+            }
+            if reset {
+                self.config.saves_dir = None;
+                self.save();
+            }
+            if open {
+                let dir = self.config.saves_dir.as_ref().map(PathBuf::from).unwrap_or_else(default_saves_dir);
+                open_folder(&dir);
+            }
         });
     }
 
@@ -767,7 +831,12 @@ impl App {
         body: impl FnOnce(&mut Self, &mut egui::Ui),
         foot: impl FnOnce(&mut Self, &mut egui::Ui),
     ) {
-        let card = full.shrink(num("layout", "moreMargin"));
+        // On a big (full-screen) window the card keeps a readable width.
+        let mut card = full.shrink(num("layout", "moreMargin"));
+        let most = 1100.0;
+        if card.width() > most {
+            card = Rect::from_center_size(card.center(), vec2(most, card.height()));
+        }
         let (px, py) = (num("layout", "morePaddingX"), num("layout", "morePaddingY"));
         ui.scope_builder(UiBuilder::new().max_rect(card), |ui| {
             theme::card().inner_margin(egui::Margin::symmetric(px as i8, py as i8)).show(ui, |ui| {
@@ -835,31 +904,36 @@ impl App {
     }
 
     fn group_section(&mut self, ui: &mut egui::Ui, group: &str) {
-        let opts: Vec<&'static Opt> = options::catalog().options.iter().filter(|o| o.group == group).collect();
-        if opts.is_empty() {
+        let opts: Vec<&'static Opt> = options::catalog()
+            .options
+            .iter()
+            .filter(|o| o.group == group && !options::AUTOMATIC.contains(&o.id.as_str()))
+            .collect();
+        if opts.is_empty() && group != "performance" {
             return;
         }
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.label(theme::caption(&self.t(&format!("group.{group}"))));
             ui.add_space(4.0);
+            if group == "performance" {
+                self.automatic_rows(ui);
+            }
             for opt in opts {
                 let h = num("layout", "rowHeight");
-                let rect = match opt.kind {
+                match opt.kind {
                     Kind::Toggle => {
-                        let before = ui.cursor().min;
-                        self.switch(ui, opt, h);
-                        Rect::from_min_max(before, pos2(before.x + ui.available_width(), before.y + h))
+                        let rect = self.switch(ui, opt, h);
+                        theme::row_line(ui, rect);
                     }
                     Kind::Choice => self.choice_row(ui, opt, h),
-                };
-                theme::row_line(ui, rect);
+                }
             }
         });
     }
 
     /// A choice in the settings: label (and hint) left, a list on the right.
-    fn choice_row(&mut self, ui: &mut egui::Ui, opt: &'static Opt, h: f32) -> Rect {
+    fn choice_row(&mut self, ui: &mut egui::Ui, opt: &'static Opt, h: f32) {
         let lang = self.language;
         let label = text::get(lang, &format!("option.{}.label", opt.id));
         let hint_key = format!("option.{}.hint", opt.id);
@@ -873,18 +947,9 @@ impl App {
         let value = opt.value(&self.config.options);
         let current = value.as_str().unwrap_or("").to_owned();
         let mut changed = None;
-        let r = ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.set_min_height(h);
-            ui.add_enabled_ui(opt.available, |ui| {
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.set_max_width(ui.available_width() - num("layout", "selectWidth") - 12.0);
-                    ui.label(theme::label(&label));
-                    if !hint.is_empty() {
-                        ui.add(egui::Label::new(theme::small(&hint, "textMuted").size(theme::type_size("caption"))).truncate());
-                    }
-                });
-                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.add_enabled_ui(opt.available, |ui| {
+            setting_row(ui, h, num("layout", "selectWidth") + 8.0, &label, &hint, "textMuted", |ui| {
+                {
                     egui::ComboBox::from_id_salt(format!("option-{}", opt.id))
                         .width(num("layout", "selectWidth"))
                         .height(400.0)
@@ -898,92 +963,64 @@ impl App {
                                 }
                             }
                         });
-                });
+                }
             });
         });
         if let Some(v) = changed {
             options::set(&mut self.config.options, &opt.id, v);
             self.save();
         }
-        r.response.rect
     }
 
+    /// The flags: one text box, one switch per line (`NAME=value`), and a
+    /// button that saves it.
     fn flags_section(&mut self, ui: &mut egui::Ui) {
         let lang = self.language;
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
             ui.label(theme::caption(&self.t("flags.title")));
             ui.add(egui::Label::new(theme::small(&self.t("flags.hint"), "textMuted")).wrap());
-            let mut remove = None;
-            let mut dirty = false;
-            let field_w = (ui.available_width() - 150.0) / 2.0;
-            for (i, f) in self.config.flags.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    let sw = vec2(num("size", "switchWidth"), num("size", "switchHeight"));
-                    ui.allocate_ui(vec2(sw.x + 8.0, num("size", "controlHeight")), |ui| {
-                        dirty |= theme::switch_row(ui, "", "", &mut f.enabled, num("size", "controlHeight")).changed();
-                    });
-                    let r = ui.add(egui::TextEdit::singleline(&mut f.name).desired_width(field_w).font(egui::TextStyle::Monospace).margin(vec2(10.0, 12.0)));
-                    dirty |= r.changed();
-                    if let Err(p) = flags::check_name(&f.name) {
-                        r.on_hover_text(text::get(lang, p.key()));
-                    }
-                    dirty |= ui
-                        .add(egui::TextEdit::singleline(&mut f.value).desired_width(field_w).font(egui::TextStyle::Monospace).margin(vec2(10.0, 12.0)))
-                        .changed();
-                    if theme::close_button(ui, &text::get(lang, "flags.remove")).clicked() {
-                        remove = Some(i);
-                    }
-                });
-            }
-            if let Some(i) = remove {
-                self.config.flags.remove(i);
-                dirty = true;
-            }
+            ui.add(
+                egui::TextEdit::multiline(&mut self.flags_text)
+                    .hint_text("VICTORY_RT_QUERY=a0")
+                    .desired_rows(6)
+                    .desired_width(f32::INFINITY)
+                    .font(egui::TextStyle::Monospace)
+                    .margin(vec2(10.0, 10.0)),
+            );
             ui.horizontal(|ui| {
-                ui.add_space(num("size", "switchWidth") + 16.0);
-                ui.add(egui::TextEdit::singleline(&mut self.new_flag.0).hint_text("VICTORY_...").desired_width(field_w).font(egui::TextStyle::Monospace).margin(vec2(10.0, 12.0)));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_flag.1)
-                        .hint_text(text::get(lang, "flags.value"))
-                        .desired_width(field_w)
-                        .font(egui::TextStyle::Monospace)
-                        .margin(vec2(10.0, 12.0)),
-                );
-                let name = self.new_flag.0.trim().to_ascii_uppercase();
-                let check = flags::check_name(&name);
-                let add = ui.add_enabled_ui(check.is_ok(), |ui| theme::outline_button(ui, &text::get(lang, "flags.add"), None, false)).inner;
-                if add.clicked() {
-                    self.config.flags.retain(|f| f.name != name);
-                    self.config.flags.push(Flag { name, value: self.new_flag.1.trim().to_owned(), enabled: true });
-                    self.new_flag = (String::new(), String::new());
-                    dirty = true;
+                if theme::outline_button(ui, &text::get(lang, "flags.save"), None, false).clicked() {
+                    let (parsed, skipped) = flags::from_text(&self.flags_text);
+                    self.config.flags = parsed;
+                    self.save();
+                    self.flags_text = flags::to_text(&self.config.flags);
+                    self.flags_note = Some(if skipped == 0 {
+                        text::fill(lang, "flags.saved", &[&self.config.flags.len().to_string()])
+                    } else {
+                        text::fill(lang, "flags.saved_skipped", &[&self.config.flags.len().to_string(), &skipped.to_string()])
+                    });
+                }
+                if let Some(n) = &self.flags_note {
+                    ui.label(theme::small(n, "textMuted"));
                 }
             });
-            if let Err(p) = flags::check_name(self.new_flag.0.trim())
-                && !self.new_flag.0.trim().is_empty()
-            {
-                ui.label(theme::small(&text::get(lang, p.key()), "gold"));
-            }
-            egui::CollapsingHeader::new(theme::small(&text::get(lang, "flags.paste"), "textSoft")).id_salt("paste").show(ui, |ui| {
-                ui.add(egui::TextEdit::multiline(&mut self.pasted).desired_rows(3).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
-                if theme::outline_button(ui, &text::get(lang, "flags.paste_add"), None, false).clicked() {
-                    for f in flags::parse_pasted(&self.pasted) {
-                        self.config.flags.retain(|o| o.name != f.name);
-                        self.config.flags.push(f);
-                    }
-                    self.pasted.clear();
-                    dirty = true;
-                }
-            });
-            egui::CollapsingHeader::new(theme::small(&text::get(lang, "flags.preview"), "textSoft")).id_salt("preview").show(ui, |ui| {
-                let mut shown = self.current_run().env.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n");
-                ui.add(egui::TextEdit::multiline(&mut shown).desired_rows(8).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace));
-            });
-            if dirty {
-                self.save();
-            }
         });
+    }
+
+    /// What the launcher sets from the PC, shown, not chosen.
+    fn automatic_rows(&mut self, ui: &mut egui::Ui) {
+        let lang = self.language;
+        let h = num("layout", "rowHeight");
+        let vram = crate::hardware::vram();
+        let card = crate::hardware::card_memory_mb(vram);
+        let card_line = match vram {
+            Some(b) => text::fill(lang, "auto.card_memory.found", &[&format!("{:.0}", b as f64 / (1u64 << 30) as f64), &card.to_string()]),
+            None => text::fill(lang, "auto.card_memory.unknown", &[&card.to_string()]),
+        };
+        let threads_line = text::fill(lang, "auto.threads.value", &[&crate::hardware::threads().to_string()]);
+        for (label, value) in [(text::get(lang, "auto.card_memory"), card_line), (text::get(lang, "auto.threads"), threads_line)] {
+            setting_row(ui, h, 0.0, &label, &value, "textSoft", |_| {});
+        }
     }
 
     fn advanced_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1004,56 +1041,6 @@ impl App {
                             self.config.language = Some(l.code().to_owned());
                             self.save();
                         }
-                    }
-                });
-            });
-            theme::row_line(ui, r.response.rect);
-
-            let r = ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.set_min_height(h);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(theme::label(&text::get(lang, "advanced.victory")));
-                    let how = match &self.checkout {
-                        Some(root) if self.config.victory_exe.is_none() => text::fill(lang, "advanced.victory.checkout", &[&root.display().to_string()]),
-                        _ => text::get(lang, "advanced.victory.hint"),
-                    };
-                    ui.add(egui::Label::new(theme::small(&how, "textMuted").size(theme::type_size("caption"))).truncate());
-                });
-                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::outline_button(ui, "…", Some(44.0), false).clicked()
-                        && let Some(file) = rfd::FileDialog::new().add_filter("victory", &["exe"]).pick_file()
-                    {
-                        self.config.victory_exe = Some(file.display().to_string());
-                        self.save();
-                    }
-                    let mut path = self.config.victory_exe.clone().unwrap_or_default();
-                    let edit = egui::TextEdit::singleline(&mut path)
-                        .hint_text(text::get(lang, "advanced.victory.auto"))
-                        .desired_width(300.0)
-                        .margin(vec2(10.0, 12.0));
-                    if ui.add(edit).changed() {
-                        self.config.victory_exe = Some(path.trim().to_owned()).filter(|p| !p.is_empty());
-                        self.save();
-                    }
-                });
-            });
-            theme::row_line(ui, r.response.rect);
-
-            let r = ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.set_min_height(h);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(theme::label(&text::get(lang, "advanced.runner")));
-                    ui.label(theme::small(&text::get(lang, "advanced.runner.hint"), "textMuted").size(theme::type_size("caption")));
-                });
-                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut runner = self.config.runner.clone().unwrap_or_default();
-                    let hint = if cfg!(windows) { "" } else { "wine" };
-                    let edit = egui::TextEdit::singleline(&mut runner).hint_text(hint).desired_width(num("layout", "selectWidth")).margin(vec2(10.0, 12.0));
-                    if ui.add(edit).changed() {
-                        self.config.runner = Some(runner.trim().to_owned()).filter(|p| !p.is_empty());
-                        self.save();
                     }
                 });
             });
@@ -1085,10 +1072,35 @@ impl App {
                 self.save();
             }
             theme::row_line(ui, Rect::from_min_max(before, pos2(before.x + ui.available_width(), before.y + h)));
-            ui.add_space(10.0);
-            ui.label(theme::small(&text::fill(lang, "advanced.data", &[&paths::data_dir().display().to_string()]), "textMuted"));
         });
     }
+}
+
+/// One row of the settings: the label with its detail under it on the left,
+/// wrapping instead of running under the controls, and the controls on the
+/// right in `controls` px. The row grows with its text; a line under it.
+fn setting_row(ui: &mut egui::Ui, h: f32, controls: f32, label: &str, detail: &str, ink: &str, right: impl FnOnce(&mut egui::Ui)) {
+    let width = ui.available_width();
+    let r = ui.horizontal(|ui| {
+        ui.set_min_height(h);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 3.0;
+            ui.set_width((width - controls - 16.0).max(120.0));
+            ui.add_space(8.0);
+            ui.add(egui::Label::new(theme::label(label)).wrap());
+            if !detail.is_empty() {
+                ui.add(egui::Label::new(theme::small(detail, ink).size(theme::type_size("caption"))).wrap());
+            }
+            ui.add_space(8.0);
+        });
+        ui.with_layout(Layout::right_to_left(egui::Align::Center), right);
+    });
+    theme::row_line(ui, r.response.rect);
+}
+
+/// Where VIctory keeps its data, saves included, when no folder is chosen.
+fn default_saves_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA").map_or_else(paths::data_dir, PathBuf::from).join("victory").join("data")
 }
 
 /// The value of a choice as the language files name it, else as it is.

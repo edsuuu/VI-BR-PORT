@@ -483,27 +483,30 @@ fn paint_switch(ui: &Ui, rect: Rect, on: bool) {
 /// switch on the right; a click anywhere on it flips it.
 pub fn switch_row(ui: &mut Ui, label_text: &str, hint: &str, on: &mut bool, height: f32) -> Response {
     let width = ui.available_width();
-    let (rect, mut response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
-    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Switch, ui.is_enabled(), *on, label_text));
-    if response.clicked() {
-        *on = !*on;
-        response.mark_changed();
-    }
     let sw = vec2(num("size", "switchWidth"), num("size", "switchHeight"));
-    let track = Rect::from_center_size(pos2(rect.right() - sw.x / 2.0, rect.center().y), sw);
-    paint_switch(ui, track, *on);
-    let wrap = rect.width() - sw.x - 12.0;
+    // The text is laid out first (wrapping short of the switch), so the row
+    // grows with it instead of running into the next one.
+    let wrap = (width - sw.x - 16.0).max(60.0);
     let label_font = FontId::new(type_size("body"), FontFamily::Name("semibold".into()));
     let label_g = ui.painter().layout(label_text.to_owned(), label_font, faded(ui, colour("text")), wrap);
     let hint_g = (!hint.is_empty()).then(|| {
         ui.painter().layout(hint.to_owned(), FontId::proportional(type_size("caption")), faded(ui, colour("textMuted")), wrap)
     });
     let lh = label_g.size().y;
-    let total = lh + hint_g.as_ref().map_or(0.0, |g| g.size().y + 2.0);
+    let total = lh + hint_g.as_ref().map_or(0.0, |g| g.size().y + 3.0);
+    let height = height.max(total + 16.0);
+    let (rect, mut response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Switch, ui.is_enabled(), *on, label_text));
+    if response.clicked() {
+        *on = !*on;
+        response.mark_changed();
+    }
+    let track = Rect::from_center_size(pos2(rect.right() - sw.x / 2.0, rect.center().y), sw);
+    paint_switch(ui, track, *on);
     let y = rect.center().y - total / 2.0;
     ui.painter().galley(pos2(rect.left(), y), label_g, colour("text"));
     if let Some(g) = hint_g {
-        ui.painter().galley(pos2(rect.left(), y + lh + 2.0), g, colour("textMuted"));
+        ui.painter().galley(pos2(rect.left(), y + lh + 3.0), g, colour("textMuted"));
     }
     focus_ring(ui, track, sw.y / 2.0, &response);
     response
