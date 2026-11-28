@@ -3268,6 +3268,9 @@ fn told_elsewhere(at: usize, len: usize) {
     }
     for &(other, bytes) in &parts {
         crate::descriptor::host::remapped(other, bytes);
+        // Told there too: a look that finds the bytes before the pass took
+        // the range (the write was landing) is not one told only here.
+        note_writer(other, bytes, Writer::Ours);
     }
     // Writes told elsewhere, and the ranges told.
     static TOLD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
