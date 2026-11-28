@@ -397,6 +397,7 @@ pub(crate) fn wait_all(list: &ID3D12GraphicsCommandList4) {
 pub(crate) fn frame() {
     if super::native_on() {
         FRAMES.fetch_add(1, Relaxed);
+        super::probe::tick();
     }
 }
 
@@ -473,7 +474,10 @@ fn record_on(host: &HostList, origin: Origin, builds: &[Build]) -> bool {
     let slot = gpu.begin(&list);
     // What wrote the inputs before (the skinning, the title's copies) is done.
     wait_all(&list);
-    let mut tops: Vec<(&Build, Arc<Structure>, usize)> = Vec::new();
+    // Pages of the console's structures the probe asked for (they are as the
+    // title's builds recorded before this left them).
+    super::probe::read_pages(host, &list);
+    let mut tops = Vec::new();
     {
         let mut table = TABLE.lock().unwrap_or_else(|e| e.into_inner());
         for b in builds.iter().filter(|b| matches!(b.level, Level::Bottom { .. })) {
@@ -500,6 +504,11 @@ fn record_on(host: &HostList, origin: Origin, builds: &[Build]) -> bool {
     // What reads the structures from here on sees them built.
     wait_all(&list);
     gpu.end(&list, slot);
+    for (b, s, descs) in tops {
+        if let Level::Top { count, .. } = b.level {
+            super::probe::after_top(host, &list, b.dest, count, &s, descs);
+        }
+    }
     held.give(host);
     true
 }

@@ -25,7 +25,11 @@
 //!   host's bottom levels;
 //! - `table`: the title's destination address to the host structure, with
 //!   generations and the refit-or-rebuild decision;
-//! - `pool`: the card memory structures and scratch memory are cut from.
+//! - `pool`: the card memory structures and scratch memory are cut from;
+//! - `probe` (`VICTORY_DXR_PROBE=1`): a picture of a host top level made with
+//!   ray queries of our own writer, and the same rays walked on the CPU
+//!   through the console's structure read back from the card (`walk`),
+//!   compared ray by ray.
 //!
 //! The tests prove the host side end to end on the card with programs of
 //! our own writer (`victory_shader::emit::ray_query_probe`) and measure
@@ -36,9 +40,11 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 
 mod native;
+mod probe;
 mod pool;
 mod table;
 mod top;
+mod walk;
 
 pub(crate) use native::{frame, line};
 
