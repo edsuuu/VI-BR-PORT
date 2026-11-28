@@ -134,6 +134,8 @@ pub(super) enum C {
     ExpandedVertices,
     ExpandedBytes,
     ExpandedByAddress,
+    /// Of them, in a host copy shaders write (`VICTORY_DXR_EXPAND_WRITTEN`).
+    ExpandedWritten,
     /// At submission: expansions whose data the CPU could not read then
     /// (written so that nothing is hit), triangles made degenerate,
     /// positions not finite.

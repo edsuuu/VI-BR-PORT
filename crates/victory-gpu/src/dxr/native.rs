@@ -522,7 +522,7 @@ pub(crate) fn line() {
         let _ = write!(
             text,
             "; expanded (VICTORY_DXR_EXPAND) {:.1} index-53 lists ({:.0} triangles) and {:.1} quantized position lists \
-             ({:.0} vertices), {:.2} MB of upload memory, {:.1} in pages of by-address memory the card holds; at submission \
+             ({:.0} vertices), {:.2} MB of upload memory, {:.1} in pages of by-address memory the card holds, {:.1} in host copies shaders write (VICTORY_DXR_EXPAND_WRITTEN); at submission \
              {:.2} not readable, {:.0} triangles made degenerate, {:.0} positions not finite",
             per(C::ExpandedIndexLists),
             per(C::ExpandedTriangles),
@@ -530,6 +530,7 @@ pub(crate) fn line() {
             per(C::ExpandedVertices),
             per(C::ExpandedBytes) / f64::from(1 << 20),
             per(C::ExpandedByAddress),
+            per(C::ExpandedWritten),
             per(C::ExpandedUnreadable),
             per(C::ExpandedDegenerate),
             per(C::ExpandedNotFinite),
