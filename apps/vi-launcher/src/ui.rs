@@ -369,7 +369,15 @@ impl App {
         let open = self.game_open();
         if open && self.tray.is_none() {
             let lang = self.language;
-            self.tray = Tray::new(ctx, "VI-BR-Launcher", &text::get(lang, "tray.show"), &text::get(lang, "prep.close_game"));
+            // Close the game from the menu acts at once (the hidden window may not run).
+            let handles = self.prep.as_ref().map(|p| (p.running.clone(), p.cancelled.clone()));
+            let close_game = move || {
+                if let Some((running, cancelled)) = &handles {
+                    cancelled.store(true, Ordering::SeqCst);
+                    run::cancel(running);
+                }
+            };
+            self.tray = Tray::new(ctx, TITLE, "VI-BR-Launcher", &text::get(lang, "tray.show"), &text::get(lang, "prep.close_game"), close_game);
             if self.tray.is_some() {
                 ctx.send_viewport_cmd(if HIDES {
                     egui::ViewportCommand::Visible(false)

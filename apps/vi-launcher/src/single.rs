@@ -31,7 +31,7 @@ pub fn first(_title: &str) -> bool {
 
 /// Shows the running launcher's window, restored and in front.
 #[cfg(windows)]
-fn show_other(title: &str) {
+pub fn show_other(title: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow};
 
     let title = wide(title);

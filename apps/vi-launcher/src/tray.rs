@@ -10,22 +10,48 @@ pub enum Action {
 #[cfg(windows)]
 pub struct Tray {
     _icon: tray_icon::TrayIcon,
-    show: tray_icon::menu::MenuId,
-    close: tray_icon::menu::MenuId,
+    actions: std::sync::Mutex<std::sync::mpsc::Receiver<Action>>,
 }
 
 #[cfg(windows)]
 impl Tray {
-    /// The icon and its menu; the window is woken by any click on them.
-    pub fn new(ctx: &egui::Context, tooltip: &str, show: &str, close: &str) -> Option<Self> {
+    /// The icon and its menu. A handler set on the icon's events takes them
+    /// all (the library's own receivers then get nothing), and the window is
+    /// hidden, so its frames may not run: the clicks act where they arrive.
+    /// Show brings the window back (`title` finds it) and Close the game runs
+    /// `close_game`; both are also told to the window, for its state.
+    pub fn new(
+        ctx: &egui::Context,
+        title: &'static str,
+        tooltip: &str,
+        show: &str,
+        close: &str,
+        close_game: impl Fn() + Send + Sync + 'static,
+    ) -> Option<Self> {
         use tray_icon::menu::{Menu, MenuEvent, MenuItem};
-        use tray_icon::{TrayIconBuilder, TrayIconEvent};
-        let wake = ctx.clone();
-        TrayIconEvent::set_event_handler(Some(move |_| wake.request_repaint()));
-        let wake = ctx.clone();
-        MenuEvent::set_event_handler(Some(move |_| wake.request_repaint()));
+        use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
         let show_item = MenuItem::new(show, true, None);
         let close_item = MenuItem::new(close, true, None);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (wake, send) = (ctx.clone(), tx.clone());
+        TrayIconEvent::set_event_handler(Some(move |e| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+                crate::single::show_other(title);
+                let _ = send.send(Action::Show);
+                wake.request_repaint();
+            }
+        }));
+        let (wake, show_id, close_id) = (ctx.clone(), show_item.id().clone(), close_item.id().clone());
+        MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+            if e.id == show_id {
+                crate::single::show_other(title);
+                let _ = tx.send(Action::Show);
+            } else if e.id == close_id {
+                close_game();
+                let _ = tx.send(Action::CloseGame);
+            }
+            wake.request_repaint();
+        }));
         let menu = Menu::new();
         menu.append(&show_item).ok()?;
         menu.append(&close_item).ok()?;
@@ -36,25 +62,15 @@ impl Tray {
             .with_menu_on_left_click(false)
             .build()
             .ok()?;
-        Some(Self { _icon: icon, show: show_item.id().clone(), close: close_item.id().clone() })
+        Some(Self { _icon: icon, actions: std::sync::Mutex::new(rx) })
     }
 
     /// What the user asked for from the icon since the last call.
     pub fn poll(&self) -> Option<Action> {
-        use tray_icon::menu::MenuEvent;
-        use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
+        let rx = self.actions.lock().ok()?;
         let mut action = None;
-        while let Ok(e) = TrayIconEvent::receiver().try_recv() {
-            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
-                action = Some(Action::Show);
-            }
-        }
-        while let Ok(e) = MenuEvent::receiver().try_recv() {
-            if e.id == self.show {
-                action = Some(Action::Show);
-            } else if e.id == self.close {
-                action = Some(Action::CloseGame);
-            }
+        while let Ok(a) = rx.try_recv() {
+            action = Some(a);
         }
         action
     }
@@ -72,7 +88,14 @@ pub struct Tray;
 
 #[cfg(not(windows))]
 impl Tray {
-    pub fn new(_ctx: &egui::Context, _tooltip: &str, _show: &str, _close: &str) -> Option<Self> {
+    pub fn new(
+        _ctx: &egui::Context,
+        _title: &'static str,
+        _tooltip: &str,
+        _show: &str,
+        _close: &str,
+        _close_game: impl Fn() + Send + Sync + 'static,
+    ) -> Option<Self> {
         Some(Self)
     }
 
