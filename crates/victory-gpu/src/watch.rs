@@ -3098,6 +3098,56 @@ pub fn writing(at: usize, len: usize) {
     }
     // A placed texture there changes with no descriptor written.
     crate::descriptor::host::remapped(at, len);
+    if writes_elsewhere() {
+        told_elsewhere(at, len);
+    }
+}
+
+/// Whether a write of title memory through one address ([`writing`]) is
+/// also told, for the placed textures, at the other addresses that show the
+/// same physical pages (`VICTORY_WRITES_ELSEWHERE=1`; off by default: at
+/// that address alone, as before).
+///
+/// The title streams textures into the pages of a pool and maps those pages
+/// into its tiled heap, 64 KiB at a time (`CopyPageMappingsBatchX`,
+/// `crate::queue`), where the textures' views lie. A DirectStorage request
+/// that writes the pool's address after the mapping told the pool's address
+/// alone; the texture at the heap's address was found changed only if its
+/// look again (`crate::texture::fingerprint`: three windows of 16 KiB, at
+/// 4 to 400 frames) fell on a changed page. Every other page kept what was
+/// there before: other textures' bytes, a 64 KiB square of each over a
+/// character's shirt and face for the whole run (capture-10, capture-6).
+fn writes_elsewhere() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WRITES_ELSEWHERE").is_some_and(|v| v == "1"))
+}
+
+/// [`writes_elsewhere`]: the placed textures at the other addresses of the
+/// pages of `[at, at + len)` are due again.
+fn told_elsewhere(at: usize, len: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    let parts = crate::inplace::ranges_elsewhere(at, len);
+    if parts.is_empty() {
+        return;
+    }
+    for &(other, bytes) in &parts {
+        crate::descriptor::host::remapped(other, bytes);
+    }
+    // Writes told elsewhere, and the ranges told.
+    static TOLD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+    let n = TOLD[0].fetch_add(1, Relaxed) + 1;
+    let ranges = TOLD[1].fetch_add(parts.len() as u64, Relaxed) + parts.len() as u64;
+    if n <= 16 || n.is_power_of_two() {
+        tracing::info!(
+            at = format_args!("{at:#x}"),
+            len,
+            first_elsewhere = format_args!("{:#x}", parts[0].0),
+            ranges = parts.len(),
+            writes_so = n,
+            ranges_so = ranges,
+            "a write of title memory is told where the same pages are shown too (VICTORY_WRITES_ELSEWHERE=1)"
+        );
+    }
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
