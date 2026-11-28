@@ -10278,6 +10278,7 @@ impl Meter {
                     if mode & 2 != 0 { "made due again" } else { "left as they were" }
                 );
             }
+            crate::twin::line();
             #[cfg(feature = "diagnostics")]
             tracing::info!(
                 "write-watch askings of a millisecond or more: {:.1} a frame, {:.1} ms a frame; the longest asking {:.1} ms",

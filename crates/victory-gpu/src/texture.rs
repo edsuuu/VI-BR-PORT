@@ -1476,6 +1476,8 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        // `VICTORY_MAP_TRACE=1`: which mapping of the tiled heap it read.
+        crate::twin::read(self.memory as usize, tiled.len());
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step

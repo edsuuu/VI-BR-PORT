@@ -1328,19 +1328,21 @@ extern "system" fn copy_page_mappings(
     } else {
         &[]
     };
-    let many = crate::resource::many_page_mapper();
+    // Gathered first: each page is checked against the title's CPU view of
+    // its heap before it is mapped (`crate::twin`).
     let mut gathered: Vec<(u64, u64, u64)> = Vec::new();
-    let map = |to: u64, from: u64, len: u64| match many {
-        Some(_) => {
-            gathered.push((to, from, len));
-            true
-        }
-        None => map(to, from, len),
-    };
-    let mut ok = map_batches(batches, pool, pool_pages, page_bytes(flags), map);
-    if let Some(many) = many {
-        ok &= many(&gathered);
+    let mut ok = map_batches(batches, pool, pool_pages, page_bytes(flags), |to, from, len| {
+        gathered.push((to, from, len));
+        true
+    });
+    #[cfg(windows)]
+    let gathered = crate::twin::before(gathered);
+    match crate::resource::many_page_mapper() {
+        Some(many) => ok &= many(&gathered),
+        None => ok &= gathered.iter().fold(true, |ok, &(to, from, len)| map(to, from, len) && ok),
     }
+    #[cfg(windows)]
+    crate::twin::mapped(crate::twin::calls(), &gathered);
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {

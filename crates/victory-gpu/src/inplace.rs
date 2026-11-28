@@ -423,6 +423,16 @@ pub(crate) fn pages_of(page: usize) -> Vec<usize> {
     v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
 }
 
+/// What the 64 KiB page at `page` shows: the section's handle and the byte
+/// offset of the page in it; `None` if it is no view.
+pub(crate) fn page_view(page: usize) -> Option<(usize, u64)> {
+    let page = page - page % K64;
+    let v = views();
+    let (&base, &(bytes, section, offset)) = v.views.range(..=page).next_back()?;
+    let within = page - base;
+    (within < bytes).then_some((section, offset + within as u64))
+}
+
 /// The title views that show any of the physical bytes `[offset, offset +
 /// len)` of `section`, as `(address, bytes)` ranges in address order; not
 /// those of a page shown in very many views (`MANY_VIEWS`).
