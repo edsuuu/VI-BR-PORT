@@ -38,6 +38,9 @@ pub struct Config {
     /// Ask for updates when the window opens (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_updates: Option<bool>,
+    /// The window full screen (F11), as it was left.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fullscreen: Option<bool>,
     #[serde(flatten)]
     pub rest: Map<String, Value>,
 }
@@ -58,6 +61,7 @@ impl Default for Config {
             victory_exe: None,
             runner: None,
             check_updates: None,
+            fullscreen: None,
             rest: Map::new(),
         }
     }

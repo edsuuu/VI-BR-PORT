@@ -30,12 +30,15 @@ const LOG_TAIL: u64 = 256 * 1024;
 
 pub fn start() -> ExitCode {
     let size = [num("size", "windowWidth"), num("size", "windowHeight")];
+    // Full screen as it was left (F11 or Alt+Enter), maximized otherwise.
+    let fullscreen = config::load(&paths::config_path()).config.fullscreen.unwrap_or(false);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("VI-BR-PORT")
             .with_inner_size(size)
             .with_min_inner_size(size)
-            .with_maximized(true),
+            .with_maximized(true)
+            .with_fullscreen(fullscreen),
         ..Default::default()
     };
     match eframe::run_native("VI-BR-PORT", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
@@ -373,6 +376,13 @@ impl eframe::App for App {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // F11 or Alt+Enter: full screen on and off, remembered for next time.
+        if ctx.input(|i| i.key_pressed(egui::Key::F11) || (i.modifiers.alt && i.key_pressed(egui::Key::Enter))) {
+            let on = !ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+            self.config.fullscreen = Some(on);
+            self.save();
+        }
         let full = ui.max_rect();
         let fade_ms = num("motion", "backgroundFadeMs").max(1.0);
         let fade_in = (self.opened.elapsed().as_secs_f32() * 1000.0 / fade_ms).min(1.0);
