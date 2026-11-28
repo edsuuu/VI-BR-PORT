@@ -9,6 +9,12 @@
 //! With arguments it prints instead of opening the window:
 //! `vi-launcher --check <folder>` checks a game folder, `--version` prints the
 //! version, `--updates` asks both sources for a newer release.
+//!
+//! The engine is linked in: started with one of the engine's commands (`run`,
+//! `shaders`, `warm`, ...; `victory_app::is_engine_command`) this executable is
+//! VIctory itself, so a release is this one file. The launcher starts the game
+//! by starting itself with those commands ([`paths::find_victory`]), and the
+//! engine's own copies of itself (warm workers, a relaunch) come back here too.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod config;
@@ -16,6 +22,7 @@ mod controls;
 mod flags;
 mod game;
 mod hardware;
+mod mark;
 mod options;
 mod paths;
 mod run;
@@ -28,6 +35,10 @@ mod update;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    #[cfg(windows)]
+    if victory_app::is_engine_command() {
+        return engine();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
         return ui::start();
@@ -41,6 +52,34 @@ fn main() -> ExitCode {
         }
     }
 }
+
+/// The engine, as the `victory` binary runs it (Windows; elsewhere the launcher
+/// starts `victory.exe` through Wine). Its output goes where the one who
+/// started it sent it (the launcher's log pipe); started by hand from a console,
+/// it prints there.
+#[cfg(windows)]
+fn engine() -> ExitCode {
+    if !stdout_redirected() {
+        attach_console();
+    }
+    match victory_app::main() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Whether this process was given an output to write to (a pipe or a file).
+#[cfg(windows)]
+fn stdout_redirected() -> bool {
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_OUTPUT_HANDLE};
+    // SAFETY: no pointers.
+    let h = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    !h.is_null() && h != windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+}
+
 
 /// The commands that print instead of opening the window.
 fn cli(args: &[String]) -> Result<(), String> {
