@@ -581,6 +581,24 @@ fn describe(e: &Event, context: bool) -> String {
 /// # Safety
 /// `now` and `held` are `len` readable bytes of ours.
 pub(crate) unsafe fn before_merge(card: bool, title: usize, now: *const u8, held: *const u8, len: usize) -> Vec<(usize, u64, u64)> {
+    // SAFETY: the caller's.
+    unsafe { look_before_merge(card, title, now, held, len, level() > 0, guard()) }
+}
+
+/// [`before_merge`], with whether events are noted and whether the guard
+/// asks for qwords back.
+///
+/// # Safety
+/// [`before_merge`]'s.
+unsafe fn look_before_merge(
+    card: bool,
+    title: usize,
+    now: *const u8,
+    held: *const u8,
+    len: usize,
+    notes: bool,
+    guarding: bool,
+) -> Vec<(usize, u64, u64)> {
     let path = if card { Path::LandCard } else { Path::LandBack };
     let mut keep = Vec::new();
     touched(path, title, len);
@@ -606,10 +624,10 @@ pub(crate) unsafe fn before_merge(card: bool, title: usize, now: *const u8, held
                 // like this some 90,000 times a second in the world, runs
                 // barco-q-w1..3, and noting them all took about 1.8 ms a
                 // frame, prisao-q-w1.)
-                if level() > 0 {
+                if notes {
                     note(Event { path, at: title + i, was: t, now: m, card: Some((c, h)), landing: landing_number(), frame: crate::frame::current(), ms: ms() });
                 }
-                if guard() && watch_flags(t, m) {
+                if guarding && watch_flags(t, m) {
                     keep.push((i, t, m));
                 }
             }
@@ -865,7 +883,8 @@ mod tests {
         card[node + 8 - at + 4] = 1;
         let before = COUNTS[Path::LandCard.index()].load(Ordering::Relaxed);
         // SAFETY: `card` and `held` are ours, `len` bytes.
-        unsafe { before_merge(true, at, card.as_ptr(), held.as_ptr(), len) };
+        let keep = unsafe { look_before_merge(true, at, card.as_ptr(), held.as_ptr(), len, true, true) };
+        assert_eq!(keep, [(node + 8 - at, 0x9_0418_cf18, 0x1_0418_cf18)]);
         assert!(COUNTS[Path::LandCard.index()].load(Ordering::Relaxed) > before);
         let ring = RING.lock().unwrap();
         let e = ring.iter().rev().find(|e| e.at == node + 8).copied().unwrap();
