@@ -816,8 +816,30 @@ pub struct Format {
     pub stencil: bool,
 }
 
+/// Whether the console's own formats 189 (signed 10-bit colour, 4 bytes a
+/// texel), 190 (two 4-bit channels, 1 byte) and 191 (24/8 colour, 4 bytes)
+/// have layouts here, as the rest of their size do
+/// (`VICTORY_FORMATS_189_191=1`). Off by default: they have none, as
+/// before, and a texture of one gets the size of every level packed
+/// (`victory-gpu`'s `footprint`), nothing tiled. The host GPU's sizes for
+/// them (`victory-gpu`'s `element`) already say the same bytes a texel.
+fn console_formats() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_CONSOLE_FORMATS.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FORMATS_189_191").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`console_formats`], for its thread only.
+    static TEST_CONSOLE_FORMATS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// By DXGI format number. `None` for 96-bit, 1-bit, packed 4:2:2 and video
-/// formats.
+/// formats, and for the console's 189 to 191 unless [`console_formats`].
 ///
 /// shortcut: those formats have no layout here; add them when a title uses
 /// one.
@@ -832,6 +854,8 @@ pub fn format(dxgi: u32) -> Option<Format> {
         60..=65 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
+        189 | 191 if console_formats() => (4, 1, false),
+        190 if console_formats() => (1, 1, false),
         _ => return None,
     };
     Some(Format {
@@ -946,6 +970,37 @@ mod tests {
             samples: 1,
             swizzle,
         }
+    }
+
+    /// The console's 189 to 191 have layouts with `VICTORY_FORMATS_189_191=1`
+    /// and none without it, as before (tn1's 0dd34bdbe).
+    #[test]
+    fn console_formats_have_layouts_only_when_asked() {
+        for (on, want) in [(true, true), (false, false)] {
+            TEST_CONSOLE_FORMATS.set(Some(on));
+            for (dxgi, bytes) in [(189, 4), (190, 1), (191, 4)] {
+                let found = format(dxgi);
+                assert_eq!(found.is_some(), want, "format {dxgi}, switch {on}");
+                if want {
+                    assert_eq!(found, Some(Format { bytes, block: 1, stencil: false }));
+                    let layout = Texture::new(&TextureDesc {
+                        dimension: Dimension::Tex2d,
+                        width: 64,
+                        height: 64,
+                        depth_or_array: 1,
+                        mips: 1,
+                        format: dxgi,
+                        samples: 1,
+                        swizzle: Swizzle::SW_4KB_S,
+                    });
+                    assert!(layout.is_ok(), "format {dxgi}: {layout:?}");
+                }
+            }
+            TEST_CONSOLE_FORMATS.set(None);
+        }
+        // Their neighbours stay as they were.
+        assert_eq!(format(188), None);
+        assert_eq!(format(192), None);
     }
 
     #[test]
