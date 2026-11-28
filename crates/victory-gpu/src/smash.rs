@@ -42,6 +42,9 @@
 //! from the CPU side's is read from title memory once more (some 25 MB a
 //! frame in the world, on the threads that land), and every copy into title
 //! memory reads its destination first.
+//!
+//! `VICTORY_SMASH_GUARD=1` ([`guard`]) also gives a pointer a landing
+//! smashed the crashes' way back to the title, right after the merge.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -61,7 +64,59 @@ pub(crate) fn level() -> u8 {
 
 /// See the file.
 pub(crate) fn on() -> bool {
-    level() > 0
+    level() > 0 || guard()
+}
+
+/// `VICTORY_SMASH_GUARD=1` (off by default; with it the checks of `1` are
+/// on): a landing does not put the card's bytes over a title pointer in the
+/// ways the crashes saw ([`watch_flags`]). Title memory and the CPU's side
+/// keep the title's qword ([`keep_title`]), the card keeps its own (it is
+/// what the card's later work reads), and the line says so.
+///
+/// Why it is no fix: whatever writes there on the card still does, beside
+/// the pointer (the title's descriptors round it stay as it left them). It
+/// keeps the ring's records whole while that is found. What it may cost:
+/// a qword the card writes that looks the same (a count beside an aligned
+/// value, whose count changes in the high dword) stays as it was for the
+/// title's CPU; the card keeps it.
+pub(crate) fn guard() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SMASH_GUARD"))
+}
+
+/// Qwords [`keep_title`] kept, since the start and since the last line.
+static KEPT_ALL: AtomicU64 = AtomicU64::new(0);
+static KEPT_SINCE: AtomicU64 = AtomicU64::new(0);
+
+/// After a landing's merge ([`before_merge`] asked for it): title memory at
+/// `into` (an address that shows the qword, ours or the title's) gets `was`
+/// back if it holds what the merge left (`now`; else the title wrote it
+/// meanwhile and keeps that), and so does the CPU's side at `held`.
+///
+/// # Safety
+/// `held` is 8 bytes of the copy's CPU side that only the caller writes.
+pub(crate) unsafe fn keep_title(into: usize, held: *mut u8, was: u64, now: u64) {
+    let mut there = [0u8; 8];
+    // SAFETY: into our own array; memory that is not there fails the copy.
+    if !unsafe { crate::safecopy::copy(there.as_mut_ptr(), into as *const u8, 8) } || u64::from_le_bytes(there) != now {
+        return;
+    }
+    let bytes = was.to_le_bytes();
+    // SAFETY: title memory the merge just wrote; a page that went away
+    // fails the copy.
+    if !unsafe { crate::safecopy::copy(into as *mut u8, bytes.as_ptr(), 8) } {
+        return;
+    }
+    // SAFETY: the caller's.
+    unsafe { held.cast::<u64>().write_unaligned(was) };
+    KEPT_SINCE.fetch_add(1, Ordering::Relaxed);
+    if KEPT_ALL.fetch_add(1, Ordering::Relaxed) < 64 {
+        tracing::warn!(
+            "smash guard (VICTORY_SMASH_GUARD=1): a landing would have left {now:#018x} over the title's {was:#018x} at {into:#x}; the \
+             title's is kept (frame {})",
+            crate::frame::current()
+        );
+    }
 }
 
 /// How many events are logged as they come (`VICTORY_SMASH_WATCH_LOG`, 200);
@@ -512,21 +567,25 @@ fn describe(e: &Event, context: bool) -> String {
 /// Before a landing merges `len` bytes (within one 4 KiB page) into title
 /// memory at `title`: `now` what the card holds, `held` what it held
 /// ([`crate::safecopy::merge`]). `card`: the copy is in the card's memory.
+/// With [`guard`]: the qwords to give back after the merge ([`keep_title`]),
+/// each its offset from the stretch's start, what it was and what the merge
+/// leaves.
 ///
 /// # Safety
 /// `now` and `held` are `len` readable bytes of ours.
-pub(crate) unsafe fn before_merge(card: bool, title: usize, now: *const u8, held: *const u8, len: usize) {
+pub(crate) unsafe fn before_merge(card: bool, title: usize, now: *const u8, held: *const u8, len: usize) -> Vec<(usize, u64, u64)> {
     let path = if card { Path::LandCard } else { Path::LandBack };
+    let mut keep = Vec::new();
     touched(path, title, len);
     // SAFETY: the caller's.
     if len == 0 || len > 4096 || !unsafe { crate::safecopy::differ(now, held, len) } {
-        return;
+        return keep;
     }
     let mut page = [0u8; 4096];
     // SAFETY: into our own array; title memory that is not there fails the
     // copy, and the merge puts nothing there either.
     if !unsafe { crate::safecopy::copy(page.as_mut_ptr(), title as *const u8, len) } {
-        return;
+        return keep;
     }
     let mut i = title.wrapping_neg() & 7;
     while i + 8 <= len {
@@ -537,10 +596,14 @@ pub(crate) unsafe fn before_merge(card: bool, title: usize, now: *const u8, held
             let m = merged(t, c, h);
             if smashes(t, m) {
                 note(Event { path, at: title + i, was: t, now: m, card: Some((c, h)), landing: landing_number(), frame: crate::frame::current(), ms: ms() });
+                if guard() && watch_flags(t, m) {
+                    keep.push((i, t, m));
+                }
             }
         }
         i += 8;
     }
+    keep
 }
 
 /// Before `now` is put at title address `at` where it differs from `was`
@@ -646,6 +709,14 @@ pub(crate) fn log(frames: f64) {
         by(&since),
         by(&all),
     );
+    if guard() {
+        tracing::info!(
+            "smash guard (VICTORY_SMASH_GUARD=1): title pointers a landing would have smashed, kept as the title had them: {} since the \
+             last line, {} since the start",
+            KEPT_SINCE.swap(0, Ordering::Relaxed),
+            KEPT_ALL.load(Ordering::Relaxed),
+        );
+    }
 }
 
 /// For the crash report: the events kept, those within 64 bytes of a
@@ -827,6 +898,29 @@ mod tests {
         src[3] = 0x1_0000_0000;
         before_copy(Path::Copy, at, src.as_ptr().cast(), 64);
         assert_eq!(COUNTS[Path::Copy.index()].load(Ordering::Relaxed), before + 1);
+    }
+
+    #[test]
+    fn the_guard_gives_the_title_its_pointer_back_unless_the_title_wrote_since() {
+        if !crate::safecopy::on() {
+            return;
+        }
+        // The merge left the card's smashed pointer in both.
+        let mut title = [0x1_0418_cf18u64, 0];
+        let mut held = [0x1_0418_cf18u64, 0];
+        let (at, held_at) = (title.as_mut_ptr() as usize, held.as_mut_ptr() as usize);
+        // SAFETY: `held` is ours.
+        unsafe { keep_title(at, held_at as *mut u8, 0x9_0418_cf18, 0x1_0418_cf18) };
+        // SAFETY: our own memory, written through its address above.
+        let (t, h) = unsafe { ((at as *const u64).read_volatile(), (held_at as *const u64).read_volatile()) };
+        assert_eq!((t, h), (0x9_0418_cf18, 0x9_0418_cf18));
+        // The title wrote a new record meanwhile: it stays.
+        // SAFETY: as above.
+        unsafe {
+            ((at + 8) as *mut u64).write_volatile(0x9_0418_d7e8);
+            keep_title(at + 8, (held_at + 8) as *mut u8, 0x9_0418_cf18, 0x1_0418_cf18);
+            assert_eq!(((at + 8) as *const u64).read_volatile(), 0x9_0418_d7e8);
+        }
     }
 
     #[test]

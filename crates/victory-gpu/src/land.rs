@@ -625,10 +625,12 @@ unsafe fn piece_at(
         }
         // Diagnostics (`VICTORY_SMASH_WATCH`): a title pointer this changes.
         // `take` is what a copy in the card's memory asks for (`land_card`).
-        if crate::smash::on() {
+        let keep = if crate::smash::on() {
             // SAFETY: the caller's.
-            unsafe { crate::smash::before_merge(take, title + from, now.add(from), held.add(from), n) };
-        }
+            unsafe { crate::smash::before_merge(take, title + from, now.add(from), held.add(from), n) }
+        } else {
+            Vec::new()
+        };
         // SAFETY: the caller's; title memory, by an address that shows it
         // (`beside`) or the title's own.
         let merge = |take| unsafe { crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take) };
@@ -650,6 +652,12 @@ unsafe fn piece_at(
             done.dwords = put;
             // (What was new to the first try was new.)
             done.new = done.new.max(1);
+        }
+        // `VICTORY_SMASH_GUARD=1`: a title pointer the merge smashed is given
+        // back, through the address the merge wrote by.
+        for &(at, was, smashed) in &keep {
+            // SAFETY: the caller's: `held` is ours from 0 to the end.
+            unsafe { crate::smash::keep_title(into.wrapping_add(from + at), held.add(from + at), was, smashed) };
         }
         blocks += done.new;
         dwords += done.dwords;
