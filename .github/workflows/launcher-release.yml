@@ -9,8 +9,9 @@ name: Release
 #   engine    engine-v<version>   VIctory-<version>-windows-x64.zip     victory.exe (next to the launcher, chosen
 #                                                                       in its settings, or with scripts/play.ps1)
 # A dev channel run puts dev- before every name and tag and makes pre-releases.
-# With publish off (the default) the bundles are only kept as artifacts to look at.
-# With publish on the release(s) are made; a stable launcher release also puts
+# Every release starts with the notes typed when the run is started.
+# With publish off the bundles are only kept as artifacts to look at.
+# With publish on (the default) the release(s) are made; a stable launcher release also puts
 # latest.json on GitHub Pages, where the launchers look first. An engine release
 # is never marked latest, so the launchers' fallback (the latest release) stays
 # on a launcher release.
@@ -33,11 +34,15 @@ on:
         type: choice
         options: [stable, dev]
         default: stable
+      notes:
+        description: "What changed, written at the top of the release(s); \\n starts a new line. GitHub's list of merged pull requests follows it"
+        required: true
+        type: string
       publish:
-        description: "Make the release(s) and, for a stable launcher, update GitHub Pages"
+        description: "Make the release(s) and, for a stable launcher, update GitHub Pages (off: only build, the bundles kept as artifacts)"
         required: true
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
@@ -180,17 +185,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          NOTES: ${{ inputs.notes }}
         run: |
+          # The typed notes, each \n made a new line.
+          printf '%s\n' "$NOTES" | sed 's/\\n/\n/g' > notes.md
           pre=()
           if [ "${{ inputs.channel }}" = dev ]; then pre=(--prerelease); fi
           if [ "$LAUNCHER" = true ]; then
             gh release create "$TAG" --repo "$REPO" --target "${{ github.sha }}" \
-              --title "VI-BR-PORT launcher ${PREFIX}$VERSION" --generate-notes "${pre[@]}" \
+              --title "VI-BR-PORT launcher ${PREFIX}$VERSION" --notes-file notes.md --generate-notes "${pre[@]}" \
               out/launcher/*.zip out/launcher/latest.json out/launcher/SHA256SUMS
           fi
           if [ "$ENGINE" = true ]; then
             gh release create "$ENGINE_TAG" --repo "$REPO" --target "${{ github.sha }}" --latest=false \
-              --title "VIctory engine ${PREFIX}$VERSION" --generate-notes "${pre[@]}" \
+              --title "VIctory engine ${PREFIX}$VERSION" --notes-file notes.md --generate-notes "${pre[@]}" \
               out/engine/*.zip out/engine/SHA256SUMS
           fi
 
