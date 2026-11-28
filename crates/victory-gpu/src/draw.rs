@@ -2826,6 +2826,7 @@ impl State {
                 match memory {
                     Some((at, len)) => {
                         let print = crate::texture::fingerprint(at, len);
+                        crate::watch::guard_slot(at as usize, len as usize);
                         host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                     }
                     None => host.texture_slot_done(index, write, again),
@@ -2947,6 +2948,7 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
+                    crate::watch::guard_slot(at as usize, len as usize);
                     host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),

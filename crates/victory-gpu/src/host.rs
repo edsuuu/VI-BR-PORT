@@ -10246,6 +10246,14 @@ impl Meter {
                     same + changed
                 );
             }
+            if crate::watch::slot_guard() {
+                let [guarded, faults, told] = [0, 1, 2].map(|i| crate::watch::SLOT_GUARDS[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "the title's writes into textures picked by index (VICTORY_SLOT_GUARD=1), since the start: {guarded} \
+                     blocks guarded, {faults} write faults in them, {told} blocks told to the texture pass; where from: {}",
+                    crate::watch::slot_sites(8)
+                );
+            }
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                 let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));

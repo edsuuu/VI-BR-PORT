@@ -3130,6 +3130,9 @@ pub enum Writer {
     StreamAddress,
     /// DirectStorage, into physical pages (told where they are shown).
     StreamPages,
+    /// The title's processor: a write fault in a block guarded for a texture
+    /// picked by index ([`guard_slot`]).
+    Title,
 }
 
 impl Writer {
@@ -3140,6 +3143,7 @@ impl Writer {
             Writer::File => "a file read",
             Writer::StreamAddress => "DirectStorage to an address",
             Writer::StreamPages => "DirectStorage into physical pages",
+            Writer::Title => "the title's processor",
         }
     }
 }
@@ -3229,6 +3233,153 @@ pub(crate) fn who_wrote(pieces: &[u64], since: u64) -> (usize, usize, Option<Wri
 /// [`Writer`]'s words, for a line.
 pub(crate) fn writer_name(writer: Option<Writer>) -> &'static str {
     writer.map_or("none", Writer::name)
+}
+
+/// Whether the memory of a texture picked by index is made read-only at
+/// every address of its pages once it is uploaded whole, so that a write of
+/// the title's processor there faults and the texture is made due at once
+/// (`VICTORY_SLOT_GUARD=1`; off by default: such a write is seen only by a
+/// look again, if one falls on it).
+///
+/// Nothing told the texture pass of those writes: the guards are for host
+/// copies of buffers, and a texture picked by index is uploaded by the pass,
+/// not refreshed through them. The blocks are guarded as another view of a
+/// guarded page is ([`protect_alias`]): read-only, not noted clean, so a
+/// copy of a buffer over them takes them as written, as before. The fault
+/// opens them as any ([`open_faulted`]) and tells the pass of the block at
+/// every address of its page ([`slot_written`]); the next upload guards them
+/// again. Where the fault came from is counted by place in the code
+/// ([`slot_sites`]).
+pub(crate) fn slot_guard() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_GUARD").is_some_and(|v| v == "1"))
+}
+
+/// Blocks guarded for a texture picked by index ([`guard_slot`]), at every
+/// address of their pages.
+static SLOT_GUARDED: Bits = Bits::new();
+
+/// Since the start: blocks guarded for textures picked by index, write
+/// faults in them, and blocks told to the texture pass because of those.
+pub(crate) static SLOT_GUARDS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// The places in the code that wrote into blocks guarded for textures
+/// picked by index: the faulting instruction's address, and how often.
+static SLOT_SITES: Mutex<Option<std::collections::HashMap<usize, u64>>> = Mutex::new(None);
+
+/// [`slot_guard`]: the texture picked by index at `[at, at + len)` was
+/// uploaded whole; its blocks are made read-only at every address of their
+/// pages. View memory only (the pool's pages); others are left as they are.
+pub(crate) fn guard_slot(at: usize, len: usize) {
+    if slot_guard() {
+        guard_slot_now(at, len);
+    }
+}
+
+/// [`guard_slot`], switch or not.
+fn guard_slot_now(at: usize, len: usize) {
+    if len == 0 || !is_view(at, at.saturating_add(len)) {
+        return;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    // Every address of each page: the title may write through the pool's.
+    let mut blocks: Vec<usize> = Vec::with_capacity(2 * (last - first));
+    for block in first..last {
+        let views = crate::inplace::pages_of(block * BLOCK);
+        if views.is_empty() {
+            blocks.push(block);
+        }
+        blocks.extend(views.into_iter().map(|page| page / BLOCK));
+    }
+    blocks.sort_unstable();
+    blocks.dedup();
+    // (One whose guard something else opened since is guarded again.)
+    blocks.retain(|&block| !(SLOT_GUARDED.any(block, block + 1) && PROTECTED.any(block, block + 1)));
+    if blocks.is_empty() {
+        return;
+    }
+    let g = guards();
+    let mut guarded = 0;
+    for block in blocks {
+        // Ahead of the protection: a fault in between finds it.
+        SLOT_GUARDED.set(block);
+        if protect_alias(&g, block, None) {
+            guarded += 1;
+        } else {
+            SLOT_GUARDED.clear(block);
+        }
+    }
+    SLOT_GUARDS[0].fetch_add(guarded, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A write fault at `at` (by the instruction at `site`) in a block guarded
+/// for a texture picked by index: the block, at every address of its page,
+/// is no longer guarded for it, and the textures there are due again. Once
+/// per block and guarding, whichever thread comes first.
+fn slot_written(at: usize, site: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let block = at / BLOCK;
+    if !SLOT_GUARDED.take(block) {
+        return;
+    }
+    SLOT_GUARDS[1].fetch_add(1, Relaxed);
+    let mut views = crate::inplace::pages_of(block * BLOCK);
+    if views.is_empty() {
+        views.push(block * BLOCK);
+    }
+    for &page in &views {
+        SLOT_GUARDED.clear(page / BLOCK);
+        crate::descriptor::host::remapped(page, BLOCK);
+        note_writer(page, BLOCK, Writer::Title);
+    }
+    SLOT_GUARDS[2].fetch_add(views.len() as u64, Relaxed);
+    let mut sites = SLOT_SITES.lock().unwrap_or_else(|e| e.into_inner());
+    *sites.get_or_insert_with(std::collections::HashMap::new).entry(site).or_default() += 1;
+}
+
+/// Whether `at` lies in a block guarded for a texture picked by index.
+fn slot_guarded(at: usize) -> bool {
+    let block = at / BLOCK;
+    SLOT_GUARDED.any(block, block + 1)
+}
+
+/// The places in the code that wrote most into blocks guarded for textures
+/// picked by index, as `module+offset (count)`, the most first.
+pub(crate) fn slot_sites(most: usize) -> String {
+    let sites: Vec<(usize, u64)> = {
+        let sites = SLOT_SITES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut all: Vec<(usize, u64)> = sites.iter().flatten().map(|(&at, &n)| (at, n)).collect();
+        all.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        all.truncate(most);
+        all
+    };
+    sites.iter().map(|&(at, n)| format!("{} ({n})", code_place(at))).collect::<Vec<_>>().join(", ")
+}
+
+/// `module+offset` of a code address, or the address alone.
+fn code_place(at: usize) -> String {
+    use windows_sys::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleFileNameW,
+        GetModuleHandleExW,
+    };
+    let mut module = std::ptr::null_mut();
+    // SAFETY: a lookup by address; the handle is not kept counted.
+    let found = unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            at as *const u16,
+            &mut module,
+        )
+    } != 0;
+    if !found {
+        return format!("{at:#x}");
+    }
+    let mut name = [0u16; 260];
+    // SAFETY: a buffer of that many characters.
+    let n = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+    let path = String::from_utf16_lossy(&name[..n]);
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_owned();
+    format!("{file}+{:#x}", at - module as usize)
 }
 
 /// Whether a write of title memory through one address ([`writing`]) is
@@ -3861,7 +4012,15 @@ pub(crate) fn install() {
         }
         let at = r.ExceptionInformation[1];
         let block = at / BLOCK;
+        // The title's processor writing a texture picked by index
+        // (`VICTORY_SLOT_GUARD=1`): the pass is told, and the block opened as
+        // any (not written beside the guard, which would keep it guarded).
+        let slot = ours.is_none() && slot_guarded(at);
+        if slot {
+            slot_written(at, r.ExceptionAddress as usize);
+        }
         if ours.is_none()
+            && !slot
             && PROTECTED.any(block, block + 1)
             // SAFETY: the context the system passes, to go on from.
             && crate::titlewrite::store(unsafe { &mut *context }, at)
@@ -4415,6 +4574,60 @@ mod tests {
         title_memory_unmapping(at, 2 * BLOCK);
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(view) };
+    }
+
+    /// A texture picked by index guarded at its address: the title's write
+    /// through the other address of the same page (the pool's) faults, is
+    /// counted with the place it came from, goes through, and leaves the
+    /// block at both addresses unguarded for the texture, so the next upload
+    /// guards it again.
+    #[test]
+    fn a_write_through_the_pool_into_a_guarded_texture_is_caught() {
+        use std::sync::atomic::Ordering::Relaxed;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
+        install();
+        // SAFETY: a pagefile section of one block, mapped twice read-write
+        // (the pool's view and the tiled heap's); the views hold it.
+        let (section, pool, heap) = unsafe {
+            let section =
+                CreateFileMappingW(INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null());
+            assert!(!section.is_null());
+            let pool = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK);
+            let heap = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK);
+            (section, pool, heap)
+        };
+        let (p, h) = (pool.Value as usize, heap.Value as usize);
+        assert!(p != 0 && h != 0);
+        crate::inplace::title_memory_view(p, BLOCK, section as usize, 0);
+        crate::inplace::title_memory_view(h, BLOCK, section as usize, 0);
+        let faults = SLOT_GUARDS[1].load(Relaxed);
+        guard_slot_now(h + 0x1000, 0x8000);
+        assert!(slot_guarded(h) && slot_guarded(p));
+        assert!(!writable(h) && !writable(p));
+        // SAFETY: inside the view; the guard's fault lets it through.
+        unsafe { ((p + 0x2000) as *mut u32).write_volatile(0x5eed) };
+        // SAFETY: the other view of the same page.
+        assert_eq!(unsafe { ((h + 0x2000) as *const u32).read_volatile() }, 0x5eed);
+        assert!(SLOT_GUARDS[1].load(Relaxed) > faults);
+        assert!(!slot_guarded(h) && !slot_guarded(p));
+        assert!(!slot_sites(8).is_empty());
+        // Guarded again, as by the next upload.
+        guard_slot_now(h, BLOCK);
+        assert!(slot_guarded(h) && !writable(h));
+        // SAFETY: as above.
+        unsafe { ((h + 8) as *mut u8).write_volatile(1) };
+        assert!(!slot_guarded(h) && writable(h));
+        for at in [p, h] {
+            title_memory_unmapping(at, BLOCK);
+            crate::inplace::views_gone(at, BLOCK);
+        }
+        // SAFETY: our views and handle.
+        unsafe {
+            UnmapViewOfFile(pool);
+            UnmapViewOfFile(heap);
+            CloseHandle(section);
+        }
     }
 
     #[test]
