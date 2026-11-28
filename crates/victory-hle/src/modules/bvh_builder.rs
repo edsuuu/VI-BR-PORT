@@ -8,12 +8,20 @@
 //! which is what lets the host's ray tracing take the builder's place one
 //! day (`docs` of the ray-tracing work: the builder taken over).
 //!
-//! This first step only listens. With `VICTORY_DXR_TRACE=1` (or `all`;
-//! unset: off, the default, and the imports are bound as before) the
-//! title's imports are bound to the functions here ([`Interpose`]), which
-//! log what each call asks, call the title's own function, and count it for
-//! the five-second report (`victory_gpu::rtcalls`). Nothing the title or
-//! its builder sees changes.
+//! With `VICTORY_DXR_TRACE=1` (or `all`) or `VICTORY_DXR_NATIVE=shadow` (or
+//! `1`) the title's imports are bound to the functions here ([`Interpose`]);
+//! with neither (the default) they are bound as before. The functions call
+//! the title's own and, around that:
+//!
+//! - with the trace, the listening post: they log what each call asks and
+//!   count it for the five-second report (`victory_gpu::rtcalls`);
+//! - with the host's own structures (`victory_gpu::dxr`), they hand the
+//!   builds, unpackings and copies they decode to the host's side once the
+//!   title's builder has recorded its own, at the same place of the same
+//!   list ([`host_build`]). `1` stops nothing yet: the title's builder runs
+//!   in both modes, until no ray program walks its structures.
+//!
+//! Nothing the title or its builder sees changes.
 //!
 //! The descriptions are decoded in [`desc`], the console's own layouts as
 //! the builder's decompiled code reads them; the first calls are dumped in
@@ -35,6 +43,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::time::{Duration, Instant};
 
+use victory_gpu::dxr;
 use victory_gpu::rtcalls::{self, Count, Trace};
 use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
@@ -92,16 +101,29 @@ type Rehydrate =
 type Morton = unsafe extern "system" fn(*mut c_void, u8);
 
 /// Binds the title's imports of [`BUILDER_DLL`] to the functions here when
-/// `VICTORY_DXR_TRACE` is on, keeping what `inner` binds them to (the
-/// title's own DLL) for them to call; otherwise binds as `inner` does.
+/// `VICTORY_DXR_TRACE` or `VICTORY_DXR_NATIVE` is on ([`interposed`]),
+/// keeping what `inner` binds them to (the title's own DLL) for them to
+/// call; otherwise binds as `inner` does.
 pub struct Interpose<'a> {
     pub inner: &'a dyn ImportResolver,
+}
+
+/// Whether the title's imports go through ours: for the listening post
+/// (`VICTORY_DXR_TRACE`) or for the host's own structures
+/// (`VICTORY_DXR_NATIVE`). Neither by default.
+fn interposed() -> bool {
+    traced() || dxr::native_on()
+}
+
+/// Whether the listening post logs and counts (`VICTORY_DXR_TRACE`).
+fn traced() -> bool {
+    rtcalls::trace() != Trace::Off
 }
 
 impl ImportResolver for Interpose<'_> {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
         let found = self.inner.resolve(dll, symbol);
-        if !dll.eq_ignore_ascii_case(BUILDER_DLL) || rtcalls::trace() == Trace::Off {
+        if !dll.eq_ignore_ascii_case(BUILDER_DLL) || !interposed() {
             return found;
         }
         // Only what the title's DLL itself provides is wrapped: a stub for a
@@ -144,7 +166,9 @@ fn interpose(name: &str, original: usize) -> Option<usize> {
     tracing::info!(
         kind = KINDS[i],
         original = format_args!("{original:#x}"),
-        "dxr trace: the title's call of its structure builder goes through ours (VICTORY_DXR_TRACE)"
+        trace = traced(),
+        native = dxr::native_on(),
+        "dxr trace: the title's call of its structure builder goes through ours (VICTORY_DXR_TRACE, VICTORY_DXR_NATIVE)"
     );
     Some(ours)
 }
@@ -459,9 +483,27 @@ fn say_seen() {
     tracing::info!("{text}");
 }
 
+/// Reads one build's geometries (as the host's side is handed them too)
+/// and, with the trace, counts the build and says it ([`say_build`]).
+fn note_build(call: u64, entry: u32, of: u32, d: &BuildDesc, tail: &str) -> (Vec<Geometry>, bool) {
+    let (geometries, whole) = desc::geometries(&Process, &d.inputs);
+    if traced() {
+        say_build(call, entry, of, d, tail, &geometries, whole);
+    }
+    (geometries, whole)
+}
+
 /// Counts one build and, when it is to be logged, says it: the level and
 /// flags, its geometries or instances, where it goes, and its scratch.
-fn note_build(call: u64, entry: u32, of: u32, d: &BuildDesc, tail: &str) {
+fn say_build(
+    call: u64,
+    entry: u32,
+    of: u32,
+    d: &BuildDesc,
+    tail: &str,
+    geometries: &[Geometry],
+    whole: bool,
+) {
     let i = &d.inputs;
     let top = i.top();
     rtcalls::add(
@@ -481,7 +523,6 @@ fn note_build(call: u64, entry: u32, of: u32, d: &BuildDesc, tail: &str) {
         Trace::Off => false,
     };
     let mut text = String::new();
-    let (geometries, whole) = desc::geometries(&Process, i);
     if top {
         rtcalls::add(Count::Instances, u64::from(i.count));
     } else {
@@ -491,7 +532,7 @@ fn note_build(call: u64, entry: u32, of: u32, d: &BuildDesc, tail: &str) {
             geometries.iter().map(|g| g.triangles()).sum(),
         );
         rtcalls::add(Count::Aabbs, geometries.iter().map(|g| g.aabbs()).sum());
-        seen(|s| Seen::kinds(&mut s.built, &geometries));
+        seen(|s| Seen::kinds(&mut s.built, geometries));
     }
     if !say {
         return;
@@ -631,7 +672,8 @@ unsafe extern "system" fn build_batched(
     let call = number(BUILD);
     rtcalls::add(Count::Batches, 1);
     let n = count.min(ENTRIES);
-    if call < DUMPED {
+    let traced = traced();
+    if traced && call < DUMPED {
         tracing::info!(
             "dxr trace: batched build call {call}, {count} entries, list {list:p}; {}",
             dump(
@@ -641,9 +683,18 @@ unsafe extern "system" fn build_batched(
             )
         );
     }
+    let native = dxr::native_on();
+    let mut host = Vec::new();
     if let Some(bytes) = Process.bytes(descs as u64, n as usize * BATCHED) {
         for (k, one) in bytes.chunks_exact(BATCHED).enumerate() {
             let e = Batched::parse(one);
+            if !traced {
+                if native {
+                    let (g, whole) = desc::geometries(&Process, &e.build.inputs);
+                    host.push(host_build(&e.build, e.build.source, &g, whole));
+                }
+                continue;
+            }
             let mut tail = String::new();
             let _ = write!(
                 tail,
@@ -673,7 +724,10 @@ unsafe extern "system" fn build_batched(
                     desc::describe_extensions(&e.extensions, records.as_deref(), &e.build.inputs)
                 );
             }
-            note_build(call, k as u32, count, &e.build, &tail);
+            let (g, whole) = note_build(call, k as u32, count, &e.build, &tail);
+            if native {
+                host.push(host_build(&e.build, e.build.source, &g, whole));
+            }
         }
     } else {
         tracing::warn!(
@@ -684,7 +738,13 @@ unsafe extern "system" fn build_batched(
     // SAFETY: as above.
     unsafe { std::mem::transmute::<*const (), Build>(original(BUILD))(this, list, count, descs) };
     took(since);
-    say_seen();
+    // The host's builds of the same come after the console's in the list.
+    if native {
+        dxr::record(list, dxr::Origin::Batched, host);
+    }
+    if traced {
+        say_seen();
+    }
 }
 
 unsafe extern "system" fn copy_structure(
@@ -703,8 +763,13 @@ unsafe extern "system" fn copy_structure(
         },
         1,
     );
-    let logged = LOGGED.fetch_add(1, Relaxed);
-    if rtcalls::trace() == Trace::All || logged < BUDGET {
+    let traced = traced();
+    let logged = if traced {
+        LOGGED.fetch_add(1, Relaxed)
+    } else {
+        0
+    };
+    if traced && (rtcalls::trace() == Trace::All || logged < BUDGET) {
         let what = match mode {
             0 => "clone",
             1 => "compact",
@@ -721,7 +786,13 @@ unsafe extern "system" fn copy_structure(
         std::mem::transmute::<*const (), Copy>(original(COPY))(this, list, dest, source, mode)
     };
     took(since);
-    say_seen();
+    // The host copies its own structure the same way, after the console's.
+    if dxr::native_on() {
+        dxr::copy(list, dest, source, mode);
+    }
+    if traced {
+        say_seen();
+    }
 }
 
 unsafe extern "system" fn prebuild_info(
@@ -738,6 +809,10 @@ unsafe extern "system" fn prebuild_info(
         std::mem::transmute::<*const (), Prebuild>(original(PREBUILD))(this, inputs, stream, info)
     };
     took(since);
+    // The host sizes its own structures itself: only the trace reads these.
+    if !traced() {
+        return;
+    }
     let Some(b) = Process.bytes(inputs as u64, INPUTS) else {
         return;
     };
@@ -821,12 +896,18 @@ unsafe extern "system" fn rehydrate_batched(
     let call = number(REHYDRATE);
     rtcalls::add(Count::Rehydrated, u64::from(count));
     let n = count.min(ENTRIES) as usize;
-    let logged = LOGGED.fetch_add(1, Relaxed);
-    let say = rtcalls::trace() == Trace::All || logged < BUDGET;
+    let traced = traced();
+    let native = dxr::native_on();
+    let logged = if traced {
+        LOGGED.fetch_add(1, Relaxed)
+    } else {
+        0
+    };
+    let say = traced && (rtcalls::trace() == Trace::All || logged < BUDGET);
     let mut text = format!(
         "dxr trace: rehydrate call {call}, {count} structures, list {list:p}, the addresses of their shipped data at {shipped:p}"
     );
-    if call < DUMPED {
+    if say && call < DUMPED {
         let _ = write!(
             text,
             "; {}; {}",
@@ -841,12 +922,20 @@ unsafe extern "system" fn rehydrate_batched(
     // `p[i]` is the address of structure i's shipped data, which the
     // builder reads on the CPU; with `p` null it reads the description's
     // source instead (0x180014700).
-    let addresses = (!shipped.is_null())
+    let addresses = (traced && !shipped.is_null())
         .then(|| Process.bytes(shipped as u64, n * 8))
         .flatten();
+    let mut host = Vec::new();
     if let Some(b) = Process.bytes(descs as u64, n * BUILD_DESC) {
         for (k, one) in b.chunks_exact(BUILD_DESC).enumerate() {
             let d = BuildDesc::parse(one);
+            if !traced {
+                if native {
+                    let (g, whole) = desc::geometries(&Process, &d.inputs);
+                    host.push(host_build(&d, 0, &g, whole));
+                }
+                continue;
+            }
             rtcalls::named(d.inputs.top(), d.dest);
             let at = if shipped.is_null() {
                 Some(d.source)
@@ -862,38 +951,11 @@ unsafe extern "system" fn rehydrate_batched(
             // of (what a host build of it would need), and how much.
             let (g, whole) = desc::geometries(&Process, &d.inputs);
             seen(|s| s.shipped(data.as_ref(), &g));
-            if !(say && k < LISTED) {
-                continue;
+            if say && k < LISTED {
+                describe_unpacking(&mut text, k, &d, at, data.as_ref(), &g, whole);
             }
-            let _ = write!(
-                text,
-                "\n  {k}: {} level {} count {} dest {:#x} source {:#x} scratch {:#x}",
-                d.inputs.level(),
-                desc::build_flags(d.inputs.flags),
-                d.inputs.count,
-                d.dest,
-                d.source,
-                d.scratch,
-            );
-            match (at, data) {
-                (None, _) => text.push_str("; the shipped data's address is not readable"),
-                (Some(a), None) => {
-                    let _ = write!(text, "; the shipped data at {a:#x} is not readable");
-                }
-                (Some(a), Some(data)) => {
-                    let _ = write!(text, "; the shipped data at {a:#x}: {}", data.describe());
-                }
-            }
-            let triangles: u64 = g.iter().map(|g| g.triangles()).sum();
-            let _ = write!(
-                text,
-                "; {} geometries read{}, {triangles} triangles, flags: {}",
-                g.len(),
-                if whole { "" } else { " (not all)" },
-                desc::flags_tally(&g)
-            );
-            if let Some(first) = g.first() {
-                let _ = write!(text, "; the first: {}", first.describe());
+            if native {
+                host.push(host_build(&d, 0, &g, whole));
             }
         }
     }
@@ -905,12 +967,126 @@ unsafe extern "system" fn rehydrate_batched(
         )
     };
     took(since);
+    // The host builds what the title's builder unpacked, from the geometries
+    // the descriptions name, after it in the list; nothing if the builder
+    // refused the call (an `HRESULT` below 0: it recorded nothing).
+    if native && code >= 0 {
+        dxr::record(list, dxr::Origin::Rehydrated, host);
+    }
     if say {
         let _ = write!(text, "\n  -> {code:#x}");
         tracing::info!("{text}");
     }
-    say_seen();
+    if traced {
+        say_seen();
+    }
     code
+}
+
+/// Structure `k` of an unpacking in its line: its description, its shipped
+/// data at `at`, and the geometries the description names.
+fn describe_unpacking(
+    text: &mut String,
+    k: usize,
+    d: &BuildDesc,
+    at: Option<u64>,
+    data: Option<&Dehydrated>,
+    g: &[Geometry],
+    whole: bool,
+) {
+    let _ = write!(
+        text,
+        "\n  {k}: {} level {} count {} dest {:#x} source {:#x} scratch {:#x}",
+        d.inputs.level(),
+        desc::build_flags(d.inputs.flags),
+        d.inputs.count,
+        d.dest,
+        d.source,
+        d.scratch,
+    );
+    match (at, data) {
+        (None, _) => text.push_str("; the shipped data's address is not readable"),
+        (Some(a), None) => {
+            let _ = write!(text, "; the shipped data at {a:#x} is not readable");
+        }
+        (Some(a), Some(data)) => {
+            let _ = write!(text, "; the shipped data at {a:#x}: {}", data.describe());
+        }
+    }
+    let triangles: u64 = g.iter().map(|g| g.triangles()).sum();
+    let _ = write!(
+        text,
+        "; {} geometries read{}, {triangles} triangles, flags: {}",
+        g.len(),
+        if whole { "" } else { " (not all)" },
+        desc::flags_tally(g)
+    );
+    if let Some(first) = g.first() {
+        let _ = write!(text, "; the first: {}", first.describe());
+    }
+}
+
+/// A build as the host's side takes it (`victory_gpu::dxr::record`): the
+/// description decoded, with the geometries read from it. `source` is the
+/// structure an update starts from; an unpacking has none (its source is
+/// the shipped data, which the host does not read).
+fn host_build(d: &BuildDesc, source: u64, geometries: &[Geometry], whole: bool) -> dxr::Build {
+    let i = &d.inputs;
+    dxr::Build {
+        dest: d.dest,
+        source,
+        flags: i.flags,
+        level: if i.top() {
+            dxr::Level::Top {
+                instances: i.descs,
+                count: i.count,
+                layout: i.layout,
+            }
+        } else {
+            dxr::Level::Bottom {
+                geometries: geometries.iter().map(host_geometry).collect(),
+                whole,
+            }
+        },
+    }
+}
+
+fn host_geometry(g: &Geometry) -> dxr::Geometry {
+    match *g {
+        Geometry::Triangles {
+            flags,
+            transform,
+            index_format,
+            vertex_format,
+            index_count,
+            vertex_count,
+            index_buffer,
+            vertex_buffer,
+            vertex_stride,
+        } => dxr::Geometry::Triangles(dxr::Triangles {
+            flags,
+            transform,
+            index_format,
+            vertex_format,
+            index_count,
+            vertex_count,
+            index_buffer,
+            vertex_buffer,
+            vertex_stride,
+        }),
+        Geometry::Aabbs {
+            flags,
+            count,
+            start,
+            stride,
+        } => dxr::Geometry::Boxes {
+            flags,
+            count,
+            start,
+            stride,
+        },
+        Geometry::Other { kind, flags } => dxr::Geometry::Other { kind, flags },
+    }
 }
 
 #[cfg(test)]
@@ -934,8 +1110,8 @@ mod tests {
 
     #[test]
     fn without_the_switch_the_imports_are_bound_as_before() {
-        // The tests run without VICTORY_DXR_TRACE.
-        if rtcalls::trace() != Trace::Off {
+        // The tests run without VICTORY_DXR_TRACE and VICTORY_DXR_NATIVE.
+        if interposed() {
             return;
         }
         let symbol = ImportSymbol::Name {
@@ -950,6 +1126,96 @@ mod tests {
                 provenance: Provenance::Title
             }
         );
+    }
+
+    #[test]
+    fn the_host_is_handed_the_build_as_decoded() {
+        let d = BuildDesc {
+            dest: 0x1_0000,
+            inputs: Inputs {
+                kind: desc::BOTTOM_LEVEL,
+                flags: desc::ALLOW_UPDATE | desc::PERFORM_UPDATE,
+                count: 2,
+                layout: desc::ARRAY,
+                descs: 0x5000,
+            },
+            source: 0x1_0000,
+            scratch: 0x9000,
+        };
+        let triangles = Geometry::Triangles {
+            flags: 1,
+            transform: 0x6000,
+            index_format: 57,
+            vertex_format: 6,
+            index_count: 300,
+            vertex_count: 120,
+            index_buffer: 0xb000,
+            vertex_buffer: 0xa000,
+            vertex_stride: 12,
+        };
+        let boxes = Geometry::Aabbs {
+            flags: 2,
+            count: 7,
+            start: 0xd000,
+            stride: 32,
+        };
+        let b = host_build(&d, d.source, &[triangles, boxes], false);
+        assert_eq!(
+            b,
+            dxr::Build {
+                dest: 0x1_0000,
+                source: 0x1_0000,
+                flags: desc::ALLOW_UPDATE | desc::PERFORM_UPDATE,
+                level: dxr::Level::Bottom {
+                    geometries: vec![
+                        dxr::Geometry::Triangles(dxr::Triangles {
+                            flags: 1,
+                            transform: 0x6000,
+                            index_format: 57,
+                            vertex_format: 6,
+                            index_count: 300,
+                            vertex_count: 120,
+                            index_buffer: 0xb000,
+                            vertex_buffer: 0xa000,
+                            vertex_stride: 12,
+                        }),
+                        dxr::Geometry::Boxes {
+                            flags: 2,
+                            count: 7,
+                            start: 0xd000,
+                            stride: 32,
+                        },
+                    ],
+                    whole: false,
+                },
+            }
+        );
+        assert_eq!(
+            host_geometry(&Geometry::Other { kind: 5, flags: 1 }),
+            dxr::Geometry::Other { kind: 5, flags: 1 }
+        );
+        // A top level names its instances; an unpacking is handed no source.
+        let top = BuildDesc {
+            inputs: Inputs {
+                kind: desc::TOP_LEVEL,
+                count: 7,
+                layout: desc::ARRAY_OF_POINTERS,
+                descs: 0x7000,
+                ..Inputs::default()
+            },
+            source: 0x2_0000,
+            ..d
+        };
+        let t = host_build(&top, 0, &[], true);
+        assert_eq!(
+            t.level,
+            dxr::Level::Top {
+                instances: 0x7000,
+                count: 7,
+                layout: desc::ARRAY_OF_POINTERS
+            }
+        );
+        assert_eq!(t.source, 0);
     }
 
     #[test]

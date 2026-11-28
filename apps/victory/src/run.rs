@@ -150,7 +150,8 @@ pub fn run(
         dlls: &dlls,
     };
     // With VICTORY_DXR_TRACE the structure builder's calls are logged on the
-    // way to the title's own (off: bound as above).
+    // way to the title's own, and with VICTORY_DXR_NATIVE handed to the
+    // host's own structures after it (both off: bound as above).
     let with_dlls = victory_hle::modules::bvh_builder::Interpose { inner: &with_dlls };
     let show =|name: &str, report: BindReport| {
         println!(
