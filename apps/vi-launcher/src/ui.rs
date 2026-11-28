@@ -258,7 +258,8 @@ impl App {
         }
         self.prep = Some(Prep { steps, events: rx, running, cancelled, message: None, finished: false, game_open: false });
         self.logs.follow = true;
-        self.go(View::Prep);
+        // The preparing shows on the main screen, above Play (play_view).
+        self.go(View::Play);
     }
 
     fn poll(&mut self) {
@@ -464,14 +465,8 @@ impl App {
             });
         });
 
-        // Above the scene: any notice, on dark panels. (The game's folder is
-        // chosen in the settings.)
-        ui.scope_builder(UiBuilder::new().max_rect(scene).layout(Layout::top_down(egui::Align::Min)), |ui| {
-            self.notice_card(ui);
-            self.update_card(ui, ctx);
-        });
-
-        // At the foot of the scene, over the sea: Play and its status.
+        // At the top of the scene: any notice, then the preparing panel (the
+        // steps, their per cent and the log) or, before a run, what Play will do.
         let plan = self.make_plan();
         let needs = |p: &Plan, id: StepId| p.steps.iter().any(|s| s.needed && s.id == id);
         let (status, dot) = match &plan {
@@ -491,24 +486,36 @@ impl App {
             )),
             _ => None,
         };
-        ui.scope_builder(UiBuilder::new().max_rect(scene).layout(Layout::bottom_up(egui::Align::Min)), |ui| {
-            ui.spacing_mut().item_spacing.y = 14.0;
-            if !status.is_empty() {
-                let status_row = ui.horizontal(|ui| {
-                    ui.set_max_width(num("layout", "statusWidth"));
-                    theme::dot(ui, dot);
-                    ui.label(theme::small(&status, "textSoft"));
+        let top = Rect::from_min_max(scene.min, pos2(scene.min.x + num("layout", "cardWidth").min(scene.width()), scene.max.y - num("size", "playHeight") - 40.0));
+        ui.scope_builder(UiBuilder::new().max_rect(top).layout(Layout::top_down(egui::Align::Min)), |ui| {
+            ui.spacing_mut().item_spacing.y = 12.0;
+            self.notice_card(ui);
+            self.update_card(ui, ctx);
+            if self.prep.is_some() {
+                self.prep_panel(ui);
+            } else if !status.is_empty() {
+                theme::panel().inner_margin(14.0).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let row = ui.horizontal(|ui| {
+                        theme::dot(ui, dot);
+                        ui.add(egui::Label::new(theme::small(&status, "textSoft")).wrap());
+                    });
+                    if let Some(m) = missing {
+                        row.response.on_hover_text(m);
+                    }
                 });
-                if let Some(m) = missing {
-                    status_row.response.on_hover_text(m);
-                }
             }
+        });
+
+        // At the foot of the scene, over the sea: Play alone.
+        ui.scope_builder(UiBuilder::new().max_rect(scene).layout(Layout::bottom_up(egui::Align::Min)), |ui| {
             let size = vec2(num("size", "playWidth"), num("size", "playHeight"));
             let font = FontId::new(theme::type_size("play"), FontFamily::Name("display".into()));
             // Without a game folder the same button chooses it, then it is Play.
             let no_game = matches!(plan, Err(PlanProblem::NoGame));
             let text = if no_game { self.t("play.choose_game") } else { self.t("play.button") }.to_uppercase();
-            if theme::gradient_button(ui, &text, size, font, true, true, plan.is_ok() || no_game).clicked() {
+            let busy = self.prep.as_ref().is_some_and(|p| !p.finished);
+            if theme::gradient_button(ui, &text, size, font, true, true, !busy && (plan.is_ok() || no_game)).clicked() {
                 if no_game {
                     if let Some(dir) = rfd::FileDialog::new().set_title(self.t("game.choose")).pick_folder() {
                         self.pick_game(dir);
@@ -758,21 +765,24 @@ impl App {
 
     // ---- Preparing --------------------------------------------------------
 
-    fn prep_view(&mut self, ui: &mut egui::Ui, full: Rect) {
+    fn prep_view(&mut self, _ui: &mut egui::Ui, _full: Rect) {
+        // Kept for the view list: the preparing now shows on the main screen.
+        self.go(View::Play);
+    }
+
+    /// The preparing, as a panel at the top of the main screen: the steps with
+    /// their per cent, the bar, the running step's log (open, can be folded),
+    /// and Cancel / Close.
+    fn prep_panel(&mut self, ui: &mut egui::Ui) {
         let lang = self.language;
-        let Some(prep) = &self.prep else {
-            self.go(View::Play);
-            return;
-        };
-        let w = num("layout", "cardWidth");
-        let card = Rect::from_center_size(full.center(), vec2(w, full.height() - 2.0 * num("layout", "viewPadding")));
+        let Some(prep) = &self.prep else { return };
         let mut back = false;
         let mut cancel = false;
         let mut logs = false;
-        ui.scope_builder(UiBuilder::new().max_rect(card).layout(Layout::top_down(egui::Align::Min)), |ui| {
-            ui.with_layout(Layout::centered_and_justified(egui::Direction::TopDown), |ui| {
-                theme::card().inner_margin(num("layout", "cardPadding")).show(ui, |ui| {
-                    ui.set_width(w - 2.0 * num("layout", "cardPadding"));
+        {
+            {
+                theme::panel().inner_margin(num("layout", "cardPadding")).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 20.0;
                     ui.with_layout(Layout::top_down(egui::Align::Min), |ui| {
                         ui.vertical(|ui| {
@@ -836,8 +846,8 @@ impl App {
                         }
                     });
                 });
-            });
-        });
+            }
+        }
         if cancel && let Some(prep) = &self.prep {
             prep.cancelled.store(true, Ordering::SeqCst);
             run::cancel(&prep.running);
@@ -930,7 +940,7 @@ impl App {
         }
         if close || close_button {
             self.crash_text = None;
-            let back = if self.prep.is_some() { View::Prep } else { View::Play };
+            let back = View::Play;
             self.go(back);
         }
     }
