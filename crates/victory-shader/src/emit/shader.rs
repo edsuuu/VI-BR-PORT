@@ -94,6 +94,19 @@ pub const USER_ROOT_ADDRESS: u32 = 0x104;
 /// the group's width. Asked for by the structure builder's programs
 /// ([`crate::spill::is_spilled`]).
 pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+/// `RootType::Other` code of a user-data dword the host computes for a
+/// program whose walk of the title's ray-tracing structure the translation
+/// made a host ray query of (`walk/replace.rs`, `VICTORY_RT_QUERY`): the
+/// structure is the view whose descriptor is at dword `dword` of the
+/// descriptor table of root parameter `slot`. The host binds its own
+/// structure for that view as the root SRV `t<SLOT_STRUCTURE>` in
+/// [`ROOT_CBV_SPACE`] (an empty one when it has none) and sets the dword to 1
+/// when it bound one of its own, 0 when not; the shader does not read it.
+/// (Not 0x104 or 0x105: those are [`USER_ROOT_ADDRESS`] and its high half.)
+pub const USER_STRUCTURE: u32 = 0x107;
+/// See [`USER_STRUCTURE`]: the root SRV slot of the host's structure, in
+/// [`ROOT_CBV_SPACE`], beside [`SLOT_MEMORY`] and [`SLOT_FAULTS`].
+pub const SLOT_STRUCTURE: u8 = 252;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
