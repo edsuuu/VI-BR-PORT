@@ -3200,16 +3200,50 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
+        // The reflections' resolve: which of its images is the colour is not
+        // known by place, so every colour image it writes in a table, of
+        // the formats a colour is kept in (R16G16B16A16_FLOAT,
+        // R11G11B10_FLOAT), is kept over the floor (its history too: a floor
+        // does not build up).
+        if role == Role::Sheen {
+            let mut any = false;
+            let mut seen = Vec::new();
+            for u in t.used.iter().filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table) {
+                let Some((of, image)) = entry(ResourceType::Uav, (u.slot, u.table_offset_dwords)) else {
+                    continue;
+                };
+                seen.push((u.slot, u.table_offset_dwords, of.Format.0, of.Width, of.Height));
+                if !matches!(of.Format.0, 10 | 26) || of.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                    continue;
+                }
+                any |= crate::ambient::after(list, role, &Views {
+                    image,
+                    depth: image,
+                    stencil: None,
+                    size: [of.Width as u32, of.Height],
+                    slices: 1,
+                });
+            }
+            // Once a program: which images it has, for the log.
+            static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+            let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+            if said.len() < 16 && !said.contains(&p.name) {
+                said.push(p.name.clone());
+                tracing::info!(name = %p.name, images = ?seen, any, "the reflections' sheen: the resolve's images (slot, offset, format, size)");
+            }
+            return any;
+        }
         let at = match role {
             Role::Resolve => LIGHT,
             Role::Radiance => RADIANCE,
             Role::Air => AIR,
             Role::LampShadows => LAMP_TABLE,
+            Role::Sheen => return false,
         };
         let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, crate::ambient::depth_at()),
-            Role::Radiance | Role::Air | Role::LampShadows => image,
+            Role::Radiance | Role::Air | Role::LampShadows | Role::Sheen => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");

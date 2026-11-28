@@ -47,6 +47,9 @@
 //! `VICTORY_AMBIENT_CUT=<factor>` follows a cut at once ([`cut`]).
 //! `VICTORY_AMBIENT_AIR_SOFT=1` bends the air's bound in ([`air_soft`]).
 //! `VICTORY_AMBIENT_EDGE=<pixels>` blends a room's edge ([`edge`]).
+//! `VICTORY_AMBIENT_SKY=<share>` adds the sky's colour outside rooms
+//! ([`sky`]). `VICTORY_AMBIENT_SHEEN=<share>` keeps the reflections the
+//! title resolves over a floor outdoors ([`sheen`], [`Role::Sheen`]).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -70,6 +73,11 @@ pub(crate) enum Role {
     /// that can light every lamp as if nothing stood in its way
     /// ([`lamp_shadows_off`]).
     LampShadows,
+    /// Resolves the reflections of opaque surfaces over time
+    /// (`sr_denoising:CS_TemporalResolveOpaque*`, `_TemporalResolve1_Opaque*`,
+    /// `_TemporalResolve2_Opaque*`): the specular light the title traces
+    /// rays for ([`sheen`]).
+    Sheen,
 }
 
 /// The program's part in this, by its name in the container.
@@ -83,6 +91,8 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
         Some(Role::Air)
     } else if has(b"CS_DenoiseShadowMaskLDSPacked") {
         Some(Role::LampShadows)
+    } else if has(b"CS_TemporalResolve") && has(b"Opaque") {
+        Some(Role::Sheen)
     } else {
         None
     }
@@ -148,6 +158,7 @@ pub(crate) fn wanted(role: Role) -> bool {
     match role {
         Role::LampShadows => lamp_shadows_off().is_some(),
         Role::Resolve | Role::Radiance | Role::Air => on(),
+        Role::Sheen => on() && sheen() > 0.0,
     }
 }
 
@@ -481,6 +492,44 @@ fn parse_edge(set: &str) -> f32 {
     set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 1.0).map_or(0.0, |v| v.min(16.0))
 }
 
+/// `VICTORY_AMBIENT_SKY=<share>`, with `VICTORY_AMBIENT_OUTSIDE`: outside
+/// rooms the stand-in also gets that share of the sky's own colour, as the
+/// title drew it this frame (the cells of the kept radiance at the far
+/// plane, followed slowly; [`sky_cells`]), more on faces turned up. Without
+/// it the light outside rooms is the mean of everything on screen, a grey
+/// that leaves people and the boat flat under a blue sky. Inside rooms
+/// nothing changes. Unset or 0: off (the default). The sky is told from the
+/// depth only with `VICTORY_AMBIENT_TRUE_DEPTH=1` (the view the passes read
+/// otherwise is the stencil plane: every cell is at the far plane and the
+/// "sky" is the mean of the screen).
+fn sky() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| parse_share(&std::env::var("VICTORY_AMBIENT_SKY").unwrap_or_default()))
+}
+
+/// `VICTORY_AMBIENT_SHEEN=<share>`: after the title's resolve of its
+/// reflections (`sr_denoising:CS_TemporalResolve*Opaque*`, [`Role::Sheen`]),
+/// what they hold is never under that share of what an outdoor surface
+/// would mirror (half the sky's colour, half the light around). With rays
+/// that find nothing and the reflection tracing left out, the reflections
+/// are dark, and skin, cloth and paint lose their sheen. As much as the
+/// screen is outside rooms: none once rooms are half of it (the reflection
+/// programs see no stencil plane). Unset or 0: off (the default).
+fn sheen() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| parse_share(&std::env::var("VICTORY_AMBIENT_SHEEN").unwrap_or_default()))
+}
+
+/// A share for [`sky`] and [`sheen`]: a number from 0 to 4 (0: off).
+fn parse_share(set: &str) -> f32 {
+    set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0).map_or(0.0, |v| v.min(4.0))
+}
+
+/// Whether the sky's colour is measured (for [`sky`] or [`sheen`]).
+fn sky_cells() -> bool {
+    sky() > 0.0 || sheen() > 0.0
+}
+
 /// The bound of `VICTORY_AMBIENT_AIR_SOFT`, as the air pass works it out:
 /// `has` itself up to half of `cap`, then bent towards `cap`, which it never
 /// reaches, with no corner.
@@ -536,7 +585,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=32, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
+#define RS "RootConstants(num32BitConstants=36, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -553,6 +602,9 @@ const SOURCE: &str = r#"
 // (VICTORY_AMBIENT_CONTRAST) The gain outside rooms (x, its log in y, the
 // last frame's error of the log in z).
 #define CONTRAST (2 * CELLS + 5)
+// (VICTORY_AMBIENT_SKY, _SHEEN) The slow mean of the sky's colour: the
+// cells at the far plane (rgb; a: measured once).
+#define SKY (2 * CELLS + 6)
 #define PX 160
 #define PY 90
 cbuffer Set : register(b0) {
@@ -583,6 +635,11 @@ cbuffer Set : register(b0) {
     // (VICTORY_AMBIENT_EDGE) How far, in pixels, a room's edge is blended
     // (0: the texel's own bit).
     float edge;
+    // (VICTORY_AMBIENT_SKY) The share of the sky's colour outside rooms;
+    // (VICTORY_AMBIENT_SHEEN) the share of what an outdoor surface mirrors
+    // the reflections are kept over (0: off).
+    float sky_share; float sheen_share;
+    float spare0; float spare1;
 };
 Texture2D<float> depth : register(t0);
 // The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
@@ -658,6 +715,13 @@ float soft_bound(float has, float cap) {
     float knee = 0.5 * cap;
     if (has <= knee || cap <= 0.0) return min(has, max(cap, 0.0));
     return knee + (cap - knee) * (1.0 - exp(-(has - knee) / (cap - knee)));
+}
+
+// (VICTORY_AMBIENT_SKY, _SHEEN) The sky's colour as the title drew it, or,
+// before it has been seen, the light around.
+float3 sky_colour() {
+    float4 s = cells[SKY];
+    return s.a > 0.0 ? s.rgb : (cells[CELLS].a > 0.0 ? cells[CELLS].rgb : 0.0);
 }
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
@@ -786,6 +850,52 @@ void inside_share() {
     cells[INSIDE] = float4(max(exp(geo_log) - 1e-3, 0.0), geo_log, share, seen_one);
     // (y: the share has been measured, though no room was seen.)
     cells[INSIDE_MEAN] = float4(mean_luma, 1.0, 0.0, seen_one);
+}
+// (VICTORY_AMBIENT_SKY, _SHEEN) The sky's colour: the mean light of the
+// cells whose centre is at the far plane (`place` puts the sky at 1,000 m),
+// followed slowly (at once after a cut). Where nine in ten cells or more are
+// there the depth is not true (the stencil plane read as depth, or a wall of
+// fog) and the measure keeps what it was; with no sky on screen too (a
+// look down at the deck keeps the sky of a moment before).
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void sky_cells() {
+    float n = 0;
+    float3 sum = 0;
+    for (uint i = 0; i < CELLS; i++) {
+        if (cells[CELLS + 1 + i].z < 999.0) continue;
+        n += 1;
+        sum += cells[i].rgb;
+    }
+    float4 was = cells[SKY];
+    if (n < 1.0 || n > 0.9 * float(CELLS)) return;
+    float f = cut > 0.0 && cells[GEO].z > 0.0 ? 1.0 : follow;
+    float3 now = sum / n;
+    cells[SKY] = float4(was.a > 0.0 ? lerp(was.rgb, now, f) : now, 1.0);
+}
+#endif
+
+#ifdef SHEEN
+RWTexture2D<float4> reflected : register(u0);
+// (VICTORY_AMBIENT_SHEEN) What the reflections hold is kept over a share of
+// what an outdoor surface mirrors: half the sky above, half the light around
+// (the water, the deck, the shore). A floor, not a sum: the title's own
+// reflections (the screen's, the water's) stay where they are brighter, and
+// the program's history, which may be this very image, does not build up.
+// As much as the screen is outside rooms (by the resolve's measure, followed
+// slowly): none once rooms are half of it.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void sheen(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    float4 in_room = cells[INSIDE];
+    float room_share = cells[INSIDE_MEAN].y > 0.0 ? saturate(in_room.z) : 0.0;
+    float outside = saturate(1.0 - 2.0 * room_share);
+    if (outside <= 0.0 || cells[CELLS].a <= 0.0) return;
+    float3 mirrored = 0.5 * (sky_colour() + cells[CELLS].rgb) * sheen_share * outside;
+    float4 was = reflected[at.xy];
+    if (any(isnan(was)) || any(isinf(was))) was = 0.0;
+    reflected[at.xy] = float4(max(was.rgb, mirrored), was.a);
 }
 #endif
 
@@ -1026,6 +1136,15 @@ void raise(uint3 at : SV_DispatchThreadID) {
         float day = saturate((dot(cells[CELLS].rgb, LUMA) - day_from) / max(day_to - day_from, 1e-6));
         found = lerp(found, float3(1.0, 0.98, 0.94) * constant * open, day);
     }
+    // (VICTORY_AMBIENT_SKY) Outside rooms, the sky's own colour on top: all
+    // of the share on a face turned up, half on an upright one (people, the
+    // boat's sides), none on one turned down (up is the view's up, which on
+    // a level camera is near enough). By day too, after the title's light
+    // above. Without a true depth the normal is the view's and every face
+    // gets half.
+    if (outdoors && sky_share > 0.0) {
+        found += sky_share * sky_colour() * open * saturate(0.5 + 0.5 * n.y);
+    }
     // (At a room's edge, with edge, between the room's light and this.)
     light[p] = pack(lerp(max(was, found), room_light, outdoors ? inside : 0.0));
 }
@@ -1034,9 +1153,9 @@ void raise(uint3 at : SV_DispatchThreadID) {
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 6) * 16;
+const CELL_BYTES: u64 = (2 * CELLS + 7) * 16;
 /// The passes' root constants, in words (the `Set` buffer).
-const WORDS: usize = 32;
+const WORDS: usize = 36;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -1049,6 +1168,8 @@ struct Pass {
     air: ID3D12PipelineState,
     unshadow: ID3D12PipelineState,
     inside: ID3D12PipelineState,
+    sky: ID3D12PipelineState,
+    sheen: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
     /// Where the slow mean is copied for the log line ([`report_mean`]).
@@ -1084,6 +1205,8 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let air = pipeline("AIR", s!("clear_air"))?;
     let unshadow = pipeline("UNSHADOW", s!("unshadow"))?;
     let inside = pipeline("PLACE", s!("inside_share"))?;
+    let sky = pipeline("PLACE", s!("sky_cells"))?;
+    let sheen = pipeline("SHEEN", s!("sheen"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     let readback = {
         let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
@@ -1122,6 +1245,8 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         air,
         unshadow,
         inside,
+        sky,
+        sheen,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
     })
@@ -1253,7 +1378,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[29] = cut().to_bits();
     words[30] = if air_soft() { 1.0f32 } else { 0.0 }.to_bits();
     words[31] = edge().to_bits();
-    let measure_rooms = ((key > 0.0 && key_room()) || outdoors) && views.stencil.is_some();
+    // (The sky's share acts outside rooms only, as the estimate there.)
+    words[32] = if outdoors { sky() } else { 0.0 }.to_bits();
+    words[33] = sheen().to_bits();
+    // (The sheen's pass reads the rooms' share the resolve measured.)
+    let measure_rooms = ((key > 0.0 && key_room()) || outdoors || sheen() > 0.0) && views.stencil.is_some();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -1279,7 +1408,8 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 KEPT.store(true, Ordering::Relaxed);
                 report_mean(list, pass);
             }
-            Role::Air => run(&pass.air, views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
+            Role::Sheen => run(&pass.sheen, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
+            Role::Air => run(&pass.air,views.size[0].div_ceil(8), views.size[1].div_ceil(8), views.slices.div_ceil(2)),
             // (Recorded by `unshadow`, above.)
             Role::LampShadows => {}
             Role::Resolve => {
@@ -1288,6 +1418,11 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                 if constant == 0.0 || air() > 0.0 || outdoors {
                     run(&pass.place, 8, 9, 1);
                     run(&pass.gather, 20, 45, 1);
+                } else if sky_cells() {
+                    run(&pass.place, 8, 9, 1);
+                }
+                if sky_cells() {
+                    run(&pass.sky, 1, 1, 1);
                 }
                 if measure_rooms {
                     run(&pass.inside, 1, 1, 1);
@@ -1318,7 +1453,7 @@ fn report_mean(list: &HostList, pass: &Pass) {
         // SAFETY: the copy was recorded 5 s ago and has run; 16 bytes mapped.
         unsafe {
             if pass.readback.Map(0, None, Some(&mut data)).is_ok() {
-                let m = std::slice::from_raw_parts(data.cast::<f32>(), 20).to_vec();
+                let m = std::slice::from_raw_parts(data.cast::<f32>(), 24).to_vec();
                 pass.readback.Unmap(0, None);
                 let luma = 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
                 let [key, most] = key();
@@ -1355,6 +1490,10 @@ fn report_mean(list: &HostList, pass: &Pass) {
                     air_hold = key_air_hold(),
                     by_geo = key_geo(),
                     by_room = key_room(),
+                    // (VICTORY_AMBIENT_SKY, _SHEEN: the sky's colour, and
+                    // whether it has been measured.)
+                    sky = ?[m[20], m[21], m[22]],
+                    sky_seen = m[23] > 0.0,
                     "the indirect light's stand-in: slow mean of the light around and the key's gain"
                 );
             }
@@ -1377,6 +1516,8 @@ fn report_mean(list: &HostList, pass: &Pass) {
         l.CopyBufferRegion(&pass.readback, 32, &pass.cells, (2 * CELLS + 3) * 16, 32);
         // (The contrast gain.)
         l.CopyBufferRegion(&pass.readback, 64, &pass.cells, (2 * CELLS + 5) * 16, 16);
+        // (The sky's colour.)
+        l.CopyBufferRegion(&pass.readback, 80, &pass.cells, (2 * CELLS + 6) * 16, 16);
         l.ResourceBarrier(&[crate::host::transition(
             &pass.cells,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -1439,6 +1580,27 @@ mod tests {
         assert_eq!(parse("constant:0.1:0.5"), Set::Constant(0.1, 0.5));
         assert_eq!(parse("constant:0.1:x"), Set::Constant(0.1, 0.0));
         assert_eq!(parse("constant:nan"), Set::Off);
+    }
+
+    #[test]
+    fn sky_and_sheen_shares() {
+        assert_eq!(parse_share(""), 0.0);
+        assert_eq!(parse_share("0"), 0.0);
+        assert_eq!(parse_share("-1"), 0.0);
+        assert_eq!(parse_share("x"), 0.0);
+        assert_eq!(parse_share("inf"), 0.0);
+        assert_eq!(parse_share(" 0.5 "), 0.5);
+        assert_eq!(parse_share("9"), 4.0);
+    }
+
+    #[test]
+    fn the_reflections_resolve_is_known_by_name() {
+        assert_eq!(role(b"..\0CS_TemporalResolveOpaque_FrameStatistics_6297ed0c_Wrapped\0.."), Some(Role::Sheen));
+        assert_eq!(role(b"..\0CS_TemporalResolve1_Opaque_FrameStatistics_f60c8f41_Wrapped\0.."), Some(Role::Sheen));
+        assert_eq!(role(b"..\0CS_TemporalResolveOpaque2_6297ed0c_Wrapped\0.."), Some(Role::Sheen));
+        // The diffuse light's resolve keeps its own part.
+        assert_eq!(role(b"..\0CS_ScreenProbes_TemporalResolve_Opaque\0.."), Some(Role::Resolve));
+        assert_eq!(role(b"..\0CS_TemporalResolve_Alpha\0.."), None);
     }
 
     #[test]
@@ -1598,6 +1760,8 @@ mod tests {
             ("KEEP", "mean"),
             ("PLACE", "place"),
             ("PLACE", "inside_share"),
+            ("PLACE", "sky_cells"),
+            ("SHEEN", "sheen"),
             ("GATHER", "gather"),
             ("RAISE", "raise"),
             ("AIR", "clear_air"),
