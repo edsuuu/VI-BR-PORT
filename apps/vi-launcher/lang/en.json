@@ -80,5 +80,7 @@
   "controls.hint": "WASD moves, the mouse turns the camera, the buttons shoot and aim",
   "controls.help": "The keys are in {0}. One per line, BUTTON = KEY; several keys separated by commas. Mouse1 is the left button, Mouse2 the right. It takes effect the next time the game opens.",
   "controls.saved": "Keys saved.",
-  "controls.reset": "Back to the default"
+  "controls.reset": "Back to the default",
+  "crash.title": "THE GAME CRASHED",
+  "crash.hint": "The logs of the last hour are below. Copy them and send them with what you were doing when it crashed."
 }

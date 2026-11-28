@@ -423,6 +423,31 @@ pub fn cancel(running: &Running) {
     }
 }
 
+/// The logs written in the last `within`: each step's log changed since
+/// then, its last `each` bytes, under a line naming it. What a crash page
+/// shows and copies.
+pub fn recent_logs(within: std::time::Duration, each: u64) -> String {
+    let since = std::time::SystemTime::now() - within;
+    let mut out = String::new();
+    for id in LOG_STEPS {
+        let path = log_path(*id);
+        let fresh = std::fs::metadata(&path).and_then(|m| m.modified()).is_ok_and(|t| t >= since);
+        if fresh {
+            out.push_str(&format!("===== {} =====\n", path.display()));
+            out.push_str(&tail(&path, each));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Whether the game's last run ended in a crash: a code other than 0 and -1
+/// (closed, or ended by us), or the build's own crash or lost-card line.
+pub fn crashed(code: Option<i32>) -> bool {
+    let log = tail(&log_path(StepId::Open), 1 << 20);
+    code.is_some_and(|c| c != 0 && c != -1) || log.contains("unhandled exception") || log.contains("device removed")
+}
+
 /// The end of a log, at most `limit` bytes, from a whole line on.
 pub fn tail(path: &Path, limit: u64) -> String {
     use std::io::{Read, Seek, SeekFrom};

@@ -80,5 +80,7 @@
   "controls.hint": "WASD anda, o mouse mexe a câmera, os botões atiram e miram",
   "controls.help": "As teclas ficam em {0}. Uma por linha, BOTÃO = TECLA; várias teclas separadas por vírgula. Mouse1 é o botão esquerdo, Mouse2 o direito. Vale na próxima vez que o jogo abrir.",
   "controls.saved": "Teclas salvas.",
-  "controls.reset": "Voltar ao padrão"
+  "controls.reset": "Voltar ao padrão",
+  "crash.title": "O JOGO CAIU",
+  "crash.hint": "Os logs da última hora estão abaixo. Copie e mande junto com o que você estava fazendo quando caiu."
 }

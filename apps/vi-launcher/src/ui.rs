@@ -56,6 +56,8 @@ enum View {
     Settings,
     Prep,
     Logs,
+    /// The game crashed: the last hour's logs, to copy.
+    Crash,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -119,6 +121,8 @@ pub struct App {
     /// The flags as typed in their text box, saved by its button.
     flags_text: String,
     flags_note: Option<String>,
+    /// The logs of the last hour when the game crashed.
+    crash_text: Option<String>,
     /// The key bindings as typed in their text box (read when first shown).
     bindings_text: Option<String>,
     bindings_note: Option<String>,
@@ -149,6 +153,7 @@ impl App {
             logs: Logs { step: StepId::Open, follow: true, text: String::new(), read_at: None, back: View::Play },
             flags_text: String::new(),
             flags_note: None,
+            crash_text: None,
             bindings_text: None,
             bindings_note: None,
             tray: None,
@@ -256,6 +261,7 @@ impl App {
 
     fn poll(&mut self) {
         let language = self.language;
+        let mut crashed = false;
         if let Some(prep) = &mut self.prep {
             while let Ok(e) = prep.events.try_recv() {
                 let set = |prep: &mut Prep, id: StepId, s: StepState| {
@@ -275,6 +281,7 @@ impl App {
                     Event::Skipped(id) => set(prep, id, StepState::Skipped),
                     Event::Done(id) => set(prep, id, StepState::Done),
                     Event::Failed { step, code, log } => {
+                        crashed |= step == StepId::Open;
                         set(prep, step, StepState::Failed);
                         let code = code.map_or_else(|| "-".to_owned(), |c| c.to_string());
                         prep.message = Some(text::fill(
@@ -291,6 +298,9 @@ impl App {
                         prep.game_open = false;
                     }
                     Event::GameEnded(code) => {
+                        if run::crashed(code) {
+                            crashed = true;
+                        }
                         set(prep, StepId::Open, StepState::Done);
                         prep.finished = true;
                         prep.game_open = false;
@@ -301,6 +311,10 @@ impl App {
                     }
                 }
             }
+        }
+        if crashed {
+            self.crash_text = Some(run::recent_logs(std::time::Duration::from_secs(3600), 2 << 20));
+            self.go(View::Crash);
         }
         let next = match &self.update {
             Update::Checking(rx) => rx.try_recv().ok().map(|r| match r {
@@ -407,6 +421,7 @@ impl eframe::App for App {
                 View::Settings => self.settings_view(ui, full, &ctx),
                 View::Prep => self.prep_view(ui, full),
                 View::Logs => self.logs_view(ui, full),
+                View::Crash => self.crash_view(ui, full),
             }
         });
         // The sun's glow breathes and the logs follow the run; slower while
@@ -838,6 +853,43 @@ impl App {
         });
         if close {
             let back = if self.logs.back == View::Prep && self.prep.is_none() { View::Play } else { self.logs.back };
+            self.go(back);
+        }
+    }
+
+    /// The game crashed: the logs of the last hour, with Copy and Close.
+    fn crash_view(&mut self, ui: &mut egui::Ui, full: Rect) {
+        let lang = self.language;
+        let mut close = false;
+        let mut close_button = false;
+        let mut copy = false;
+        let mut folder = false;
+        self.big_card(ui, full, &text::get(lang, "crash.title"), &mut close, |app, ui| {
+            ui.add(egui::Label::new(theme::small(&text::get(lang, "crash.hint"), "textSoft")).wrap());
+            let h = ui.available_height() - 8.0;
+            egui::Frame::new().fill(colour("night")).stroke(egui::Stroke::new(1.0, colour("stroke"))).corner_radius(theme::radius("control")).inner_margin(12.0).show(ui, |ui| {
+                ui.set_min_size(vec2(ui.available_width(), h - 24.0));
+                egui::ScrollArea::both().max_height(h - 24.0).stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+                    let shown = app.crash_text.clone().filter(|t| !t.is_empty()).unwrap_or_else(|| text::get(lang, "logs.empty"));
+                    ui.add(egui::Label::new(RichText::new(shown).monospace().color(colour("textSoft"))).extend());
+                });
+            });
+        }, |app, ui| {
+            copy = theme::outline_button(ui, &text::get(app.language, "logs.copy"), None, false).clicked();
+            folder = theme::outline_button(ui, &text::get(app.language, "logs.open_folder"), None, false).clicked();
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                close_button = theme::outline_button(ui, &text::get(app.language, "common.close"), None, false).clicked();
+            });
+        });
+        if copy {
+            ui.ctx().copy_text(self.crash_text.clone().unwrap_or_default());
+        }
+        if folder {
+            open_folder(&paths::logs_dir());
+        }
+        if close || close_button {
+            self.crash_text = None;
+            let back = if self.prep.is_some() { View::Prep } else { View::Play };
             self.go(back);
         }
     }
