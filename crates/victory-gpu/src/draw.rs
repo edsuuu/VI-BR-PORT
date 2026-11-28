@@ -888,13 +888,28 @@ macro_rules! once {
 /// shader that decodes colour from it draws what the zeros make of it.
 /// `index`: the host slot the draw binds; `handle`: the title's slot.
 fn note_empty(host: &crate::descriptor::host::HostHeap, index: u32, handle: u64, u: &UsedResource) {
-    if !crate::descriptor::host::empty_view_log() || !matches!(u.kind, ResourceType::Srv | ResourceType::Uav) {
+    if !matches!(u.kind, ResourceType::Srv | ResourceType::Uav) {
+        return;
+    }
+    note_empty_at(host, index, handle, (u.slot, u.table_offset_dwords, u.lower_bound));
+}
+
+/// [`note_empty`] for the entry at dword `dwords` of the table in root
+/// parameter `slot`, read as shader register `register` (`u32::MAX`: a
+/// slot the shader picks by index, `RootIndexedView`).
+fn note_empty_at(
+    host: &crate::descriptor::host::HostHeap,
+    index: u32,
+    handle: u64,
+    (slot, dwords, register): (u8, u32, u32),
+) {
+    if !crate::descriptor::host::empty_view_log() {
         return;
     }
     static SAID: std::sync::Mutex<std::collections::BTreeSet<(u64, u8, u32)>> =
         std::sync::Mutex::new(std::collections::BTreeSet::new());
     let program = PROGRAM.get();
-    let key = (program, u.slot, u.table_offset_dwords);
+    let key = (program, slot, dwords);
     {
         let said = SAID.lock().unwrap_or_else(|e| e.into_inner());
         if said.len() >= 4096 || said.contains(&key) {
@@ -902,6 +917,10 @@ fn note_empty(host: &crate::descriptor::host::HostHeap, index: u32, handle: u64,
         }
     }
     let view = crate::descriptor::view(handle);
+    // (A slot picked by index may hold constants, made in upload memory.)
+    if matches!(view, Some(View::Constant(..) | View::Sampler(_) | View::ConsoleSampler(_))) {
+        return;
+    }
     let Some(why) = host.why_empty(index, view.as_ref()) else {
         return;
     };
@@ -910,8 +929,8 @@ fn note_empty(host: &crate::descriptor::host::HostHeap, index: u32, handle: u64,
     }
     tracing::warn!(
         program = format_args!("{program:016x}"),
-        entry = format_args!("s{}+{}", u.slot, u.table_offset_dwords),
-        register = u.lower_bound,
+        entry = format_args!("s{slot}+{dwords}"),
+        register = if register == u32::MAX { "by index".to_owned() } else { register.to_string() },
         host_slot = index,
         view = ?view,
         "a view a draw reads has no host resource: {why}"
@@ -3966,6 +3985,8 @@ impl State {
                 }
                 if let Some(u) = used {
                     note_empty(host, index, table + u64::from(k) * 32, u);
+                } else if selected.binary_search(&k).is_ok() {
+                    note_empty_at(host, index, table + u64::from(k) * 32, (slot, k * 8, u32::MAX));
                 }
             }
             made.push((slot, first * 32));
