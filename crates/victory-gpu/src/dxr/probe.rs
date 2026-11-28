@@ -609,8 +609,9 @@ enum Frame {
     /// The title's own axes (but for rounding).
     Same,
     /// Its axes swapped, turned over or scaled (one entry a row and a
-    /// column), as the builder's 64 turns of the axes and per-axis scales
-    /// would give.
+    /// column), as per-axis scales would give (the builder's 64 rotations
+    /// are turns by steps of 22.5 degrees about each axis, so only its
+    /// index 0 keeps the axes).
     Axes,
     /// Anything else (another instance's transform, or a turn the walk read
     /// wrong).

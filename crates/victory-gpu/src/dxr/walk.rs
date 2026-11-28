@@ -76,8 +76,9 @@ pub(crate) struct Hit {
     /// bottom level's own space; `None`: it has none (the identity).
     pub turn: Option<[f32; 9]>,
     /// The word at `+60` of the bottom level's header, which holds its
-    /// frame (the critic's item 3: an index into the builder's 64 turns of
-    /// the axes and a scale of each axis), as it is.
+    /// frame (the critic's item 3: an index into the builder's 64 rotations,
+    /// steps of 22.5 degrees about each axis, and a scale of each axis), as
+    /// it is.
     pub frame_word: u32,
 }
 

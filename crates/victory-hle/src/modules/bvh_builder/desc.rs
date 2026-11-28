@@ -673,8 +673,11 @@ pub fn node_kind(pointer: u32) -> &'static str {
 /// are stored in, which the rehydrate hands to the leaf stage
 /// (0x180014700). [`NO_PLACEMENT`]: none, the nodes are in the geometry's
 /// own frame. Any other word: bits 24..29 index a table of 64 rotations
-/// the builder makes from permutations and signs of the axes (0x18000be20;
-/// index 0 is skipped there, the identity [inf]); bit 30 centres each axis
+/// (0x18000be20), two bits an axis (x lowest, then y, then z), each a turn
+/// about that axis by 0, 22.5, 45 or 67.5 degrees, made one after another
+/// x, y, z; they are not permutations of the axes (90 degrees is not
+/// among them), and index 0, which the builder skips, is the identity;
+/// bit 30 centres each axis
 /// on the box's middle where the box does not hold 0
 /// ([`Dehydrated::centre`]); bit 31 scales the axes by the powers of two
 /// whose float exponents are its bytes 0, 1 and 2 (x, y, z; 127 is 1.0),
