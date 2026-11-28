@@ -113,6 +113,13 @@ pub(super) enum C {
     InstancesUnknown,
     /// Of them, in memory the CPU could not read at submission.
     InstancesUnreadable,
+    /// The bottom levels top levels named that the host lacked (each once a
+    /// top level): recorded in a list not submitted yet; let go or refused
+    /// for memory, to be made again (`super::keep`); never built by the host
+    /// (refused, or never asked of the builder).
+    LackPending,
+    LackKept,
+    LackNever,
     /// Instances whose flags held the console's own bits (taken off).
     InstancesConsoleFlags,
     /// Builds whose flags held bits the PC does not know (taken off).
@@ -134,12 +141,30 @@ pub(super) enum C {
     ExpandedVertices,
     ExpandedBytes,
     ExpandedByAddress,
+    /// Of them, in a host copy shaders write (`VICTORY_DXR_EXPAND_WRITTEN`).
+    ExpandedWritten,
     /// At submission: expansions whose data the CPU could not read then
     /// (written so that nothing is hit), triangles made degenerate,
     /// positions not finite.
     ExpandedUnreadable,
     ExpandedDegenerate,
     ExpandedNotFinite,
+    /// Barriers recorded for builds to take the scratch memory of builds
+    /// before them again (`super::scratch`).
+    ScratchWaits,
+    /// `super::keep`: destinations top levels named that the host had a
+    /// recipe but no structure for; bottom levels made again, and those
+    /// refused; bottom levels let go for want of memory.
+    Wanted,
+    Remade,
+    RemadeRefused,
+    Evicted,
+    /// `super::compact`: bottom levels compacted, their bytes before and
+    /// after, and those not compacted after all.
+    Compacted,
+    CompactedFrom,
+    CompactedTo,
+    CompactDropped,
     Swept,
 }
 

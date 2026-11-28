@@ -36,6 +36,7 @@ pub(crate) const INSTANCE: usize = 64;
 /// put after the bottom levels), and the rewrite of its instances at
 /// submission. The structure built and where its instances go (the upload
 /// memory's CPU address).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn top(
     host: &HostList,
     list: &ID3D12GraphicsCommandList4,
@@ -44,6 +45,7 @@ pub(super) fn top(
     b: &Build,
     frame: u64,
     held: &mut Held,
+    scratch: &mut super::scratch::Scratch,
 ) -> Result<(Arc<Structure>, usize), Refused> {
     let Level::Top { instances, count, layout } = b.level else {
         return Err((Refusal::OtherGeometry, "not a top level".into()));
@@ -69,8 +71,8 @@ pub(super) fn top(
         Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 { InstanceDescs: descs },
     };
     let sizes = native::prebuild(gpu, &inputs)?;
-    let s = Structure::new(native::lease_structure(sizes.ResultDataMaxSizeInBytes)?);
-    let scratch = native::lease_scratch(sizes.ScratchDataSizeInBytes)?;
+    let s = Structure::new(native::lease_for(table, sizes.ResultDataMaxSizeInBytes, frame)?);
+    let scratch = scratch.take(list, sizes.ScratchDataSizeInBytes, held)?;
     if count > 0 {
         let top = s.clone();
         host.defer_host_read(instances as usize, bytes, move || rewrite(instances, count as usize, cpu, &top));
@@ -79,14 +81,13 @@ pub(super) fn top(
         DestAccelerationStructureData: s.gpu(),
         Inputs: inputs,
         SourceAccelerationStructureData: 0,
-        ScratchAccelerationStructureData: scratch.gpu,
+        ScratchAccelerationStructureData: scratch,
     };
     // SAFETY: an open list; the instances are upload memory the list holds,
     // written at its submission; the structure and scratch are held by the
     // list (`held`).
     unsafe { list.BuildRaytracingAccelerationStructure(&desc, None) };
     table.built(b.dest, flags, Shape::Top(count), s.clone(), frame);
-    held.leases.push(scratch);
     held.made.push(s.clone());
     add(C::TopBuilt, 1);
     add(C::Instances, u64::from(count));
@@ -110,7 +111,25 @@ fn rewrite(instances: u64, count: usize, to: usize, top: &Arc<Structure>) {
     let frame = crate::frame::current();
     let (mut named, unknown) = {
         let mut table = native::table();
-        rename(out, |blas| table.usable(blas, frame).map(|v| (v.gpu(), v)))
+        // The bottom levels named that the host lacks, each once.
+        let mut lacking = std::collections::HashSet::new();
+        rename(out, |blas| {
+            let found = table.usable(blas, frame);
+            if found.is_none() && lacking.insert(blas) {
+                let why = if table.get(blas).is_some() {
+                    // Recorded in a list not submitted yet.
+                    C::LackPending
+                } else if super::keep::want(blas, frame) {
+                    // Let go or refused for memory: made again at the next
+                    // recording of top levels of ours (`super::keep`).
+                    C::LackKept
+                } else {
+                    C::LackNever
+                };
+                add(why, 1);
+            }
+            found.map(|v| (v.gpu(), v))
+        })
     };
     named.sort_by_key(|n| Arc::as_ptr(n) as usize);
     named.dedup_by(|a, b| Arc::ptr_eq(a, b));

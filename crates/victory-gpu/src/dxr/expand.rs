@@ -45,6 +45,26 @@ pub(super) fn on() -> bool {
     })
 }
 
+/// `VICTORY_DXR_EXPAND_WRITTEN=1` (off by default: such data are refused):
+/// packed data in a host copy shaders were declared to write are expanded
+/// from the CPU's view of title memory anyway, and counted. What a list's
+/// shaders write into such a copy is copied back into title memory once
+/// the list has run (`Shadow::gpu_writes`; in place they write title memory
+/// itself), so the CPU's view lags only by the lists still running when the
+/// expanding one is submitted. Memory shaders write by address is not
+/// brought back; that is counted apart (`in pages of by-address memory`),
+/// as before.
+fn written_too() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DXR_EXPAND_WRITTEN").is_ok_and(|v| v.trim() == "1");
+        if asked && on() {
+            tracing::info!("VICTORY_DXR_EXPAND_WRITTEN: packed data in host copies shaders write are expanded from title memory");
+        }
+        asked
+    })
+}
+
 /// What one build's expansions add to the five-second line once it is
 /// recorded.
 #[derive(Default)]
@@ -55,6 +75,7 @@ pub(super) struct Tally {
     vertices: u64,
     bytes: u64,
     by_address: u64,
+    written: u64,
 }
 
 impl Tally {
@@ -66,6 +87,7 @@ impl Tally {
         add(C::ExpandedVertices, self.vertices);
         add(C::ExpandedBytes, self.bytes);
         add(C::ExpandedByAddress, self.by_address);
+        add(C::ExpandedWritten, self.written);
     }
 }
 
@@ -98,10 +120,13 @@ fn checked(what: &str, at: u64, len: u64, tally: &mut Tally) -> Result<(), Refus
         .iter()
         .any(|c| c.written())
     {
-        return Err((
-            Refusal::PackedWritten,
-            format!("{what} at {at:#x}+{len:#x}"),
-        ));
+        if !written_too() {
+            return Err((
+                Refusal::PackedWritten,
+                format!("{what} at {at:#x}+{len:#x}"),
+            ));
+        }
+        tally.written += 1;
     }
     const PAGE: u64 = 1 << 16;
     if crate::shadow::in_buffer(at, len).is_none()

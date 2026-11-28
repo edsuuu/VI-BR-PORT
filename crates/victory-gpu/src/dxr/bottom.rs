@@ -9,7 +9,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
 use super::count::{C, REBUILT, Refusal, add};
-use super::native::{Held, Refused, Structure, lease_scratch, lease_structure, prebuild};
+use super::native::{Held, Refused, Structure, lease_for, prebuild};
+use super::scratch::Scratch;
 use super::packed;
 use super::stamps::Gpu;
 use super::table::{self, Decision, GeometryShape, PERFORM_UPDATE, Shape, Table, Why};
@@ -243,6 +244,7 @@ pub(super) fn bottom(
     origin: Origin,
     frame: u64,
     held: &mut Held,
+    scratch: &mut Scratch,
 ) -> Result<(), Refused> {
     let Level::Bottom { geometries, whole } = &b.level else {
         return Ok(());
@@ -292,7 +294,8 @@ pub(super) fn bottom(
         }
     }
     let update = origin == Origin::Batched && b.flags & PERFORM_UPDATE != 0;
-    let flags = host_flags(b.flags, origin);
+    // With VICTORY_DXR_COMPACT, one never updated is built to be compacted.
+    let flags = super::compact::flags(host_flags(b.flags, origin));
     let shape = Shape::Bottom(shapes);
     let decision = table::decide(update, b.dest, b.source, flags, &shape, table);
     let refit = matches!(decision, Decision::Refit { .. });
@@ -312,31 +315,32 @@ pub(super) fn bottom(
             if in_place {
                 (src.gpu(), src.gpu(), None)
             } else {
-                let lease = lease_structure(sizes.ResultDataMaxSizeInBytes.max(src.lease.len()))?;
+                let lease = lease_for(table, sizes.ResultDataMaxSizeInBytes.max(src.lease.len()), frame)?;
                 let s = Structure::new(lease);
                 (s.gpu(), src.gpu(), Some(s))
             }
         }
         Decision::Build | Decision::Rebuild(_) => {
-            let s = Structure::new(lease_structure(sizes.ResultDataMaxSizeInBytes)?);
+            let s = Structure::new(lease_for(table, sizes.ResultDataMaxSizeInBytes, frame)?);
             (s.gpu(), 0, Some(s))
         }
     };
     let scratch_len = if refit { sizes.UpdateScratchDataSizeInBytes } else { sizes.ScratchDataSizeInBytes };
-    let scratch = lease_scratch(scratch_len)?;
+    let scratch = scratch.take(list, scratch_len, held)?;
     let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
         DestAccelerationStructureData: dest,
         Inputs: inputs,
         SourceAccelerationStructureData: source,
-        ScratchAccelerationStructureData: scratch.gpu,
+        ScratchAccelerationStructureData: scratch,
     };
+    // (A compacted size, if asked, goes to a buffer of ours held for good.)
+    let post = made.as_ref().and_then(|s| super::compact::ask(host, b.dest, s, flags, frame));
     // SAFETY: an open list; the description and the geometry descriptions it
     // points at outlive the call; every address is of a buffer the list holds
     // until it is reset (the copies by their refresh, ours by `held`), each in
     // the state a build needs.
-    unsafe { list.BuildRaytracingAccelerationStructure(&desc, None) };
+    unsafe { list.BuildRaytracingAccelerationStructure(&desc, post.as_ref().map(std::slice::from_ref)) };
     tally.count();
-    held.leases.push(scratch);
     match (decision, made) {
         (Decision::Refit { in_place: true }, _) => {
             table.refit_in_place(b.dest, frame);

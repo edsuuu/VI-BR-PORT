@@ -417,6 +417,113 @@ fn packed_geometry_expanded_is_built_and_hit_where_the_stages_decode_it() {
     }
 }
 
+/// What `VICTORY_DXR_COMPACT` does (`super::compact`), on the card: a
+/// bottom level built with `ALLOW_COMPACTION` writes its compacted size into
+/// a buffer the CPU reads and shaders may write (made as
+/// `Host::shared_buffer` makes its, left in the common state), the size is
+/// below the driver's worst case, and the copy compacted into memory of that
+/// size is what a top level's rays hit.
+#[test]
+fn a_bottom_level_compacted_into_the_size_its_build_wrote_is_hit_as_built() {
+    let Some(gpu) = Gpu::new() else {
+        eprintln!("no hardware adapter with ray tracing tier 1.1; skipped");
+        return;
+    };
+    let (vertices, indices) = grid(2000, 2.0);
+    let v = gpu.resident(&f32s(&vertices));
+    let i = gpu.resident(&indices.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>());
+    // SAFETY: plain queries of buffers of ours.
+    let (v, i) = unsafe { (v.GetGPUVirtualAddress(), i.GetGPUVirtualAddress()) };
+    let bottom = gpu.bottom(
+        vec![triangles(v, (vertices.len() / 3) as u32, Some((i, indices.len() as u32)), D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE)],
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY
+            | D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_COMPACTION,
+    );
+    // The sizes' buffer, as the host's.
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: 256,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_CUSTOM,
+        CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_WRITE_BACK,
+        MemoryPoolPreference: D3D12_MEMORY_POOL_L0,
+        ..Default::default()
+    };
+    let mut sizes: Option<ID3D12Resource> = None;
+    let mut data = std::ptr::null_mut();
+    // SAFETY: plain creation and mapping of a buffer of ours.
+    let sizes = unsafe {
+        gpu.device
+            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut sizes)
+            .expect("a buffer");
+        let sizes = sizes.expect("a buffer");
+        sizes.Map(0, None, Some(&mut data)).expect("map");
+        data.cast::<u64>().write_volatile(0);
+        sizes
+    };
+    // SAFETY: as above.
+    let at = unsafe { sizes.GetGPUVirtualAddress() };
+    gpu.run(|list| bottom.record_sized(list, at));
+    // SAFETY: the mapping, written by the run waited for.
+    let size = unsafe { data.cast::<u64>().read_volatile() };
+    eprintln!("compacted {size} bytes of {} at most", bottom.sizes.ResultDataMaxSizeInBytes);
+    assert!(size > 0 && size < bottom.sizes.ResultDataMaxSizeInBytes, "compacted size {size}");
+    let compacted = gpu.buffer(
+        size,
+        D3D12_HEAP_TYPE_DEFAULT,
+        D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+    );
+    // SAFETY: as above.
+    let compacted_at = unsafe { compacted.GetGPUVirtualAddress() };
+    let instances = gpu.resident(&instance(moved(0.0, 0.0, 0.0), 7, 0xff, 0, compacted_at));
+    // SAFETY: as above.
+    let top = gpu.top(
+        unsafe { instances.GetGPUVirtualAddress() },
+        1,
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+    );
+    let up = [0.0, 0.0, 1.0];
+    // Square (x, y)'s lower triangle is primitive 2 (y w + x); a corner bump
+    // of at most 0.04 moves t a little.
+    let w = (2000f64.sqrt().ceil()) as u32;
+    let cases = [
+        Case { want: Some((2.0, 0, 7, 0, 0, [0.0, 0.0])), ..case([0.2, 0.2, 0.0], up) },
+        Case { want: Some((2.0, 0, 7, 2 * (3 * w + 5), 0, [0.0, 0.0])), ..case([5.2, 3.2, 0.0], up) },
+        case([-5.0, -5.0, 0.0], up),
+    ];
+    let hits = shoot(&gpu, top.address(), &cases, |list| unsafe {
+        // SAFETY: both structures live until the run has waited.
+        list.CopyRaytracingAccelerationStructure(
+            compacted_at,
+            bottom.address(),
+            D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE_COMPACT,
+        );
+        list.ResourceBarrier(&[uav_barrier(&compacted)]);
+        top.record(list, false);
+    });
+    for (n, (c, hit)) in cases.iter().zip(&hits).enumerate() {
+        let f = f32::from_bits;
+        match c.want {
+            None => assert_eq!(hit[0], COMMITTED_NOTHING, "ray {n}"),
+            Some((t, index, id, primitive, _, _)) => {
+                assert_eq!(hit[0], COMMITTED_TRIANGLE_HIT, "ray {n}");
+                assert!((f(hit[1]) - t).abs() < 0.05, "ray {n}: t {}", f(hit[1]));
+                assert_eq!([hit[2], hit[3], hit[4]], [index, id, primitive], "ray {n}");
+            }
+        }
+    }
+}
+
 /// A grid of `quads` squares (two triangles each) in the plane z = `z`, as
 /// vertices and `u32` indices.
 fn grid(quads: u32, z: f32) -> (Vec<f32>, Vec<u32>) {
