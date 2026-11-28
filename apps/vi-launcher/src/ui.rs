@@ -256,10 +256,6 @@ impl App {
         {
             plan.run.env.insert("VICTORY_MNK_BINDINGS".to_owned(), bindings.display().to_string());
         }
-        // PC icons: the texture mods that draw the buttons as keys.
-        if self.config.pc_icons == Some(true) {
-            plan.run.env.insert("VICTORY_TEXTURE_MODS".to_owned(), paths::pc_icons_dir().display().to_string());
-        }
         let (tx, rx) = channel();
         let running: run::Running = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -1257,12 +1253,6 @@ impl App {
         let r = theme::switch_row(ui, &text::get(lang, "controls.label"), &text::get(lang, "controls.hint"), &mut on, num("layout", "switchRowHeight"));
         if r.changed() {
             self.config.mouse_keyboard = Some(on);
-            self.save();
-        }
-        let mut icons = self.config.pc_icons == Some(true);
-        let r = theme::switch_row(ui, &text::get(lang, "pc_icons.label"), &text::get(lang, "pc_icons.hint"), &mut icons, num("layout", "switchRowHeight"));
-        if r.changed() {
-            self.config.pc_icons = Some(icons);
             self.save();
         }
     }

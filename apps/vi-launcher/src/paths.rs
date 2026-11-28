@@ -33,11 +33,6 @@ pub fn logs_dir() -> PathBuf {
     data_dir().join("logs")
 }
 
-/// The texture mods that draw the pad's buttons as the PC's keys.
-pub fn pc_icons_dir() -> PathBuf {
-    data_dir().join("mods").join("pc-icons")
-}
-
 pub fn downloads_dir() -> PathBuf {
     data_dir().join("updates")
 }
