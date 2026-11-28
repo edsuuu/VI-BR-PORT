@@ -12,7 +12,8 @@
 //! (`VICTORY_DXR_PROBE_EYE=x,y,z`, or else the middle of the instances'
 //! places, each axis's median) at it with ray queries. The distances and the
 //! instances hit are saved as two PNGs in `VICTORY_DXR_PROBE_DIR` (by
-//! default `dxr-probe` in the working directory).
+//! default the folder of the frame pictures, `VICTORY_CAPTURE`, or else
+//! `dxr-probe` in the working directory).
 //!
 //! The critic's item 6: the probe also fires a grid of 24 x 12 of the same
 //! rays at the **console's** top level of the same destination with a walk
@@ -79,8 +80,15 @@ fn every() -> u64 {
     })
 }
 
+/// `VICTORY_DXR_PROBE_DIR`; else the folder of the title's frame pictures
+/// (`VICTORY_CAPTURE`, `crate::capture`), so the probe's lie beside the
+/// title's of about the same frames; else `dxr-probe` in the working
+/// directory.
 fn folder() -> PathBuf {
-    std::env::var_os("VICTORY_DXR_PROBE_DIR").map_or_else(|| PathBuf::from("dxr-probe"), PathBuf::from)
+    std::env::var_os("VICTORY_DXR_PROBE_DIR")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("VICTORY_CAPTURE").filter(|v| !v.is_empty()))
+        .map_or_else(|| PathBuf::from("dxr-probe"), PathBuf::from)
 }
 
 fn eye_asked() -> Option<[f32; 3]> {
