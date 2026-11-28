@@ -741,10 +741,25 @@ impl Drop for Heap {
     }
 }
 
+/// Bytes of a render target view as the console's headers define it
+/// (`D3D12XBOX_DESCRIPTOR_RENDER_TARGET_VIEW_SIZE_IN_BYTES`).
+const CONSOLE_RTV_STRIDE: u32 = 112;
+
+/// Whether render target views are spaced as the headers say (112 bytes)
+/// instead of the 128 we reserved: `VICTORY_RTV_STRIDE_112=1`, default off
+/// until measured. A title that bakes the header's constant in (rather than
+/// asking `GetDescriptorHandleIncrementSize`) would otherwise compute
+/// handles that land inside our wider slots.
+fn rtv_stride_112() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RTV_STRIDE_112").is_some_and(|v| v == "1"))
+}
+
 /// Bytes per descriptor, by heap type (views, samplers, render targets,
 /// depth).
 fn increment(kind: u32) -> Option<u32> {
-    [32, 16, 128, 128].get(kind as usize).copied()
+    let rtv = if rtv_stride_112() { CONSOLE_RTV_STRIDE } else { 128 };
+    [32, 16, rtv, 128].get(kind as usize).copied()
 }
 
 /// Device method.
