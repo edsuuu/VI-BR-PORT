@@ -30,6 +30,8 @@
 //!   the device's ray-tracing interface and the card's time of the builds;
 //! - `table`: the title's destination address to the host structure, with
 //!   generations and the refit-or-rebuild decision;
+//! - `compact` (`VICTORY_DXR_COMPACT=1`): bottom levels never updated,
+//!   compacted once built;
 //! - `keep` (`VICTORY_DXR_KEEP=1`): bottom levels let go or refused for want
 //!   of memory, made again when a top level names them;
 //! - `pool`: the card memory structures and scratch memory are cut from;
@@ -53,6 +55,7 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 
 mod bottom;
+mod compact;
 mod count;
 mod expand;
 mod keep;
@@ -363,6 +366,28 @@ pub(crate) mod build {
             self.record_unfenced(list, update);
             // SAFETY: the barrier names a buffer of ours.
             unsafe { list.ResourceBarrier(&[uav_barrier(&self.result)]) };
+        }
+
+        /// Records its build with its compacted size written to `size_at`
+        /// (8 bytes of a buffer shaders may write, as the host's builds do
+        /// with `VICTORY_DXR_COMPACT`), then a barrier.
+        pub fn record_sized(&self, list: &ID3D12GraphicsCommandList4, size_at: u64) {
+            let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                DestAccelerationStructureData: self.address(),
+                Inputs: self.inputs(false),
+                SourceAccelerationStructureData: 0,
+                // SAFETY: a plain query of a buffer of ours.
+                ScratchAccelerationStructureData: unsafe { self.scratch.GetGPUVirtualAddress() },
+            };
+            let post = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC {
+                DestBuffer: size_at,
+                InfoType: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_COMPACTED_SIZE,
+            };
+            // SAFETY: as `record_unfenced`; the size's buffer is the caller's.
+            unsafe {
+                list.BuildRaytracingAccelerationStructure(&desc, Some(&[post]));
+                list.ResourceBarrier(&[uav_barrier(&self.result)]);
+            }
         }
 
         /// [`Structure::record`] without the barrier (builds into different

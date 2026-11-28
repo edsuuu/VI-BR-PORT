@@ -150,6 +150,12 @@ pub(super) enum C {
     Remade,
     RemadeRefused,
     Evicted,
+    /// `super::compact`: bottom levels compacted, their bytes before and
+    /// after, and those not compacted after all.
+    Compacted,
+    CompactedFrom,
+    CompactedTo,
+    CompactDropped,
     Swept,
 }
 

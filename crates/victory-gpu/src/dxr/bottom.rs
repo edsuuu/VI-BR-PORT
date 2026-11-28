@@ -294,7 +294,8 @@ pub(super) fn bottom(
         }
     }
     let update = origin == Origin::Batched && b.flags & PERFORM_UPDATE != 0;
-    let flags = host_flags(b.flags, origin);
+    // With VICTORY_DXR_COMPACT, one never updated is built to be compacted.
+    let flags = super::compact::flags(host_flags(b.flags, origin));
     let shape = Shape::Bottom(shapes);
     let decision = table::decide(update, b.dest, b.source, flags, &shape, table);
     let refit = matches!(decision, Decision::Refit { .. });
@@ -332,11 +333,13 @@ pub(super) fn bottom(
         SourceAccelerationStructureData: source,
         ScratchAccelerationStructureData: scratch,
     };
+    // (A compacted size, if asked, goes to a buffer of ours held for good.)
+    let post = made.as_ref().and_then(|s| super::compact::ask(host, b.dest, s, flags, frame));
     // SAFETY: an open list; the description and the geometry descriptions it
     // points at outlive the call; every address is of a buffer the list holds
     // until it is reset (the copies by their refresh, ours by `held`), each in
     // the state a build needs.
-    unsafe { list.BuildRaytracingAccelerationStructure(&desc, None) };
+    unsafe { list.BuildRaytracingAccelerationStructure(&desc, post.as_ref().map(std::slice::from_ref)) };
     tally.count();
     match (decision, made) {
         (Decision::Refit { in_place: true }, _) => {

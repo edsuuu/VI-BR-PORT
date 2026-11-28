@@ -251,6 +251,10 @@ fn record_on(host: &HostList, origin: Origin, builds: &[Build]) -> bool {
         // title's own call in its own list, on its own queue (a list of
         // another queue gives no order against the lists that read them).
         let tops_here = builds.iter().any(|b| matches!(b.level, Level::Top { .. }));
+        // The same for the compactions due (`super::compact`).
+        if tops_here {
+            super::compact::run(&list, &mut table, frame, &mut held);
+        }
         let wanted = if tops_here { super::keep::wanted(&table) } else { Vec::new() };
         for (dest, recipe) in wanted {
             let made = super::bottom::bottom(host, &list, gpu, &mut table, &recipe.build, recipe.origin, frame, &mut held, &mut scratch);
@@ -529,6 +533,16 @@ pub(crate) fn line() {
             per(C::ExpandedUnreadable),
             per(C::ExpandedDegenerate),
             per(C::ExpandedNotFinite),
+        );
+    }
+    if super::compact::on() {
+        let _ = write!(
+            text,
+            "; VICTORY_DXR_COMPACT: {:.2} bottom levels compacted a frame ({:.2} MB into {:.2} MB), {:.2} not after all",
+            per(C::Compacted),
+            per(C::CompactedFrom) / f64::from(1 << 20),
+            per(C::CompactedTo) / f64::from(1 << 20),
+            per(C::CompactDropped),
         );
     }
     if super::keep::on() {
