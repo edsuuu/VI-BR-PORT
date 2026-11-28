@@ -7,7 +7,7 @@
 # -Build        target\release (what the README's benchmark is of) or target\diag (the default)
 # -Console      series-s (the default: the profile for 8 GB cards) or series-x
 # -MouseKeyboard  mouse and keyboard drive the pad (WASD, the mouse for the camera); the keys are in
-#               %LOCALAPPDATA%ictoryindings.ini, copied from the repository's bindings.ini the first time
+#               %LOCALAPPDATA%\victory\bindings.ini, copied from the repository's bindings.ini the first time
 # -More         other settings, or other values for these: -More @{VICTORY_THIN='0'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -57,10 +57,10 @@ if ($Safe) {
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' } else { $settings.VICTORY_RT_MISS = '1' }
 if ($MouseKeyboard) {
     # The player's own copy of the key bindings, made from the repository's the first time.
-    $bindings = Join-Path $env:LOCALAPPDATA 'victoryindings.ini'
+    $bindings = Join-Path $env:LOCALAPPDATA 'victory\bindings.ini'
     if (-not (Test-Path -LiteralPath $bindings)) {
         New-Item -ItemType Directory -Force (Split-Path $bindings) | Out-Null
-        Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..indings.ini') $bindings
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\bindings.ini') $bindings
     }
     $settings.VICTORY_MNK_BINDINGS = $bindings
 }
