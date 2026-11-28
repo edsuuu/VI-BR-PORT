@@ -31,6 +31,15 @@ $settings = @{
     # room is dark; outdoors the game's own light with a floor.
     VICTORY_AMBIENT = 'constant:0.1:0.5'; VICTORY_AMBIENT_OUTSIDE = '1:0.16'
     VICTORY_AMBIENT_KEY = '0.2:8:room:air:geo'; VICTORY_AMBIENT_AIR = '0.8'
+    # Day and night outdoors: no whitish water by day.
+    VICTORY_AMBIENT_DAY = '0.5:2'; VICTORY_AMBIENT_CONTRAST = '4:8'; VICTORY_AMBIENT_CUT = '3'
+    VICTORY_AMBIENT_AIR_SOFT = '1'; VICTORY_AMBIENT_EDGE = '4'
+    # Programs that need the paired 64-lane form; the last, the sky's CS_SortRayTiles, takes the
+    # light blocks off the clouds and the rectangle off the sky by the bridge. Translation switch.
+    VICTORY_WAVE_PAIRED_FOR = '5dc3b25986622949,6f225b641c5b0708,1aa247ed3653b616,a1bf269d5b19f025'
+    # The glass of the cell window's prepass tests depth first, so it no longer draws over Lucia's
+    # hair and shoulder. Translation switch.
+    VICTORY_EARLY_DEPTH_FOR = 'd16aa6328e7f5025'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
