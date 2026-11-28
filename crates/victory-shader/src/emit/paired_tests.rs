@@ -23,6 +23,22 @@ fn paired(native: &NativeProgram) -> HostShader {
     shader
 }
 
+/// The regular retry chain on a Wave32 host, with or without a named paired override.
+fn emit_with_paired_first(native: &NativeProgram, named: bool) -> Result<HostShader, ShaderError> {
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let st = structure::structure(&p).expect("structure");
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, native).expect("io::raise");
+    let bytes = super::super::container::build(&[]);
+    let c = super::super::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let result = super::super::with_paired_first(named, || {
+        super::super::emit(&c, native, &p, &st, &io, &res)
+    });
+    lower::TEST_HOST_WAVE.set(was);
+    result
+}
+
 /// The first `words` dwords of the UAV after one group of `shader` ran with root constant s0
 /// = `s0`; none without a device that takes it.
 fn run(host: &Host, shader: &HostShader, s0: u32, words: u32) -> Option<Vec<u32>> {
@@ -161,6 +177,61 @@ fn a_lane_mask_as_data_and_a_lane_read_from_the_upper_half() {
         assert_eq!(out, expected, "{below} lanes in the mask");
     }
     eprintln!("ran on the hardware device: the mask's two dwords and lane 43, in every case");
+}
+
+/// Save both dwords of a comparison inside `if (s0 <= t)` and store them after EXEC is
+/// restored. The constant lane mask also makes the local-wave approximations refuse the program.
+#[test]
+fn a_divergent_lane_mask_taken_as_data_gets_the_paired_fallback() {
+    let native = native_of(
+        &[
+            0x3402_0083, // v_lshlrev_b32 v1, 3, v0
+            0xBEEA_0481, // s_mov_b64 vcc, 1
+            0x0204_0080, // v_cndmask_b32 v2, 0, v0, vcc
+            0xBE86_0380, // s_mov_b32 s6, 0
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0x7D86_0000, // v_cmp_le_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0003, // s_cbranch_execz to the restore
+            0x7D82_0080, // v_cmp_lt_u32 vcc, 0, v0
+            0xBE86_036A, // s_mov_b32 s6, vcc_lo
+            0xBE87_036B, // s_mov_b32 s7, vcc_hi
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x4A06_0406, // v_add_nc_u32 v3, s6, v2
+            0x7E08_0207, // v_mov_b32 v4, s7
+            0xE070_1000,
+            0x8002_0301, // buffer_store_dword v3, v1, s[8:11], 0 offen
+            0xE070_1004,
+            0x8002_0401, // buffer_store_dword v4, v1, s[8:11], 0 offen offset:4
+        ],
+        true,
+        128,
+    );
+    let shader = emit_with_paired_first(&native, false).expect("automatic paired fallback");
+    assert_eq!(shader.dxil, paired(&native).dxil);
+    let _one = super::super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(host) = card() else { return };
+    for from in [0u32, 1, 31, 32, 33, 63, 64, 65, 96, 97, 127, 128] {
+        let expected: Vec<u32> = [0u32, 64]
+            .into_iter()
+            .flat_map(|base| {
+                let mask = (0..64)
+                    .filter(|&lane| base + lane >= from && base + lane != 0)
+                    .fold(0u64, |mask, lane| mask | (1 << lane));
+                (0..64).flat_map(move |lane| {
+                    let bias = if lane == 0 { base } else { 0 };
+                    [(mask as u32).wrapping_add(bias), (mask >> 32) as u32]
+                })
+            })
+            .collect();
+        let Some(out) = run(&host, &shader, from, 256) else {
+            return;
+        };
+        assert_eq!(out, expected, "threads at or above {from}");
+    }
+    eprintln!("ran on the hardware device: both mask dwords across divergent waves");
 }
 
 /// Each thread writes its id to LDS dword t, the group meets (`s_barrier`), and the threads
@@ -345,21 +416,7 @@ fn first_lane_kept(threads: u32) -> NativeProgram {
 /// with it. So does [`leave_one_by_one`] with one console wave, round by round.
 #[test]
 fn the_paired_form_is_taken_when_asked_for() {
-    let emit = |native: &NativeProgram, paired: bool| {
-        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-        let st = structure::structure(&p).expect("structure");
-        let res =
-            resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-        let io = io::raise(&p, native).expect("io::raise");
-        let bytes = super::super::container::build(&[]);
-        let c = super::super::Container::parse(&bytes).expect("container");
-        let was = lower::TEST_HOST_WAVE.replace(Some(32));
-        let r = super::super::with_paired_first(paired, || {
-            super::super::emit(&c, native, &p, &st, &io, &res)
-        });
-        lower::TEST_HOST_WAVE.set(was);
-        r.expect("emit").dxil
-    };
+    let emit = |native, named| emit_with_paired_first(native, named).expect("emit").dxil;
     let exact = program(0xBF88_0000);
     // (named: the paired form even where an exact one came first)
     assert_ne!(emit(&exact, false), paired(&exact).dxil);

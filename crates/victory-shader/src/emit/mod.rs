@@ -1012,6 +1012,20 @@ pub fn emit(
                 }
             }
         }
+        // A ballot or mask-derived SCC in a divergent block cannot use a group barrier.
+        // The paired form collects the whole console mask within one host wave.
+        if matches!(&original, Err(ShaderError::Unsupported { what: lower::LANE_MASK_EXCHANGE, .. }))
+            && !PAIRED_FIRST.get()
+            && std::env::var_os("VICTORY_WAVE_PAIRED").is_none_or(|v| v != "1")
+        {
+            let again = emit_paired(c, native, p, st);
+            lower::take_needs();
+            lower::take_meets();
+            report("paired for a divergent lane-mask exchange", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
         // Last of all, for a program that would still ask for 64-lane waves, which this host
         // refuses outright: the wave-wide form after all (unless `VICTORY_WAVE_WIDE=0`). Every
         // group barrier it adds now stands behind decisions the two host waves take as one
