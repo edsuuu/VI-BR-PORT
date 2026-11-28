@@ -46,7 +46,11 @@
 //! input triangle's second and third vertices). Triangle `k` of the node
 //! uses the node's vertices [`TRIANGLE_VERTICES`]`[k]`. A program that
 //! keeps fewer triangles in a node uses the bytes of the unused vertices
-//! for its own data.
+//! for its own data. The console's builder does: its leaves hold four
+//! vertices (bytes 0-47) and at 48-59 the geometry index and flags and two
+//! primitive indices, so only triangles 0 and 1 are its own; the
+//! instruction still reads those words as a fifth vertex for kinds 2
+//! and 3.
 //!
 //! With the descriptor's triangle return mode set (bit 120) the result is
 //! the hit distance's numerator, its denominator, and the numerators of I
