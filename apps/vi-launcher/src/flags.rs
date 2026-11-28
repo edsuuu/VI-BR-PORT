@@ -73,6 +73,36 @@ pub fn to_text(flags: &[Flag]) -> String {
         .join("\n")
 }
 
+/// The text box as the player sees it: the build's own switches (`base`) with
+/// the player's changes over them, then the player's other switches.
+pub fn with_base(flags: &[Flag], base: &[(String, String)]) -> String {
+    let mut shown: Vec<Flag> = base
+        .iter()
+        .map(|(name, value)| {
+            flags.iter().find(|f| &f.name == name).cloned().unwrap_or(Flag { name: name.clone(), value: value.clone(), enabled: true })
+        })
+        .collect();
+    shown.extend(flags.iter().filter(|f| !base.iter().any(|(n, _)| n == &f.name)).cloned());
+    to_text(&shown)
+}
+
+/// What is kept of the box: only what differs from the build's switches. A
+/// switch of the build left as it is is not stored (a newer build's value then
+/// applies); one changed or switched off is; one deleted is stored empty,
+/// which takes it out of the run.
+pub fn without_base(typed: Vec<Flag>, base: &[(String, String)]) -> Vec<Flag> {
+    let mut out: Vec<Flag> = Vec::new();
+    for (name, value) in base {
+        match typed.iter().find(|f| &f.name == name) {
+            Some(f) if f.enabled && &f.value == value => {}
+            Some(f) => out.push(f.clone()),
+            None => out.push(Flag { name: name.clone(), value: String::new(), enabled: true }),
+        }
+    }
+    out.extend(typed.into_iter().filter(|f| !base.iter().any(|(n, _)| n == &f.name)));
+    out
+}
+
 /// The text box read back: the flags it holds (a line behind `#` is kept
 /// switched off) and how many non-empty lines were not a flag.
 pub fn from_text(text: &str) -> (Vec<Flag>, usize) {
@@ -98,6 +128,25 @@ pub fn from_text(text: &str) -> (Vec<Flag>, usize) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_box_shows_the_build_switches_and_stores_only_changes() {
+        let base = vec![("VICTORY_A".to_owned(), "1".to_owned()), ("VICTORY_B".to_owned(), "2".to_owned())];
+        let shown = super::with_base(&[], &base);
+        assert_eq!(shown, "VICTORY_A=1
+VICTORY_B=2");
+        let (typed, _) = super::from_text("VICTORY_A=1
+# VICTORY_B=2
+VICTORY_C=3");
+        let kept = super::without_base(typed, &base);
+        let names: Vec<_> = kept.iter().map(|f| (f.name.as_str(), f.value.as_str(), f.enabled)).collect();
+        assert_eq!(names, vec![("VICTORY_B", "2", false), ("VICTORY_C", "3", true)]);
+        let (typed, _) = super::from_text("VICTORY_B=2");
+        assert_eq!(super::without_base(typed, &base)[0].value, "");
+        assert_eq!(super::with_base(&kept, &base), "VICTORY_A=1
+# VICTORY_B=2
+VICTORY_C=3");
+    }
+
     #[test]
     fn the_text_box_round_trips() {
         let (flags, skipped) = super::from_text("VICTORY_A=1\n# VICTORY_B=x\n\nnot a flag\n# a comment\nVICTORY_A=2");

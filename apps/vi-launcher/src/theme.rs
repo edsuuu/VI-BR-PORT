@@ -378,9 +378,17 @@ pub fn gradient_button(ui: &mut Ui, text: &str, size: Vec2, font: FontId, icon: 
     let rect = rect.translate(vec2(0.0, lift));
     gradient_polygon(painter, &rounded_points(rect, r), rect, &stops, false);
     let ink = if off { colour("textMuted") } else { colour("onAccent") };
-    let galley = painter.layout_no_wrap(text.to_owned(), font, ink);
     let icon_w = if icon { num("layout", "iconPlay") } else { 0.0 };
     let gap = if icon { 16.0 } else { 0.0 };
+    // A longer text than the button was sized for gets a smaller font, never
+    // runs past its sides.
+    let mut font = font;
+    let mut galley = painter.layout_no_wrap(text.to_owned(), font.clone(), ink);
+    let room = rect.width() - 2.0 * 28.0 - icon_w - gap;
+    if galley.size().x > room && room > 0.0 {
+        font.size *= room / galley.size().x;
+        galley = painter.layout_no_wrap(text.to_owned(), font, ink);
+    }
     let total = icon_w + gap + galley.size().x;
     let x0 = rect.center().x - total / 2.0;
     if icon {

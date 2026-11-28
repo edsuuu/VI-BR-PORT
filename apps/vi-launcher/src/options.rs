@@ -98,6 +98,12 @@ fn base() -> &'static Base {
     BASE.get_or_init(|| serde_json::from_str(BASE_JSON).expect("apps/vi-launcher/base.json"))
 }
 
+/// The switches every run starts from (base.json, scripts/play.ps1's list), in
+/// name order: what the flags box shows before the player's own changes.
+pub fn base_flags() -> Vec<(String, String)> {
+    base().base.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+}
+
 pub const GROUPS: &[&str] = &["profile", "image", "light", "performance", "diagnostics"];
 
 /// Options this launcher does not show: the preparing steps' threads and the

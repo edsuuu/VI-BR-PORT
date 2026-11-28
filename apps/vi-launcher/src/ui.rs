@@ -160,7 +160,7 @@ impl App {
             bindings_note: None,
             tray: None,
         };
-        app.flags_text = flags::to_text(&app.config.flags);
+        app.flags_text = flags::with_base(&app.config.flags, &options::base_flags());
         if app.config.updates_on() {
             app.check_updates(ctx);
         }
@@ -1112,7 +1112,7 @@ impl App {
             ui.add(
                 egui::TextEdit::multiline(&mut self.flags_text)
                     .hint_text("VICTORY_RT_QUERY=a0")
-                    .desired_rows(6)
+                    .desired_rows(14)
                     .desired_width(f32::INFINITY)
                     .font(egui::TextStyle::Monospace)
                     .margin(vec2(10.0, 10.0)),
@@ -1120,9 +1120,9 @@ impl App {
             ui.horizontal(|ui| {
                 if theme::outline_button(ui, &text::get(lang, "flags.save"), None, false).clicked() {
                     let (parsed, skipped) = flags::from_text(&self.flags_text);
-                    self.config.flags = parsed;
+                    self.config.flags = flags::without_base(parsed, &options::base_flags());
                     self.save();
-                    self.flags_text = flags::to_text(&self.config.flags);
+                    self.flags_text = flags::with_base(&self.config.flags, &options::base_flags());
                     self.flags_note = Some(if skipped == 0 {
                         text::fill(lang, "flags.saved", &[&self.config.flags.len().to_string()])
                     } else {
@@ -1145,39 +1145,26 @@ impl App {
             ui.label(theme::caption(&self.t("advanced.title")));
             ui.add_space(4.0);
 
-            let r = ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.set_min_height(h);
-                ui.label(theme::label(&text::get(lang, "advanced.language")));
-                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    for l in LANGUAGES.iter().rev() {
-                        if theme::segment(ui, &text::get(*l, "language.name"), *l == self.language, 170.0).clicked() {
-                            self.language = *l;
-                            self.config.language = Some(l.code().to_owned());
-                            self.save();
-                        }
+            // The same rows as every other setting: label on the left with room
+            // above and below, the controls on the right.
+            setting_row(ui, h, 360.0, &text::get(lang, "advanced.language"), "", "textSoft", |ui| {
+                for l in LANGUAGES.iter().rev() {
+                    if theme::segment(ui, &text::get(*l, "language.name"), *l == self.language, 170.0).clicked() {
+                        self.language = *l;
+                        self.config.language = Some(l.code().to_owned());
+                        self.save();
                     }
-                });
+                }
             });
-            theme::row_line(ui, r.response.rect);
-
-            let r = ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.set_min_height(h);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(theme::label(&text::get(lang, "advanced.updates_now")));
-                    if let Some((state, ink)) = self.update_state() {
-                        ui.add(egui::Label::new(theme::small(&state, ink).size(theme::type_size("caption"))).truncate());
-                    }
-                });
-                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    let checking = matches!(self.update, Update::Checking(_) | Update::Downloading { .. });
-                    let r = ui.add_enabled_ui(!checking, |ui| theme::outline_button(ui, &text::get(lang, "advanced.check_now"), None, false)).inner;
-                    if r.clicked() {
-                        self.check_updates(ctx);
-                    }
-                });
+            let (state, ink) = self.update_state().unwrap_or_default();
+            let checking = matches!(self.update, Update::Checking(_) | Update::Downloading { .. });
+            let mut check = false;
+            setting_row(ui, h, 190.0, &text::get(lang, "advanced.updates_now"), &state, if ink.is_empty() { "textMuted" } else { ink }, |ui| {
+                check = ui.add_enabled_ui(!checking, |ui| theme::outline_button(ui, &text::get(lang, "advanced.check_now"), None, false)).inner.clicked();
             });
-            theme::row_line(ui, r.response.rect);
+            if check {
+                self.check_updates(ctx);
+            }
 
             let before = ui.cursor().min;
             let mut on = self.config.updates_on();

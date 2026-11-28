@@ -126,3 +126,4 @@ mod tests {
         assert!(matches!(find_game_exe(dir.path()), Err(GameProblem::NotAnExe(_))));
     }
 }
+
