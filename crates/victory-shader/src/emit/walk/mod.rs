@@ -12,6 +12,8 @@
 //!   translation is then the same as without this module.
 
 mod cfg;
+#[cfg(all(test, windows))]
+mod query_tests;
 pub mod recognize;
 pub(crate) mod replace;
 
