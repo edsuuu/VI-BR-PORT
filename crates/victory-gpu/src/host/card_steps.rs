@@ -113,6 +113,26 @@ const BETWEEN: u64 = 4 << 20;
 /// The most steps of a submission done this way.
 const MOST: usize = 12288;
 
+/// Whether the buffer of each list of ours ([`Own`]) is kept for the run
+/// once made, so that the slots its steps make constant views of in title
+/// heaps need not hold it (`VICTORY_STEP_BUFFERS_KEPT=1`; off by default until measured in the game:
+/// each slot holds the buffer it shows, as before).
+///
+/// The lists and their buffers go back to [`POOL`] when they land and are
+/// never let go there, so a slot never shows freed memory either way. But
+/// each of the 11,000 slots a frame (a street) held the buffer it showed
+/// and let go of the one before, which the lists take in turn: an AddRef, a
+/// retirement under one lock that every thread making descriptors takes
+/// (`crate::host::retire_resource`) and a Release later, for each slot. In
+/// the opening that was most of the 2.4% of the submitting thread in
+/// `constant_at` (keep 2.0%, retire 1.9%, profile intro-s-pfabre), and its
+/// share on the threads beside. With the switch a buffer is kept by a
+/// reference of its own that is never given back, made with it.
+fn buffers_kept() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_STEP_BUFFERS_KEPT"))
+}
+
 /// How a fill's bytes get where its list reads them, if the card brings
 /// them.
 #[derive(Clone)]
@@ -844,7 +864,7 @@ impl Host {
                     && *index as usize / 4 % parts == part
                 {
                     // (A heap that is gone: nothing can read the slot.)
-                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32);
+                    crate::descriptor::constant_slot(*heap, *index, &own.between, gpu + op.at, op.len as u32, !buffers_kept());
                 }
             }
         });
@@ -871,6 +891,10 @@ impl Host {
         }
         let between = self.uav_buffer(BETWEEN)?;
         name(&between, || "copies of title memory on the card".into());
+        if buffers_kept() {
+            // Never given back: slots may show it for the rest of the run.
+            std::mem::forget(between.clone());
+        }
         let list = self.new_list().ok()?;
         Some(Own { list, between })
     }

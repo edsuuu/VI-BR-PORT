@@ -613,6 +613,41 @@ pub(crate) fn log_removal_context() {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Of the submissions sent ahead, since the last frame-rate line, in
+/// microseconds: the time ahead of their preparing (the submission lock, the
+/// steps done on the card planned, flights waited for, the heaps' records
+/// begun, the sweep), from their preparing's end to the flight handed back
+/// (the send, what is in the air noted), the flight put in the line and the
+/// waits behind it, and the landed lists given back; and how many went the
+/// whole way ([`lane_line`]).
+///
+/// Why: in the prison walk of 28 Nov the thread that prepares worked 35-45
+/// ms a frame (`queue::behind`'s line) of which the frame line's
+/// "preparing" was 20-30: the other 8-12 ms, growing with the draws, had
+/// no line of their own.
+static LANE_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The line of [`LANE_PARTS`], with the frame-rate lines. (Two clock reads
+/// a part, some 25 submissions a frame: nothing a frame would notice.)
+fn lane_line(frames: f64) {
+    let p: Vec<f64> = LANE_PARTS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64).collect();
+    if p.iter().all(|&n| n == 0.0) {
+        return;
+    }
+    let ms = |i: usize| p[i] / 1000.0 / frames;
+    tracing::info!(
+        "submissions sent ahead, the submitting thread's time per frame beside their preparing: {:.1} ms ahead of it (the lock, \
+         steps done on the card planned, flights waited for, the heaps' records begun, the sweep), {:.1} from its end to the \
+         flight handed back (the send, what is in the air noted), {:.1} putting the flight in the line and the waits behind it \
+         (the frame line's \"on the GPU\" among them), {:.1} giving landed lists back; {:.1} submissions",
+        ms(0),
+        ms(1),
+        ms(2),
+        ms(3),
+        p[4] / frames
+    );
+}
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -1128,6 +1163,145 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    /// Runs `list` (closed) on the host's queue and waits for it.
+    fn run_and_wait(host: &Host, list: &HostList) {
+        // SAFETY: a closed list of ours; a fence and event of the test's.
+        unsafe {
+            let fence: ID3D12Fence = host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            host.queue.ExecuteCommandLists(&[Some(list.list.cast().unwrap())]);
+            host.queue.Signal(&fence, 1).unwrap();
+            fence.SetEventOnCompletion(1, event).unwrap();
+            WaitForSingleObject(event, INFINITE);
+            let _ = windows::Win32::Foundation::CloseHandle(event);
+        }
+    }
+
+    /// A host list put away closed as it ran (`VICTORY_LIST_LAZY_RESET`):
+    /// emptied it runs nothing, as one put away reset and closed; reset it
+    /// records and runs as any. On the host's card (needs one; the switch is
+    /// not read, the calls are made directly).
+    #[test]
+    #[ignore = "uses the host's card: cargo test -p victory-gpu --lib rested -- --ignored --nocapture"]
+    fn a_rested_list_runs_empty_and_records_after_its_reset() {
+        let Some(host) = host() else {
+            return;
+        };
+        const N: usize = 256;
+        let (src, src_data) = host.shared_buffer(N as u64).unwrap();
+        let (dst, dst_data) = host.shared_buffer(N as u64).unwrap();
+        // SAFETY: both mapped for `N` bytes; the card is not using them
+        // between the runs below.
+        let (src_bytes, dst_bytes) =
+            unsafe { (std::slice::from_raw_parts_mut(src_data, N), std::slice::from_raw_parts_mut(dst_data, N)) };
+        let copy = |list: &HostList| {
+            // SAFETY: an open list; live buffers of `N` bytes.
+            unsafe { list.list.CopyBufferRegion(&dst, 0, &src, 0, N as u64) };
+        };
+        let list = host.new_list().unwrap();
+        // Not put away: nothing to do.
+        list.unrest();
+        assert!(!list.rested());
+        src_bytes.fill(0xAB);
+        dst_bytes.fill(0);
+        copy(&list);
+        list.close();
+        run_and_wait(host, &list);
+        assert!(dst_bytes.iter().all(|&b| b == 0xAB), "the copy ran");
+        // Put away as it ran, then run again before any reset: nothing.
+        list.rest();
+        assert!(list.rested());
+        dst_bytes.fill(0);
+        list.unrest();
+        assert!(!list.rested());
+        run_and_wait(host, &list);
+        assert!(dst_bytes.iter().all(|&b| b == 0), "an emptied list runs nothing");
+        // Put away again, and reset by whoever records next.
+        list.rest();
+        list.reset();
+        assert!(!list.rested());
+        src_bytes.fill(0xCD);
+        copy(&list);
+        list.close();
+        run_and_wait(host, &list);
+        assert!(dst_bytes.iter().all(|&b| b == 0xCD), "a list reset after its rest records and runs");
+    }
+
+    /// What a host list's cycle costs the thread that recycles and detaches
+    /// it, the old way (reset at its landing, closed empty when given to a
+    /// title's list, then the title's reset and close) and with
+    /// `VICTORY_LIST_LAZY_RESET` (put away closed: only the title's reset and
+    /// close). Prints microseconds a cycle; the title's reset and close are
+    /// not on the submitting thread, so the difference is what that thread
+    /// saves a list.
+    #[test]
+    #[ignore = "a measurement on the host's card: cargo test -p victory-gpu --release --lib list_cycle -- --ignored --nocapture"]
+    fn list_cycle_costs() {
+        let Some(host) = host() else {
+            return;
+        };
+        let (a, _) = host.shared_buffer(1 << 16).unwrap();
+        let (b, _) = host.shared_buffer(1 << 16).unwrap();
+        const LISTS: usize = 64;
+        const ROUNDS: usize = 20;
+        let lists: Vec<HostList> = (0..LISTS).map(|_| host.new_list().unwrap()).collect();
+        let record = |list: &HostList| {
+            // SAFETY: an open list; live buffers.
+            unsafe {
+                for _ in 0..16 {
+                    list.list.CopyBufferRegion(&b, 0, &a, 0, 1 << 16);
+                }
+            }
+            list.close();
+        };
+        let run_all = |lists: &[HostList]| {
+            for list in lists {
+                run_and_wait(host, list);
+            }
+        };
+        lists.iter().for_each(&record);
+        run_all(&lists);
+        // (submitting thread's part, whole cycle) in microseconds.
+        let mut old = (0u128, 0u128);
+        let mut new = (0u128, 0u128);
+        for _ in 0..ROUNDS {
+            let began = std::time::Instant::now();
+            let mut ours = std::time::Duration::ZERO;
+            for list in &lists {
+                let t = std::time::Instant::now();
+                list.reset();
+                list.close();
+                ours += t.elapsed();
+                list.reset();
+                record(list);
+            }
+            old.0 += ours.as_micros();
+            old.1 += began.elapsed().as_micros();
+            run_all(&lists);
+            let began = std::time::Instant::now();
+            let mut ours = std::time::Duration::ZERO;
+            for list in &lists {
+                let t = std::time::Instant::now();
+                list.rest();
+                ours += t.elapsed();
+                list.reset();
+                record(list);
+            }
+            new.0 += ours.as_micros();
+            new.1 += began.elapsed().as_micros();
+            run_all(&lists);
+        }
+        let per = |us: u128| us as f64 / (LISTS * ROUNDS) as f64;
+        eprintln!(
+            "a host list's cycle, us: reset at landing and closed empty {:.2} on the submitting thread ({:.2} with the title's reset, \
+             16 copies and close); put away closed {:.2} ({:.2})",
+            per(old.0),
+            per(old.1),
+            per(new.0),
+            per(new.1)
+        );
+    }
 }
 
 /// The batches of clamped records in one scratch buffer
@@ -1182,6 +1356,10 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// Put away after its run with its D3D12 list still closed as it ran
+    /// and not reset ([`HostList::rest`], [`lazy_reset`]): reset when it is
+    /// next recorded into, emptied if it is to run before that.
+    rested: std::sync::atomic::AtomicBool,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -1206,6 +1384,27 @@ type Prelude = (ID3D12CommandAllocator, ID3D12GraphicsCommandList);
 fn lazy_prelude() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_PRELUDE").is_none_or(|v| v != "0"))
+}
+
+/// Whether a host list that has run is put away for reuse with its D3D12
+/// list closed as it ran (`VICTORY_LIST_LAZY_RESET=1`; off by default: reset
+/// when it lands, as before).
+///
+/// Each host list went through two resets and two closes a cycle, one of
+/// each on the submitting thread for nothing: reset (allocator and list)
+/// when its submission landed (`crate::list::recycle`), closed empty when it
+/// was given to a title's list in place of the one a submission took
+/// (`crate::list::detach`), then reset by the title's own reset and closed by
+/// its close. With some 290 host lists a frame (the opening, thin lists) the
+/// detaching alone was 3.4% of the submitting thread and list resets 3.0%
+/// (profile intro-s-pfabre). With the switch the landing lets go of what the
+/// list held, as before, and leaves the D3D12 calls to the title's reset; a
+/// list that is to record before that (`crate::list::fresh_list`) is reset
+/// there, and one that is to run as it is (a title's list submitted again
+/// without a reset, [`Host::submit`]) is emptied first, as it was before.
+pub(crate) fn lazy_reset() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_LAZY_RESET").is_some_and(|v| v == "1"))
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -3676,6 +3875,7 @@ struct RelayFetch {
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
     crate::cores::keep_on_fast_cores("victory-relay");
+    crate::cores::raise_helper();
     let Some(host) = host() else {
         return;
     };
@@ -4012,14 +4212,18 @@ fn late_line(frames: f64) {
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
     crate::picked::log(frames);
+    send_thread::line(frames);
+    lane_line(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
-        let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
+        let [pages, runs, bytes, read, in_parts, missed] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
             "title bytes put in under flights' shader writes per frame (VICTORY_LATE_WAIT=2): {pages:.0} pages looked at, \
-             {runs:.0} changed runs, {:.2} MB",
-            bytes / (1 << 20) as f64
+             {runs:.0} changed runs, {:.2} MB; {:.2} MB of title memory read for them, {in_parts:.0} pages read in their \
+             written parts only (VICTORY_UNDER_PARTS=1), {missed:.1} whose parts left out a changed byte (VICTORY_UNDER_PARTS_CHECK=1)",
+            bytes / (1 << 20) as f64,
+            read / (1 << 20) as f64
         );
     }
 }
@@ -4034,6 +4238,7 @@ pub(crate) mod indirects;
 mod panel;
 mod place;
 mod send;
+mod send_thread;
 pub(crate) use send::{goes_as_words, words_under};
 #[cfg(feature = "diagnostics")]
 pub(crate) mod spans;
@@ -4455,6 +4660,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                rested: std::sync::atomic::AtomicBool::new(false),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -4841,6 +5047,8 @@ impl Host {
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     list.Close()?;
+                    // Behind what the thread that sends has (`VICTORY_SEND_THREAD`).
+                    send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -4967,6 +5175,8 @@ impl Host {
                         stamps.end(list, n);
                     }
                     list.Close()?;
+                    // Behind what the thread that sends has (`VICTORY_SEND_THREAD`).
+                    send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
                 })()
@@ -5270,6 +5480,8 @@ impl Host {
                     stamps.end(list, n);
                 }
                 list.Close()?;
+                // Behind what the thread that sends has (`VICTORY_SEND_THREAD`).
+                send_thread::wait_idle();
                 self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                 self.queue.Signal(&fence, value)?;
                 Ok(())
@@ -5577,9 +5789,19 @@ impl Host {
         let waiting = std::time::Instant::now();
         // The flights the fetch runs behind: those in the line by now have
         // been given to the queue. On the copy queue, those landed here.
+        // With `VICTORY_SEND_THREAD` a flight enters the line when it is
+        // handed to the thread that sends, not when that has put it on the
+        // queue: the target is read first and the thread waited for after,
+        // so every flight at or below it is on the queue by then (the other
+        // way round the fetch could claim to run behind a flight it overtook,
+        // and a landing would leave out what that one writes).
         let ahead = match copy_queue {
             Some(_) => 0,
-            None => line().target,
+            None => {
+                let target = line().target;
+                send_thread::wait_idle();
+                target
+            }
         };
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
@@ -5921,6 +6143,8 @@ impl Host {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
                     list.Close()?;
+                    // Behind what the thread that sends has (`VICTORY_SEND_THREAD`).
+                    send_thread::wait_idle();
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
                     *submitted += 1;
@@ -6049,6 +6273,7 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         };
+        let lined = std::time::Instant::now();
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
@@ -6091,8 +6316,12 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
+        let landing = std::time::Instant::now();
+        LANE_PARTS[2].fetch_add((landing - lined).as_micros() as u64, Ordering::Relaxed);
         let _landing = crate::timeline::span("landed lists reset and given back");
         land();
+        LANE_PARTS[3].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        LANE_PARTS[4].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -6339,10 +6568,17 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        let entered = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        let called = std::time::Instant::now();
+        let called = entered;
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
+        // A list put away closed as it ran ([`lazy_reset`]) runs empty, as one
+        // put away reset and closed did: a title may submit its list again
+        // without recording into it.
+        if lazy_reset() {
+            runs.iter().for_each(|list| list.unrest());
+        }
         // One submission at a time from preparation to copy-back: snapshots
         // and the ranges shaders write are per host copy, not per submission.
         let mut stage = crate::timeline::span("submit: the submission lock");
@@ -6427,6 +6663,9 @@ impl Host {
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
+        if late {
+            LANE_PARTS[0].fetch_add((started - entered).as_micros() as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         ahead.part(14);
         #[cfg(feature = "diagnostics")]
@@ -6585,19 +6824,17 @@ impl Host {
                 firsts.iter_mut().for_each(|first| *first += 1);
             }
             let cuts: Vec<usize> = parts.iter().filter_map(|&n| firsts.get(n).copied()).collect();
-            // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                let mut from = 0;
-                for to in cuts.into_iter().chain([lists.len()]) {
-                    self.queue.ExecuteCommandLists(&lists[from..to]);
-                    from = to;
-                }
-                self.queue.Signal(&self.fence, *submitted)
-            };
-            awake::sent(&self.device);
+            // The lists go to the queue and the fence is signalled behind
+            // them in `Job::run`, the same calls in the same order as they
+            // were made here; with `VICTORY_SEND_THREAD=1` on a thread of
+            // their own while this one goes on to the flight's bookkeeping
+            // (host/send_thread.rs: the flight goes into the line from here,
+            // under the submission lock, and its value is not completed until
+            // that thread has signalled it).
+            let job = send_thread::Job::new(std::mem::take(&mut lists), cuts, *submitted);
             #[cfg(feature = "diagnostics")]
-            crate::timeline::sent(sending, *submitted, stamp);
-            self.card_sent();
+            let job = job.timed(sending, stamp);
+            let signalled = send_thread::send(self, job);
             stage.next("submit: noting what is in the air");
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -6622,6 +6859,7 @@ impl Host {
                 texture_back_ranges,
                 writes,
             };
+            LANE_PARTS[1].fetch_add(prepared.elapsed().as_micros() as u64, Ordering::Relaxed);
             working(was_working);
             return Some((submitted, sent));
         }
@@ -6639,6 +6877,8 @@ impl Host {
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
         submitting(2, runs.len());
+        // After whatever was handed to the thread that sends (`VICTORY_SEND_THREAD`).
+        send_thread::wait_idle();
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
             let started = std::time::Instant::now();
@@ -7124,10 +7364,57 @@ impl HostList {
     /// Only after the list's last submission finished (every one is waited
     /// for).
     pub(crate) fn reset(&self) {
-        self.changed_something();
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         let _resetting = crate::timeline::span("resetting a host list");
+        self.let_go();
+        // SAFETY: the list is not executing.
+        let reset = unsafe {
+            self.allocator
+                .Reset()
+                .and_then(|()| self.list.Reset(&self.allocator, None))
+        };
+        if let Err(e) = reset {
+            fail(format_args!("a host command list did not reset ({e})"));
+        }
+        self.rested.store(false, Ordering::Release);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// As [`HostList::reset`] for what the list holds, its D3D12 list left
+    /// closed as it ran ([`lazy_reset`]). Only after the list's last
+    /// submission finished.
+    pub(crate) fn rest(&self) {
+        let _resting = crate::timeline::span("letting go of what a host list held");
+        self.let_go();
+        self.rested.store(true, Ordering::Release);
+    }
+
+    /// Whether the list was put away by [`HostList::rest`] and not reset
+    /// since: closed, its D3D12 list still holding the commands it ran.
+    pub(crate) fn rested(&self) -> bool {
+        self.rested.load(Ordering::Acquire)
+    }
+
+    /// A list put away by [`HostList::rest`] that is to run before any reset
+    /// (a title's list submitted again as it was): emptied, as a list put
+    /// away was before, so that it runs nothing. Nothing for another list.
+    pub(crate) fn unrest(&self) {
+        if !self.rested() {
+            return;
+        }
+        self.reset();
+        // SAFETY: our list, open and empty.
+        if let Err(e) = unsafe { self.list.Close() } {
+            fail(format_args!("an emptied host command list did not close ({e})"));
+        }
+    }
+
+    /// What [`HostList::reset`] lets go of on our side: the work and states
+    /// recorded, the scratch memory's place.
+    fn let_go(&self) {
+        self.changed_something();
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
@@ -7147,17 +7434,6 @@ impl HostList {
                 give_chunks(std::mem::take(&mut scratch.chunks));
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
-        };
-        if let Err(e) = reset {
-            fail(format_args!("a host command list did not reset ({e})"));
-        }
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
     /// Something changed in this list that bringing a draw's textures and
@@ -9590,8 +9866,11 @@ fn for_pieces(start: usize, len: usize, step: usize, mut f: impl FnMut(usize, us
 impl Host {
     /// The queue everything of ours runs on, for a call that must go to it
     /// in order with the lists (`crate::tiles`: a texture's levels are
-    /// given memory ahead of the list that uploads them).
+    /// given memory ahead of the list that uploads them). With
+    /// `VICTORY_SEND_THREAD` it is given once the lists handed to the thread
+    /// that sends are on it, so the call comes behind them as it did.
     pub(crate) fn queue(&self) -> &ID3D12CommandQueue {
+        send_thread::wait_idle();
         &self.queue
     }
 
@@ -10532,6 +10811,11 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
+            // The copy into the back buffer may be on the thread that sends
+            // (`VICTORY_SEND_THREAD`): Present goes to the same queue, behind
+            // it, or the copy would write a buffer the compositor holds
+            // (device removed, 0x887A002B).
+            send_thread::wait_idle();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
@@ -10702,6 +10986,11 @@ impl Host {
             // the picture it keeps.
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(first, D3D12_RESOURCE_STATES(first_state as i32));
+            // The copy into the back buffer may be on the thread that sends
+            // (`VICTORY_SEND_THREAD`): Present goes to the same queue, behind
+            // it, or the copy would write a buffer the compositor holds
+            // (device removed, 0x887A002B).
+            send_thread::wait_idle();
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             p.meter.frame(p.hwnd);
         }

@@ -284,9 +284,46 @@ fn fresh_list() -> Option<crate::host::HostList> {
         taken
     };
     match idle {
-        Some(Idle(list, _)) => Some(list),
+        Some(Idle(list, _)) => {
+            // Put away closed as it ran (`crate::host::lazy_reset`): reset
+            // here, where it is to record.
+            if list.rested() {
+                list.reset();
+            }
+            Some(list)
+        }
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
+}
+
+/// A host list closed and empty, for a title's list whose host side a
+/// submission took: the title's next call on it is a reset. One put away
+/// closed as it ran (`crate::host::lazy_reset`) is given as it is, and the
+/// title's reset is its only one; it runs nothing if submitted before that
+/// (`crate::host::HostList::unrest`).
+#[cfg(windows)]
+fn closed_list() -> Option<crate::host::HostList> {
+    if crate::host::lazy_reset() {
+        let rested = {
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            match idle.0.last() {
+                Some(Idle(list, _)) if list.rested() => {
+                    let taken = idle.0.pop();
+                    if let Some(Idle(_, bytes)) = &taken {
+                        idle.1 -= bytes;
+                    }
+                    taken
+                }
+                _ => None,
+            }
+        };
+        if let Some(Idle(list, _)) = rested {
+            return Some(list);
+        }
+    }
+    let fresh = fresh_list()?;
+    fresh.close();
+    Some(fresh)
 }
 
 /// The host sides of lists whose submission has run (submissions are
@@ -306,8 +343,13 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
-        // goes, its allocators stay.
-        host.reset();
+        // goes, its allocators stay. (With `crate::host::lazy_reset` the
+        // D3D12 reset is left to whoever records into it next.)
+        if crate::host::lazy_reset() {
+            host.rest();
+        } else {
+            host.reset();
+        }
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
@@ -426,12 +468,11 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // The title's next call on its list is a reset, which wants it
+        // closed.
+        let Some(fresh) = closed_list() else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
@@ -498,12 +539,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
+        // The title's next call on its list is a reset, which wants it
+        // closed.
+        let Some(fresh) = closed_list() else {
             continue;
         };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
