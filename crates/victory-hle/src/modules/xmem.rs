@@ -711,9 +711,11 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         };
         table.pages.insert(first + index * FRAMES, slice);
     }
+    let (next, held) = (table.next_page, table.pages.len());
     // Title memory is touched without our locks: a fault there may wait for
     // a mapping call, which takes them.
     drop(table);
+    pages_handed(n, next, held);
     for index in 0..n {
         // SAFETY: the title passes room for `n` page numbers.
         unsafe { pages.add(index).write(first + index * FRAMES) };
@@ -725,6 +727,58 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 /// 16: the title keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
+
+/// The numbers the title can keep: below this, `number >> 4` fits 21 bits.
+const TITLE_NUMBERS: usize = FRAMES << 21;
+
+/// The line of physical pages handed out (`VICTORY_XMEM_PAGES_LINE`, on by
+/// default; `=0` off): at an allocation, at most every 5 s, the pages given
+/// since the start, those held now, and the next page number against
+/// [`TITLE_NUMBERS`]. Numbers past that come back truncated from the title,
+/// and one may be a live page's: two of the title's addresses on the same
+/// memory (the suspect of the `+0x4e9b54a` crashes, `docs\agente-queda.md`).
+fn pages_line() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_XMEM_PAGES_LINE").is_none_or(|v| v != "0"))
+}
+
+/// Pages handed out since the start, and when the line last went (ms + 1).
+static HANDED: AtomicU64 = AtomicU64::new(0);
+static LINE_AT: AtomicU64 = AtomicU64::new(0);
+
+/// `n` pages were handed out; `next` is the next number, `held` the pages
+/// the title holds now.
+fn pages_handed(n: usize, next: usize, held: usize) {
+    let handed = HANDED.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+    if !pages_line() {
+        return;
+    }
+    if next > TITLE_NUMBERS {
+        static PAST: std::sync::Once = std::sync::Once::new();
+        PAST.call_once(|| {
+            tracing::warn!(
+                next = format_args!("{next:#x}"),
+                handed,
+                "physical page numbers pass the title's 21 bits: those it keeps from now on come back truncated \
+                 (VICTORY_XMEM_PAGES_LINE)"
+            );
+        });
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let now = START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1;
+    let at = LINE_AT.load(Ordering::Relaxed);
+    if at != 0 && now < at + 5000 || LINE_AT.compare_exchange(at, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return;
+    }
+    let first = 0x10_0000;
+    tracing::info!(
+        "physical pages handed out since the start (VICTORY_XMEM_PAGES_LINE): {handed} ({:.1} GiB), {held} held now ({:.1} \
+         GiB); next page number {next:#x}, the title keeps them below {TITLE_NUMBERS:#x} ({:.1} % used)",
+        handed as f64 * PAGE as f64 / (1u64 << 30) as f64,
+        held as f64 * PAGE as f64 / (1u64 << 30) as f64,
+        next.saturating_sub(first) as f64 * 100.0 / (TITLE_NUMBERS - first) as f64,
+    );
+}
 
 /// Pages still mapped stay readable through their views until unmapped.
 pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> BOOL {
@@ -2180,6 +2234,18 @@ mod tests {
         unsafe { at(3).cast::<u32>().write(7) };
         assert_eq!(XMemMapPhysicalPages(base, 4, std::ptr::null()), base);
         assert_eq!(XMemFreePhysicalPages(4, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn the_pages_handed_out_are_counted_against_the_title_s_21_bits() {
+        // The last number the title keeps whole, and the first it cannot.
+        assert_eq!((TITLE_NUMBERS - FRAMES) >> 4, (1 << 21) - 1);
+        assert_eq!(TITLE_NUMBERS >> 4 & 0x1f_ffff, 0);
+        let before = HANDED.load(Ordering::Relaxed);
+        let (mut count, mut pages) = (2usize, [0usize; 2]);
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()), 1);
+        assert!(HANDED.load(Ordering::Relaxed) >= before + 2);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
     #[test]
