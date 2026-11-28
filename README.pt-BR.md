@@ -8,7 +8,7 @@ Dois downloads, cada um com a sua release na [página de Releases](https://githu
 
 | O quê | Release | Arquivo | Dentro |
 |---|---|---|---|
-| **Launcher** | `v<versão>` | `VI-BR-PORT-<versão>-windows-x64.zip` | `vi-launcher.exe` |
+| **Launcher** | `v<versão>` | `VI-BR-PORT-<versão>-windows-x64.zip` | `ED_Launcher.exe` |
 | **Engine** | `engine-v<versão>` | `VIctory-<versão>-windows-x64.zip` | `victory.exe` |
 
 As releases que começam com `dev-` (`dev-v<versão>`, `dev-engine-v<versão>`) são builds de
@@ -16,10 +16,10 @@ teste, marcadas como pré-release; as sem prefixo são as estáveis.
 
 1. Tenha **a sua própria cópia do jogo** (a versão de Xbox Series): uma pasta com o
    `game_scarlett_master.exe`.
-2. Baixe as últimas releases do **launcher** e da **engine** e ponha o `vi-launcher.exe` e o
+2. Baixe as últimas releases do **launcher** e da **engine** e ponha o `ED_Launcher.exe` e o
    `victory.exe` na mesma pasta (em outro lugar também funciona: a engine se escolhe nas
    configurações do launcher).
-3. Abra o `vi-launcher.exe`.
+3. Abra o `ED_Launcher.exe`.
 4. Clique em **ESCOLHER PASTA DO JOGO** e escolha a pasta da sua cópia.
 5. Se a engine não estiver ao lado do launcher, o botão vira **ESCOLHER A ENGINE**: escolha o
    `victory.exe`.

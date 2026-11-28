@@ -8,7 +8,7 @@ Two downloads, each its own release on the [Releases page](https://github.com/ed
 
 | What | Release | File | Inside |
 |---|---|---|---|
-| **Launcher** | `v<version>` | `VI-BR-PORT-<version>-windows-x64.zip` | `vi-launcher.exe` |
+| **Launcher** | `v<version>` | `VI-BR-PORT-<version>-windows-x64.zip` | `ED_Launcher.exe` |
 | **Engine** | `engine-v<version>` | `VIctory-<version>-windows-x64.zip` | `victory.exe` |
 
 Releases whose names start with `dev-` (`dev-v<version>`, `dev-engine-v<version>`) are
@@ -16,10 +16,10 @@ test builds, marked as pre-releases; the plain ones are the stable builds.
 
 1. Have **your own copy of the game** (the Xbox Series build): a folder holding
    `game_scarlett_master.exe`.
-2. Download the latest **launcher** and **engine** releases and put `vi-launcher.exe` and
+2. Download the latest **launcher** and **engine** releases and put `ED_Launcher.exe` and
    `victory.exe` in the same folder (anywhere else works too: the launcher's settings choose
    the engine).
-3. Open `vi-launcher.exe`.
+3. Open `ED_Launcher.exe`.
 4. Click **CHOOSE THE GAME FOLDER** and pick the folder of your copy.
 5. If the engine is not next to the launcher, the button says **CHOOSE THE ENGINE**: pick
    `victory.exe`.

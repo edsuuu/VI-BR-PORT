@@ -318,7 +318,7 @@ pub fn unpack(archive: &Path, out: &Path) -> Result<(), UpdateError> {
 
 /// The launcher's own file name in a bundle.
 pub fn launcher_name() -> &'static str {
-    if cfg!(windows) { "vi-launcher.exe" } else { "vi-launcher" }
+    if cfg!(windows) { "ED_Launcher.exe" } else { "ED_Launcher" }
 }
 
 /// Puts an unpacked bundle in place of the installed one: every file but the

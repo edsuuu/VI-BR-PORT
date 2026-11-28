@@ -52,7 +52,7 @@ fn cli(args: &[String]) -> Result<(), String> {
     let language = text::Language::detect(None);
     match args[0].as_str() {
         "--version" | "-V" => {
-            println!("vi-launcher {}", update::current_version());
+            println!("ED_Launcher {}", update::current_version());
             Ok(())
         }
         "--check" => {
