@@ -44,6 +44,10 @@ pub struct Config {
     /// Mouse and keyboard drive the pad (VICTORY_MNK_BINDINGS).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse_keyboard: Option<bool>,
+    /// Another folder for the engine's translated shaders and made pipelines
+    /// than its own default (VICTORY_CACHE_DIR): one an engine already warmed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_dir: Option<String>,
     #[serde(flatten)]
     pub rest: Map<String, Value>,
 }
@@ -66,6 +70,7 @@ impl Default for Config {
             check_updates: None,
             fullscreen: None,
             mouse_keyboard: None,
+            cache_dir: None,
             rest: Map::new(),
         }
     }

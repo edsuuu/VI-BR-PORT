@@ -39,6 +39,12 @@ fn main() -> ExitCode {
         if !single::first(ui::TITLE) {
             return ExitCode::SUCCESS;
         }
+        // The settings' cache folder, for every step and the game (a path
+        // switch, kept from the launcher's own environment).
+        if let Some(dir) = config::load(&paths::config_path()).config.cache_dir.filter(|d| !d.trim().is_empty()) {
+            // SAFETY: set before any other thread starts.
+            unsafe { std::env::set_var("VICTORY_CACHE_DIR", dir.trim()) };
+        }
         return ui::start();
     }
     attach_console();
