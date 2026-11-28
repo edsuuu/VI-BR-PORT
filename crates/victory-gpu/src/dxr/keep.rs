@@ -18,8 +18,10 @@
 //!   recording of ours, in whatever list, makes it again first, from the
 //!   title memory as it is then (`super::native::record_on`), so that the
 //!   top levels after it name it;
-//! - when card memory is short, bottom levels no top level named for
-//!   [`EVICT_IDLE`] frames are let go, the least lately named first
+//! - bottom levels are no longer let go for being idle (`super::native`
+//!   sweeps only top levels); instead, when card memory is short, those no
+//!   top level named for [`EVICT_IDLE`] frames are let go, the least lately
+//!   named first
 //!   ([`evict`]), before a build is refused: what the top levels name now
 //!   wins over what they named long ago.
 //!

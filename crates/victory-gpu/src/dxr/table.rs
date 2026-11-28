@@ -244,9 +244,19 @@ impl<V: Version> Table<V> {
     }
 
     /// Takes out the destinations not used for `idle` frames before `frame`.
+    #[cfg(test)]
     pub(crate) fn sweep(&mut self, frame: u64, idle: u64) -> Vec<Entry<V>> {
-        let old: Vec<u64> =
-            self.entries.iter().filter(|(_, e)| e.last_used.saturating_add(idle) < frame).map(|(&k, _)| k).collect();
+        self.sweep_where(frame, idle, |_| true)
+    }
+
+    /// [`Table::sweep`] of the destinations `which` says may go.
+    pub(crate) fn sweep_where(&mut self, frame: u64, idle: u64, which: impl Fn(&Entry<V>) -> bool) -> Vec<Entry<V>> {
+        let old: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| e.last_used.saturating_add(idle) < frame && which(e))
+            .map(|(&k, _)| k)
+            .collect();
         old.into_iter().filter_map(|k| self.entries.remove(&k)).collect()
     }
 }
@@ -414,5 +424,15 @@ mod tests {
         assert_eq!(t.len(), 2);
         assert!(t.forget(0x2000).is_some());
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn a_sweep_may_take_only_the_top_levels() {
+        let mut t = Table::<Fake>::default();
+        t.built(0x1000, 0, Shape::Bottom(vec![tri(3)]), version(1), 1);
+        t.built(0x2000, 0, Shape::Top(1), version(2), 1);
+        let gone = t.sweep_where(300, 256, |e| e.shape.top());
+        assert_eq!(gone.len(), 1);
+        assert!(t.get(0x1000).is_some() && t.get(0x2000).is_none());
     }
 }

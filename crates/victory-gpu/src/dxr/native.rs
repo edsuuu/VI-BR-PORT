@@ -457,7 +457,15 @@ pub(crate) fn line() {
     }
     let swept = {
         let mut table = TABLE.lock().unwrap_or_else(|e| e.into_inner());
-        table.sweep(crate::frame::current(), IDLE).len() as u64
+        // With VICTORY_DXR_KEEP only top levels go for being idle: the pool's
+        // chunks stay made anyway, so letting idle bottom levels go gives no
+        // card memory back to the textures, and they would be made again (the
+        // m2a-expand-h2 run: some 4,500 let go through a stretch of frames
+        // whose top levels named a handful of instances, and 806 of 2,507
+        // instances named nothing after). They go when memory is short
+        // (`super::keep::evict`).
+        let bottoms = !super::keep::on();
+        table.sweep_where(crate::frame::current(), IDLE, |e| bottoms || e.shape.top()).len() as u64
     };
     add(C::Swept, swept);
     let frames = FRAMES.swap(0, Relaxed).max(1) as f64;
