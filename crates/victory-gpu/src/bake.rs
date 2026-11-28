@@ -170,6 +170,12 @@ pub(crate) fn count(sources: &Sources, past: &PastLine) -> u64 {
     n
 }
 
+/// The sources of one bake draw as its line gives them: `slot:KiB:outcome`,
+/// by commas (what the pass made of each: uploaded, same, refused, ...).
+pub(crate) fn each_text(each: &[(u32, u64, &str)]) -> String {
+    each.iter().map(|(slot, kib, what)| format!("{slot}:{kib}:{what}")).collect::<Vec<_>>().join(", ")
+}
+
 /// Whether a pass that served a bake draw's sources alone keeps the mark of
 /// the last full pass (`BAKE_SERVED` of `crate::draw`: the queue's writes
 /// then, plus one; 0, none served all): when the first of the writes that made
@@ -241,6 +247,15 @@ mod tests {
         assert_eq!(sources.missing(), 0);
         let sources = Sources { refused: 1, not_reached: 2, ..sources };
         assert_eq!(sources.missing(), 3);
+    }
+
+    #[test]
+    fn each_source_is_said_with_its_slot_size_and_outcome() {
+        assert_eq!(each_text(&[]), "");
+        assert_eq!(
+            each_text(&[(7_301, 344, "uploaded"), (12, 4, "REFUSED for room")]),
+            "7301:344:uploaded, 12:4:REFUSED for room"
+        );
     }
 
     #[test]

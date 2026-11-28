@@ -1075,6 +1075,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
+            // Into a kept decoration bake's result (`VICTORY_BAKE_KEEP`).
+            crate::bake_keep::copied_whole(list, dst, to);
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
@@ -1383,6 +1385,27 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        // A decoration bake's result: what the copy wrote is kept beside it
+        // (`VICTORY_BAKE_KEEP`; off by default).
+        if crate::bake_keep::on() && dst.kind != FOOTPRINT {
+            let from_desc = (src.kind != FOOTPRINT)
+                .then(|| crate::resource::host_resource(src.resource))
+                .flatten()
+                // SAFETY: a live resource.
+                .map(|t| unsafe { t.GetDesc() });
+            // SAFETY: the title's box or the cut one, live until here.
+            let given = host_box.map(|b| unsafe { b.read_unaligned() }).map(|b| [b.left, b.top, b.front, b.right, b.bottom, b.back]);
+            crate::bake_keep::copied(
+                list,
+                dst.resource,
+                to,
+                dst.footprint.offset as u32,
+                [x, y, z],
+                from_desc.as_ref(),
+                src.footprint.offset as u32,
+                given,
+            );
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);

@@ -297,6 +297,9 @@ fn finish(jobs: Vec<Arc<Job>>) {
         job.staging.note_held();
         job.copy.ahead.store(DONE, Relaxed);
         BYTES.fetch_sub(job.staging.read as u64, Relaxed);
+        // Over a decoration bake's result copied since it was claimed
+        // (`crate::bake_keep`, `VICTORY_BAKE_KEEP`).
+        crate::bake_keep::ahead_ran(job.copy.texture.as_raw() as usize);
     }
     {
         let mut way = ON_THEIR_WAY.lock().unwrap_or_else(|e| e.into_inner());

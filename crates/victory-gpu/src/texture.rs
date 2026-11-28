@@ -634,6 +634,8 @@ pub(crate) fn forget(resource: usize) {
     if let Some(through) = through.as_mut() {
         through.remove(&resource);
     }
+    drop(through);
+    crate::bake_keep::forget(resource);
 }
 
 /// Whether `resource`'s host copy takes its contents from title memory:
@@ -831,9 +833,14 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // again if it detiles (the next list then uploads once more).
     {
         let staging = staging.clone();
+        // (A decoration bake's result whose copy was in a list submitted
+        // before this one loses the bake here: `crate::bake_keep` puts it
+        // back, `VICTORY_BAKE_KEEP`.)
+        let (title, by) = (resource as usize, std::ptr::from_ref(list) as usize);
         list.defer_host(move || {
             staging.uploaded.store(true, Relaxed);
             staging.dirty.store(false, Relaxed);
+            crate::bake_keep::upload_runs(title, by);
         });
     }
     // A host copy that took the place of one with fewer levels: the slots
