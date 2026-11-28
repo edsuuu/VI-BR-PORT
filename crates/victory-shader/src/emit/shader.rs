@@ -17,7 +17,8 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
 /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// element of the buffer view at heap slot `i` (0: none or not a buffer),
+/// followed by the title addresses of the views at [`SLOT_VIEW_ADDRESSES_OFFSET`].
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
@@ -32,8 +33,10 @@ pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
 pub const VIEW_SIGNED: u32 = 1 << 30;
-/// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
+/// Number of heap slots with metadata in [`SLOT_STRIDES`].
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// Byte offset of the 64-bit title address for slot zero in [`SLOT_STRIDES`].
+pub const SLOT_VIEW_ADDRESSES_OFFSET: u32 = SLOT_STRIDES_COUNT * 4;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

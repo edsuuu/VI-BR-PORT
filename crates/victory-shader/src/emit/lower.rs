@@ -3399,6 +3399,55 @@ impl<'a> Lower<'a> {
         Some((lo, hi))
     }
 
+    /// A buffer descriptor selected from the view heap and decoded to a pointer in
+    /// 256-byte units. Masking the high dword and shifting the pair identifies the address
+    /// fields, even when no resource instruction names the view.
+    fn heap_view_address(&mut self, inst: &Inst, site: Site) -> Option<(V, V)> {
+        use super::shader::{SLOT_STRIDES, SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES_OFFSET};
+        let a = self.scalar.get(&site)?;
+        if self.x.native.layout.get(a.param)?.root != RootType::ResourceHeap {
+            return None;
+        }
+        let [(_, lo), (_, hi), ..] = inst.writes.as_slice() else { return None };
+        let instructions = || self.x.p.blocks.iter().flat_map(|b| &b.insts);
+        let masked_high = instructions().filter_map(|i| match &i.fields {
+            Fields::Sop { src, .. }
+                if i.name() == "s_and_b32"
+                    && i.reads.iter().any(|r| r.1 == *hi)
+                    && src.iter().any(|s| matches!(s, Operand::Literal(0xffff))) =>
+            {
+                i.writes.first().map(|w| w.1)
+            }
+            _ => None,
+        });
+        let address = |high| instructions().any(|i| match &i.fields {
+            Fields::Sop { src, .. } if i.name() == "s_lshr_b64" => matches!(src.as_slice(),
+                [Operand::Scalar { code, .. }, Operand::Const(136) | Operand::Literal(8)]
+                    if i.read(Reg::S(*code)) == Some(*lo) && i.read(Reg::S(*code + 1)) == Some(high)),
+            _ => false,
+        });
+        if !masked_high.into_iter().any(address) {
+            return None;
+        }
+
+        let slot = self.heap_index(site, 0, false).ok()?;
+        let limit = super::shader::view_heap_limit();
+        let limit = if limit == 0 { SLOT_STRIDES_COUNT } else { limit.min(SLOT_STRIDES_COUNT) };
+        let c = self.cur;
+        let (limit, zero) = (self.s.m.i32(limit), self.s.m.i32(0));
+        let valid = self.s.m.cmp(c, pred::IULT, slot, limit);
+        let safe = self.s.m.select(c, valid, slot, zero);
+        let shift = self.s.m.i32(3);
+        let byte = self.s.m.bin(c, Bin::Shl, safe, shift);
+        let base = self.s.m.i32(SLOT_VIEW_ADDRESSES_OFFSET);
+        let byte = self.s.m.bin(c, Bin::Add, byte, base);
+        let h = self.s.root_srv_handle(SLOT_STRIDES);
+        let words = self.raw_dwords(h, byte, 2);
+        let lo = self.s.m.select(c, valid, words[0], zero);
+        let hi = self.s.m.select(c, valid, words[1], zero);
+        Some((lo, hi))
+    }
+
     /// `lo`, `hi` plus the instruction's byte offset `off`, with the carry.
     fn address_plus(&mut self, lo: V, hi: V, off: i32) -> (V, V) {
         if off == 0 {
@@ -6866,9 +6915,11 @@ impl<'a> Lower<'a> {
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
             // from the host, the other dwords have no value.
-            if count <= 4
-                && let Some((lo, hi)) = self.view_address(site)
-            {
+            if let Some((lo, hi)) = match count {
+                1 | 2 => self.view_address(site),
+                4 => self.view_address(site).or_else(|| self.heap_view_address(inst, site)),
+                _ => None,
+            } {
                 for k in 0..count {
                     let reg = Reg::S(code + k as u8);
                     match k {
