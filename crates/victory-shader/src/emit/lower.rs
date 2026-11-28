@@ -1383,6 +1383,27 @@ thread_local! {
     pub(super) static TEST_DIV_FIXUP_ZERO_FIRST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+/// Whether a console wave of 64 run as two host waves of 32 in the halves form numbers its
+/// lanes by console lane where a lane asks which it is: a 64-bit mask read as a number (a
+/// select on an SGPR pair, a constant mask) gives each lane its own bit, lanes 32-63 the high
+/// dword's (`VICTORY_HALVES_LANE=1`). Off by default: the host lane, 0-31 in both host waves,
+/// as before, so the second host wave took the low dword's bits. Part of the translation: the
+/// shader cache keys on it.
+fn halves_console_lane() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_HALVES_LANE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALVES_LANE").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`halves_console_lane`], for its thread only.
+    pub(super) static TEST_HALVES_LANE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
@@ -4455,9 +4476,10 @@ impl<'a> Lower<'a> {
     }
 
     /// This thread's console lane (0..63): its relabelled thread index (`thread_id`), whose host
-    /// wave holds a 32-aligned run of console lanes. Without `exchange`: the host lane.
+    /// wave holds a 32-aligned run of console lanes. Without `exchange`: the host lane, also in
+    /// the halves form unless [`halves_console_lane`].
     fn console_lane(&mut self) -> V {
-        if self.exchange.is_none() {
+        if self.exchange.is_none() && !self.halves_by_console_lane() {
             return self.lane_index();
         }
         if let Some(v) = self.clane {
@@ -4471,6 +4493,13 @@ impl<'a> Lower<'a> {
         self.s.flags |= flags::WAVE_OPS;
         self.clane = Some(cl);
         cl
+    }
+
+    /// Whether this program is in the halves form (a console wave of 64 run as two host waves of
+    /// 32, numbered through `console_thread`) and its lanes are numbered by console lane for
+    /// [`Self::console_lane`] and [`Self::lane_bit`] ([`halves_console_lane`]).
+    fn halves_by_console_lane(&self) -> bool {
+        self.halves.is_some() && halves_console_lane()
     }
 
     /// A group barrier with an LDS fence in `block`.
@@ -4695,7 +4724,7 @@ impl<'a> Lower<'a> {
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         self.s.flags |= flags::WAVE_OPS;
-        let lane = if self.exchange.is_some() {
+        let lane = if self.exchange.is_some() || self.halves_by_console_lane() {
             self.console_lane()
         } else {
             self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])

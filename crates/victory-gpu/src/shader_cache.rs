@@ -90,6 +90,8 @@ fn build() -> [u8; 32] {
             "VICTORY_RT_MISS",
             // The order of `v_div_fixup_f32`'s special cases.
             "VICTORY_DIV_FIXUP_ZERO_FIRST",
+            // How a wave64 program in two host waves numbers its lanes.
+            "VICTORY_HALVES_LANE",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
