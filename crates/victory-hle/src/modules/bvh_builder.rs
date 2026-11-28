@@ -41,7 +41,8 @@ use victory_pe::ImportSymbol;
 
 use desc::{
     BATCHED, BUILD_DESC, Batched, BuildDesc, DEHYDRATED, Dehydrated, Geometry, INPUTS, INSTANCE,
-    Inputs, Instance, Memory, POSTBUILD, Postbuild, PrebuildInfo, Record, STREAM, Stream,
+    Inputs, Instance, Memory, POSTBUILD, Placement, Postbuild, PrebuildInfo, Record, STREAM,
+    Stream,
 };
 
 /// The DLL the title imports the builder from.
@@ -292,7 +293,18 @@ struct Seen {
     /// opaque triangle lists, other triangle lists, box lists, other kinds.
     built: [u64; 4],
     unpacked_geometries: [u64; 4],
+    /// The +60 word of the unpacked structures' shipped data
+    /// ([`Placement`]): none, rotated, centred, scaled, and another word
+    /// that changes nothing (one word can be rotated, centred and scaled).
+    /// That of built structures is written on the card and not seen here.
+    placements: [u64; 5],
+    /// How often each +60 word was seen (at most [`WORDS`] words).
+    words: HashMap<u32, u64>,
 }
+
+/// The +60 words told apart at most, and those the summary names.
+const WORDS: usize = 4096;
+const COMMON: usize = 8;
 
 /// The summary's period.
 const SAY_EVERY: Duration = Duration::from_secs(5);
@@ -357,21 +369,53 @@ impl Seen {
         self.bare += u64::from(geometries.is_empty());
         Self::kinds(&mut self.unpacked_geometries, geometries);
         match data {
-            Some(d) => self.shipped_invalid += u64::from(!d.valid()),
+            Some(d) => {
+                self.shipped_invalid += u64::from(!d.valid());
+                self.placed(d.placement);
+            }
             None => self.shipped_unread += 1,
         }
+    }
+
+    /// The histogram of the +60 word.
+    fn placed(&mut self, p: Placement) {
+        if p.none() {
+            self.placements[0] += 1;
+        } else {
+            self.placements[1] += u64::from(p.rotation() != 0);
+            self.placements[2] += u64::from(p.centred());
+            self.placements[3] += u64::from(p.scaled());
+            self.placements[4] += u64::from(p.identity());
+        }
+        if self.words.len() < WORDS || self.words.contains_key(&p.0) {
+            *self.words.entry(p.0).or_default() += 1;
+        }
+    }
+
+    /// The most common +60 words, most first.
+    fn common(&self) -> String {
+        let mut words: Vec<(u32, u64)> = self.words.iter().map(|(&w, &n)| (w, n)).collect();
+        words.sort_by_key(|&(w, n)| (std::cmp::Reverse(n), w));
+        let mut text = format!("{} distinct", words.len());
+        for (w, n) in words.into_iter().take(COMMON) {
+            let _ = write!(text, ", {w:#x} x{n}");
+        }
+        text
     }
 
     fn describe(&self) -> String {
         let [bo, bt, bb, bx] = self.built;
         let [uo, ut, ub, ux] = self.unpacked_geometries;
+        let [pn, pr, pc, ps, pi] = self.placements;
         format!(
             "dxr trace: since the start (VICTORY_DXR_TRACE): {} batched entries, {} with extension records, and {} prebuild \
              asks with them; records of kind 0 {}, kind 1 {}, kind 2 {}, other kinds {}; lists not a multiple of 16 {}, not \
              readable {}; the builder takes kind 1's instance count on {} top levels, a level on {} bottom levels, the mode \
              bit on {}; {} structures unpacked (shipped data not readable {}, BIT 24 CLEAR {}, no geometries named {}); \
              geometries built: {bo} opaque triangle lists, {bt} other triangle lists, {bb} box lists, {bx} of other kinds; \
-             unpacked: {uo} opaque triangle lists, {ut} other triangle lists, {ub} box lists, {ux} of other kinds",
+             unpacked: {uo} opaque triangle lists, {ut} other triangle lists, {ub} box lists, {ux} of other kinds; the +60 \
+             word of the unpacked: none (0x7f7f7f) {pn}, rotated {pr}, centred {pc}, scaled {ps}, another word that changes \
+             nothing {pi}; {}",
             self.entries,
             self.listed,
             self.prebuilds_listed,
@@ -388,6 +432,7 @@ impl Seen {
             self.shipped_unread,
             self.shipped_invalid,
             self.bare,
+            self.common(),
         )
     }
 }
@@ -982,6 +1027,37 @@ mod tests {
         let text = s.describe();
         assert!(
             text.contains("3 structures unpacked (shipped data not readable 1, BIT 24 CLEAR 1, no geometries named 1)"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_summary_holds_a_histogram_of_the_placement_word() {
+        let mut s = Seen::default();
+        let words = [
+            desc::NO_PLACEMENT,
+            desc::NO_PLACEMENT,
+            5 << 24,
+            1 << 31 | 0x7f_7f80,
+            1 << 30,
+            1 << 31 | 0x7f_7f7f,
+        ];
+        for word in words {
+            let d = Dehydrated {
+                first: desc::DEHYDRATED_BIT,
+                placement: Placement(word),
+                ..Dehydrated::default()
+            };
+            s.shipped(Some(&d), &[]);
+        }
+        // None, rotated, centred, scaled, placed but in effect none.
+        assert_eq!(s.placements, [2, 1, 1, 1, 1]);
+        let text = s.describe();
+        assert!(
+            text.contains(
+                "none (0x7f7f7f) 2, rotated 1, centred 1, scaled 1, another word that changes nothing 1; \
+                 5 distinct, 0x7f7f7f x2, 0x5000000 x1, 0x40000000 x1"
+            ),
             "{text}"
         );
     }
