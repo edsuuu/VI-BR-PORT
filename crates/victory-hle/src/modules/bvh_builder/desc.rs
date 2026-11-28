@@ -257,40 +257,54 @@ impl Stream {
 /// of the list in the builder skips the kinds it does not want among 0, 1
 /// and 2, takes the first record of the kind it wants, and stops at a
 /// record of any other kind. What each field does there (the builder's own
-/// switches, globals that nothing in its code writes, at zero):
+/// switches, globals that nothing in its code writes, at zero). The kinds
+/// are the GDK's three build parameter records (`..._PARAMS1/2/3`), whose
+/// fields it names; the names below say in our words what it gives them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Record {
-    /// Kind 0, the build's quality. `quality` (+8, a float): below 0 the
+    /// Kind 0 (`PARAMS1`), thresholds. `box16_inflation` (+8, a float): the
+    /// error a box may grow by when stored in 16-bit floats; below 0 the
     /// build flags choose it (0.0 with PREFER_FAST_TRACE and not
     /// MINIMIZE_MEMORY, 1.01 the other way round, 1.005 otherwise); above
     /// 10.0 on a bottom level with MINIMIZE_MEMORY it turns on a build mode
     /// bit (bit 9 of the build's flags word; the prebuild sizes with it).
-    /// Prebuild 0x180011b80, batched 0x18000cc00, which also keeps `factor`
-    /// (+4, a float, -1.0 without the record) and `bytes` (+0xc..+0xf) in the
-    /// build's record for the stages.
-    Quality {
-        factor: f32,
-        quality: f32,
-        bytes: [u8; 4],
+    /// Prebuild 0x180011b80, batched 0x18000cc00, which also keeps
+    /// `quad_join` (+4, a float: how much a box may grow for two adjacent
+    /// triangles to be paired; -1.0 without the record) and `treelet`
+    /// (+0xc..+0xf: the tree optimisation's first level, its levels, its
+    /// step between rounds and its limit of rounds) in the build's record
+    /// for the stages.
+    Thresholds {
+        quad_join: f32,
+        box16_inflation: f32,
+        treelet: [u8; 4],
     },
-    /// Kind 1, sizes. `instances` (+8): a top level without ALLOW_UPDATE
-    /// and with 2 or more instances is built for this many instead of
-    /// `NumDescs`, if it is not 0 (0x18000c780). `bytes[1]` (+0xd): the
-    /// level n of a bottom level, at most 15, which adds n²·0x90 bytes to
-    /// the result (the same as a shipped header's `(h >> 20 & 0xf)²·0x90`;
-    /// prebuild 0x180011b80, batched 0x18000cc00, which keeps n in bits
-    /// 10..13 of the build's flags word); 0 leaves the builder's default.
-    /// `bytes[2]` (+0xe): not 0 on a top level clears bit 0x40 of that word
-    /// (0x18000cc00). `bytes[0]` and `bytes[3]` are not read.
+    /// Kind 1 (`PARAMS2`), sizes. `instances` (+8, the instances the
+    /// builder allocates for): a top level without ALLOW_UPDATE and with 2
+    /// or more instances is built for this many instead of `NumDescs`, if
+    /// it is not 0 (0x18000c780). `bytes[1]` (+0xd): the k-DOP tessellation
+    /// factor N of a bottom level (`level` here), at most 15, which adds
+    /// N²·0x90 bytes to the result, the map of 2·N² apex points of 12 bytes
+    /// on each of the six cube faces (the same as a shipped header's
+    /// `(h >> 20 & 0xf)²·0x90`; prebuild 0x180011b80, batched 0x18000cc00,
+    /// which keeps N in bits 10..13 of the build's flags word); 0 leaves
+    /// the builder's default (no k-DOP). `bytes[2]` (+0xe): not 0 on a top
+    /// level turns off an experimental top-level optimisation, clearing bit
+    /// 0x40 of that word (0x18000cc00). `bytes[0]` (+0xc, the offline
+    /// builder's threads) and `bytes[3]` (+0xf, an automatic rotation of
+    /// bottom levels) are not read by this builder.
     Sizes { instances: u32, bytes: [u8; 4] },
-    /// Kind 2, the top level's extra instance slots. `extra` (+4): if not
-    /// 0xffffffff, the slots added to a top level without ALLOW_UPDATE and
-    /// with 2 or more instances; without it 35 % of the instances with
-    /// PREFER_FAST_TRACE and not MINIMIZE_MEMORY, else none (0x18000c820;
-    /// rebraid in GPURT's words [inf]). `words` (+8, +0xc): two values the
-    /// batched build keeps in the build's record (0x18000cc00; 0.2 and 0.75
-    /// without them). The prebuild skips this kind.
-    Slots { extra: u32, words: [u32; 2] },
+    /// Kind 2 (`PARAMS3`), the top level's instance splitting. `extra`
+    /// (+4): if not 0xffffffff, the extra instances made by splitting on a
+    /// top level without ALLOW_UPDATE and with 2 or more instances; without
+    /// it 35 % of the instances with PREFER_FAST_TRACE and not
+    /// MINIMIZE_MEMORY, else none (0x18000c820; rebraid in GPURT's words).
+    /// `split16` (+8) and `isolate` (+0xc), floats: the fraction split into
+    /// 16 and a surface-area ratio for isolating, which the batched build
+    /// keeps in the build's record (0x18000cc00; 0.2 and 0.75 without the
+    /// record, plausibly the builder's own values for the GDK's "internal
+    /// default" -1 and 0 [inf]). The prebuild skips this kind.
+    Split { extra: u32, split16: f32, isolate: f32 },
     /// Any other kind: the builder stops reading the list here.
     Other { kind: u32, words: [u32; 3] },
 }
@@ -304,18 +318,19 @@ impl Record {
         let word = |at| u32_at(b, at);
         let bytes = [b[12], b[13], b[14], b[15]];
         match word(0) {
-            0 => Record::Quality {
-                factor: f32_at(b, 4),
-                quality: f32_at(b, 8),
-                bytes,
+            0 => Record::Thresholds {
+                quad_join: f32_at(b, 4),
+                box16_inflation: f32_at(b, 8),
+                treelet: bytes,
             },
             1 => Record::Sizes {
                 instances: word(8),
                 bytes,
             },
-            2 => Record::Slots {
+            2 => Record::Split {
                 extra: word(4),
-                words: [word(8), word(12)],
+                split16: f32_at(b, 8),
+                isolate: f32_at(b, 12),
             },
             kind => Record::Other {
                 kind,
@@ -326,42 +341,38 @@ impl Record {
 
     pub fn kind(&self) -> u32 {
         match *self {
-            Record::Quality { .. } => 0,
+            Record::Thresholds { .. } => 0,
             Record::Sizes { .. } => 1,
-            Record::Slots { .. } => 2,
+            Record::Split { .. } => 2,
             Record::Other { kind, .. } => kind,
         }
     }
 
     pub fn describe(&self) -> String {
         match *self {
-            Record::Quality {
-                factor,
-                quality,
-                bytes,
+            Record::Thresholds {
+                quad_join,
+                box16_inflation,
+                treelet,
             } => format!(
-                "kind 0 quality {quality} (+4 {factor}, +c {:02x} {:02x} {:02x} {:02x})",
-                bytes[0], bytes[1], bytes[2], bytes[3]
+                "kind 0 box16 inflation {box16_inflation} quad join {quad_join} (treelet {:02x} {:02x} {:02x} {:02x})",
+                treelet[0], treelet[1], treelet[2], treelet[3]
             ),
             Record::Sizes { instances, bytes } => format!(
-                "kind 1 instances {instances} level {} (+c {:02x} +e {:02x} +f {:02x})",
+                "kind 1 instances {instances} k-DOP N {} (+c {:02x} +e {:02x} +f {:02x})",
                 bytes[1], bytes[0], bytes[2], bytes[3]
             ),
-            // Whether the builder takes +8 and +0xc as integers it converts
-            // or as floats is not clear from its decompiled code: both.
-            Record::Slots { extra, words } => format!(
-                "kind 2 extra slots {} (+8 {:#x}: {} or {}, +c {:#x}: {} or {})",
+            Record::Split {
+                extra,
+                split16,
+                isolate,
+            } => format!(
+                "kind 2 extra instances {} (split16 {split16}, isolate {isolate})",
                 if extra == u32::MAX {
                     "none".to_string()
                 } else {
                     extra.to_string()
                 },
-                words[0],
-                words[0] as i32,
-                f32::from_bits(words[0]),
-                words[1],
-                words[1] as i32,
-                f32::from_bits(words[1])
             ),
             Record::Other { kind, words } => format!(
                 "KIND {kind} (+4 {:#x} +8 {:#x} +c {:#x}): the builder stops reading here",
@@ -407,19 +418,20 @@ fn first(records: &[Record], kind: u32) -> Option<&Record> {
 pub struct Taken {
     /// Top level: the instances it builds for, `NumDescs` or kind 1's.
     pub instances: Option<u32>,
-    /// Top level: the extra instance slots.
+    /// Top level: the extra instances for splitting.
     pub extra: Option<u32>,
-    /// Bottom level: the level n (`None`: the builder's default, which
-    /// nothing in its code sets).
+    /// Bottom level: the k-DOP tessellation factor N (`None`: the
+    /// builder's default, which nothing in its code sets).
     pub level: Option<u32>,
-    pub quality: f32,
+    /// The 16-bit box inflation threshold.
+    pub box16_inflation: f32,
     /// Bottom level: the build mode bit kind 0 turns on.
     pub mode: bool,
 }
 
-/// The quality a build without a kind-0 record (or with one below 0) gets
-/// from its flags (0x180011b80, 0x18000cc00).
-fn default_quality(flags: u32) -> f32 {
+/// The 16-bit box inflation threshold a build without a kind-0 record (or
+/// with one below 0) gets from its flags (0x180011b80, 0x18000cc00).
+fn default_box16_inflation(flags: u32) -> f32 {
     match (flags & PREFER_FAST_TRACE != 0, flags & MINIMIZE_MEMORY != 0) {
         (true, false) => 0.0,
         (false, true) => 1.01,
@@ -441,7 +453,7 @@ pub fn taken(inputs: &Inputs, records: &[Record]) -> Taken {
             0
         } else {
             match first(records, 2) {
-                Some(&Record::Slots { extra: n, .. }) if n != u32::MAX => n,
+                Some(&Record::Split { extra: n, .. }) if n != u32::MAX => n,
                 _ if inputs.flags & (PREFER_FAST_TRACE | MINIMIZE_MEMORY) == PREFER_FAST_TRACE => {
                     (inputs.count as f32 * 0.35) as u32
                 }
@@ -455,37 +467,37 @@ pub fn taken(inputs: &Inputs, records: &[Record]) -> Taken {
     }
     // Only a value below 0 falls back (a NaN is kept, as the builder's
     // comparison has it).
-    let quality = match first(records, 0) {
-        Some(&Record::Quality { quality, .. })
-            if quality.partial_cmp(&0.0) != Some(std::cmp::Ordering::Less) =>
+    let box16_inflation = match first(records, 0) {
+        Some(&Record::Thresholds { box16_inflation, .. })
+            if box16_inflation.partial_cmp(&0.0) != Some(std::cmp::Ordering::Less) =>
         {
-            quality
+            box16_inflation
         }
-        _ => default_quality(inputs.flags),
+        _ => default_box16_inflation(inputs.flags),
     };
     Taken {
         instances,
         extra,
         level,
-        quality,
-        mode: !inputs.top() && inputs.flags & MINIMIZE_MEMORY != 0 && quality > 10.0,
+        box16_inflation,
+        mode: !inputs.top() && inputs.flags & MINIMIZE_MEMORY != 0 && box16_inflation > 10.0,
     }
 }
 
 impl Taken {
     pub fn describe(&self) -> String {
-        let mut text = format!("quality {}", self.quality);
+        let mut text = format!("box16 inflation {}", self.box16_inflation);
         if let Some(n) = self.instances {
             let _ = write!(text, ", {n} instances");
         }
         if let Some(n) = self.extra {
-            let _ = write!(text, " + {n} extra slots");
+            let _ = write!(text, " + {n} extra for splitting");
         }
         match self.level {
             Some(n) => {
-                let _ = write!(text, ", level {n} (+{} bytes)", n * n * 0x90);
+                let _ = write!(text, ", k-DOP N {n} (+{} bytes)", n * n * 0x90);
             }
-            None if self.instances.is_none() => text.push_str(", the default level"),
+            None if self.instances.is_none() => text.push_str(", the default k-DOP"),
             None => {}
         }
         if self.mode {
@@ -546,7 +558,8 @@ pub fn describe_extensions(stream: &Stream, records: Option<&[Record]>, inputs: 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Dehydrated {
     /// +0: [`DEHYDRATED_BIT`] set, or the whole call answers
-    /// `E_INVALIDARG`; bits 20..23 the level n.
+    /// `E_INVALIDARG`; bits 20..23 the k-DOP tessellation factor N (the
+    /// "level n" of [`Record::Sizes`]).
     pub first: u32,
     /// +0xc: what the leaf stage is dispatched over, 2048 a group (its
     /// leaves [inf]).
@@ -1371,13 +1384,13 @@ mod tests {
         ));
         assert_eq!(
             q,
-            Record::Quality {
-                factor: -1.0,
-                quality: 12.5,
-                bytes: [1, 2, 3, 4]
+            Record::Thresholds {
+                quad_join: -1.0,
+                box16_inflation: 12.5,
+                treelet: [1, 2, 3, 4]
             }
         );
-        // Kind 1: the instances at +8, the level in the byte at +0xd.
+        // Kind 1: the instances at +8, the k-DOP N in the byte at +0xd.
         let s = Record::parse(&record(1, 0xdead, 700, 0x0000_0900));
         assert_eq!(
             s,
@@ -1387,21 +1400,22 @@ mod tests {
             }
         );
         assert!(
-            s.describe().contains("instances 700 level 9"),
+            s.describe().contains("instances 700 k-DOP N 9"),
             "{}",
             s.describe()
         );
-        // Kind 2: the extra slots at +4 (0xffffffff: none).
+        // Kind 2: the extra instances at +4 (0xffffffff: none), two floats after.
         let x = Record::parse(&record(2, u32::MAX, 0x3e4c_cccd, 0x3f40_0000));
         assert_eq!(
             x,
-            Record::Slots {
+            Record::Split {
                 extra: u32::MAX,
-                words: [0x3e4c_cccd, 0x3f40_0000]
+                split16: 0.2,
+                isolate: 0.75
             }
         );
         assert!(
-            x.describe().contains("extra slots none"),
+            x.describe().contains("extra instances none (split16 0.2, isolate 0.75)"),
             "{}",
             x.describe()
         );
@@ -1455,7 +1469,7 @@ mod tests {
         assert!(text.contains("SIZE NOT A MULTIPLE OF 16"), "{text}");
         assert!(text.contains("KIND 9"), "{text}");
         // Kind 1 lies after the unknown kind: the builder never sees it.
-        assert!(text.contains("10 instances + 5 extra slots"), "{text}");
+        assert!(text.contains("10 instances + 5 extra for splitting"), "{text}");
         assert_eq!(
             extensions(&memory, &Stream::default(), &Inputs::default()),
             "no extension records"
@@ -1471,42 +1485,42 @@ mod tests {
         // updated and has two or more (0x18000c780) ...
         let t = taken(&top(PREFER_FAST_TRACE, 100), &[sizes]);
         assert_eq!(t.instances, Some(300));
-        // ... with 35 % more slots for fast trace (0x18000c820) ...
+        // ... with 35 % more instances for splitting for fast trace (0x18000c820) ...
         assert_eq!(t.extra, Some(35));
         assert_eq!(t.level, None);
-        assert_eq!(t.quality, 0.0);
+        assert_eq!(t.box16_inflation, 0.0);
         // ... but not with ALLOW_UPDATE, nor with fewer than two.
         let u = taken(&top(ALLOW_UPDATE | PREFER_FAST_TRACE, 100), &[sizes]);
         assert_eq!((u.instances, u.extra), (Some(100), Some(0)));
         assert_eq!(taken(&top(0, 1), &[sizes]).instances, Some(1));
-        // Kind 2's slots win over the 35 %, unless 0xffffffff.
+        // Kind 2's extra instances win over the 35 %, unless 0xffffffff.
         let slots = Record::parse(&record(2, 7, 0, 0));
         assert_eq!(taken(&top(PREFER_FAST_TRACE, 100), &[slots]).extra, Some(7));
         let none = Record::parse(&record(2, u32::MAX, 0, 0));
         assert_eq!(taken(&top(PREFER_FAST_TRACE, 100), &[none]).extra, Some(35));
         assert_eq!(taken(&top(0, 100), &[none]).extra, Some(0));
 
-        // A bottom level takes the level at +0xd, at most 15 (0x180011b80).
+        // A bottom level takes the k-DOP N at +0xd, at most 15 (0x180011b80).
         assert_eq!(taken(&bottom(0), &[sizes]).level, Some(15));
         let three = Record::parse(&record(1, 0, 0, 0x0300));
         assert_eq!(taken(&bottom(0), &[three]).level, Some(3));
         assert!(
             taken(&bottom(0), &[three])
                 .describe()
-                .contains("level 3 (+1296 bytes)")
+                .contains("k-DOP N 3 (+1296 bytes)")
         );
         assert_eq!(taken(&bottom(0), &[]).level, None);
         assert_eq!(taken(&bottom(0), &[]).instances, None);
 
-        // Kind 0's quality, its defaults by flags, and the mode bit.
-        assert_eq!(taken(&bottom(0), &[]).quality, 1.005);
-        assert_eq!(taken(&bottom(MINIMIZE_MEMORY), &[]).quality, 1.01);
+        // Kind 0's box16 inflation threshold, its defaults by flags, and the mode bit.
+        assert_eq!(taken(&bottom(0), &[]).box16_inflation, 1.005);
+        assert_eq!(taken(&bottom(MINIMIZE_MEMORY), &[]).box16_inflation, 1.01);
         assert_eq!(
-            taken(&bottom(MINIMIZE_MEMORY | PREFER_FAST_TRACE), &[]).quality,
+            taken(&bottom(MINIMIZE_MEMORY | PREFER_FAST_TRACE), &[]).box16_inflation,
             1.005
         );
         let low = Record::parse(&record(0, 0, (-2.0f32).to_bits(), 0));
-        assert_eq!(taken(&bottom(PREFER_FAST_TRACE), &[low]).quality, 0.0);
+        assert_eq!(taken(&bottom(PREFER_FAST_TRACE), &[low]).box16_inflation, 0.0);
         let high = Record::parse(&record(0, 0, 11.0f32.to_bits(), 0));
         assert!(taken(&bottom(MINIMIZE_MEMORY), &[high]).mode);
         assert!(!taken(&bottom(0), &[high]).mode);
@@ -1514,7 +1528,7 @@ mod tests {
         let ten = Record::parse(&record(0, 0, 10.0f32.to_bits(), 0));
         assert!(!taken(&bottom(MINIMIZE_MEMORY), &[ten]).mode);
         // The first record of a kind is the one taken.
-        assert_eq!(taken(&bottom(0), &[ten, high]).quality, 10.0);
+        assert_eq!(taken(&bottom(0), &[ten, high]).box16_inflation, 10.0);
     }
 
     /// 64 bytes of shipped data: the first dword, the leaves at +0xc, a box
