@@ -647,10 +647,25 @@ impl Drop for Tiled {
 
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
-/// it started before it, shows as many levels fewer (clamped to the
-/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
-/// the effective minimum LOD stays at the same resource level.
+/// it started before it, and shows as many levels fewer (clamped to the
+/// remaining levels). `ResourceMinLODClamp` as [`min_lod_kept`] says.
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
+    show_from_as(desc, first, levels, min_lod_kept());
+}
+
+/// Whether a view [`show_from`] moves keeps its `ResourceMinLODClamp`,
+/// which counts from the resource's level 0, not from the view's first
+/// level (`VICTORY_MIN_LOD_KEEP=1`). Off by default: the clamp is lowered by
+/// the shift, as before, and the view can then show levels the title
+/// clamped away (a clamp of 5 on a view moved from level 0 to level 3 became
+/// 2, and levels 3 and 4 showed).
+fn min_lod_kept() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIN_LOD_KEEP").is_some_and(|v| v == "1"))
+}
+
+/// [`show_from`], the minimum level kept (`keep`) or lowered by the shift.
+fn show_from_as(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32, keep: bool) {
     if first >= levels {
         return;
     }
@@ -663,7 +678,7 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
         if *mips != u32::MAX {
             *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
         }
-        if *min_lod > 0.0 {
+        if !keep && *min_lod > 0.0 {
             *min_lod = (*min_lod - fewer as f32).max(0.0);
         }
     };
@@ -1264,10 +1279,12 @@ void look() {
         give_back(singles[1].1, &singles[1].2);
     }
 
-    /// (v) A view made by [`show_from`] of a texture whose level 0 has no
-    /// tiles returns level 1's colour for a sample at level 0; the view as
-    /// the title asked returns zero.
-    fn the_view_starts_at_the_first_level_with_tiles(rig: &mut Rig) -> Option<()> {
+    /// (v) A sample at level 0 through a view made by [`show_from_as`] of a
+    /// texture whose level 0 has no tiles, and through the view as the
+    /// title asked, both with the minimum level `min_lod` (`keep`: the moved
+    /// view keeps it, as `VICTORY_MIN_LOD_KEEP=1` has it). Each level reads
+    /// sixteen times its number plus one; level 0, without tiles, zero.
+    fn sample_resident_views(rig: &mut Rig, min_lod: f32, keep: bool) -> Option<[u32; 2]> {
         rig.step = "step 5, the view from the first level with tiles";
         let cs = compile(LOOK, s!("look"), s!("cs_5_1")).ok()?;
         let format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -1313,12 +1330,12 @@ void look() {
                         MostDetailedMip: 0,
                         MipLevels: u32::MAX,
                         PlaneSlice: 0,
-                        ResourceMinLODClamp: 0.0,
+                        ResourceMinLODClamp: min_lod,
                     },
                 },
             };
             let mut shown = as_asked;
-            show_from(&mut shown, tiled.first_shown()?, u32::from(LEVELS));
+            show_from_as(&mut shown, tiled.first_shown()?, u32::from(LEVELS), keep);
             assert_eq!(shown.Anonymous.Texture2D.MostDetailedMip, 1);
             let step = rig.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
             let mut at = views.GetCPUDescriptorHandleForHeapStart();
@@ -1355,14 +1372,15 @@ void look() {
             let mut data = std::ptr::null_mut();
             let range = D3D12_RANGE { Begin: 0, End: 16 };
             back.Map(0, Some(&range), Some(&mut data)).unwrap();
-            let read = std::slice::from_raw_parts(data.cast::<u32>(), 2).to_vec();
+            let read = data.cast::<[u32; 2]>().read();
             back.Unmap(0, None);
             read
         };
-        eprintln!("a sample at level 0: {} through the view from level 1, {} through the view as asked", read[0], read[1]);
-        assert_eq!(read[0], 32, "the view from the first level with tiles reads level 1");
-        assert_eq!(read[1], 0, "the view from level 0 reads a level without tiles");
-        Some(())
+        eprintln!(
+            "a sample at level 0, minimum level {min_lod}, kept {keep}: {} through the view from level 1, {} through the view as asked",
+            read[0], read[1]
+        );
+        Some(read)
     }
 
     fn a_full_card_keeps_new_levels_waiting(rig: &mut Rig) {
@@ -1451,8 +1469,17 @@ void look() {
         a_level_on_several_ranges(&mut rig);
         a_full_card_keeps_new_levels_waiting(&mut rig);
         a_claim_given_up_is_made_again(&mut rig);
-        if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
-            eprintln!("the view test's shader or objects could not be made; that part was skipped");
+        // The minimum level counts from the resource's level 0: kept, the
+        // moved view reads level 3 under a minimum of 3, as the view as
+        // asked does; lowered by the shift (as before), it reads level 2.
+        // Without a minimum, the moved view reads level 1 and the view as
+        // asked a level without tiles.
+        for (min_lod, keep, expected) in [(0.0, true, [32, 0]), (0.0, false, [32, 0]), (3.0, true, [64, 64]), (3.0, false, [48, 64])] {
+            let Some(read) = sample_resident_views(&mut rig, min_lod, keep) else {
+                eprintln!("the view test's shader or objects could not be made; that part was skipped");
+                break;
+            };
+            assert_eq!(read, expected, "minimum level {min_lod}, kept {keep}");
         }
         rig.step = "the end";
         rig.check("every step done");
@@ -1480,50 +1507,55 @@ void look() {
         assert_eq!(parse_floor(Some(&u64::MAX.to_string())), u64::MAX);
     }
 
+    /// The levels are clamped either way; the minimum level is lowered by the
+    /// shift (as before) or kept (`VICTORY_MIN_LOD_KEEP=1`), for 2D views and
+    /// 2D array views.
     #[test]
-    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
-        let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: 5768,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2D: D3D12_TEX2D_SRV {
-                    MostDetailedMip: 0,
-                    MipLevels: 12,
-                    PlaneSlice: 0,
-                    ResourceMinLODClamp: 3.5,
+    fn show_from_clamps_2d_and_2d_array_and_keeps_or_lowers_min_lod() {
+        for (keep, clamp_2d, clamp_arr) in [(false, 0.5, 0.0), (true, 3.5, 1.5)] {
+            let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: 5768,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 12,
+                        PlaneSlice: 0,
+                        ResourceMinLODClamp: 3.5,
+                    },
                 },
-            },
-        };
-        show_from(&mut srv2d, 3, 11);
-        // SAFETY: `ViewDimension` is `TEXTURE2D`.
-        let v2d = unsafe { srv2d.Anonymous.Texture2D };
-        assert_eq!(v2d.MostDetailedMip, 3);
-        // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
-        assert_eq!(v2d.MipLevels, 8);
-        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
+            };
+            show_from_as(&mut srv2d, 3, 11, keep);
+            // SAFETY: `ViewDimension` is `TEXTURE2D`.
+            let v2d = unsafe { srv2d.Anonymous.Texture2D };
+            assert_eq!(v2d.MostDetailedMip, 3);
+            // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
+            assert_eq!(v2d.MipLevels, 8);
+            assert_eq!(v2d.ResourceMinLODClamp, clamp_2d, "kept {keep}");
 
-        let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
-            Shader4ComponentMapping: 5768,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
-                    MostDetailedMip: 0,
-                    MipLevels: 6,
-                    FirstArraySlice: 0,
-                    ArraySize: 1,
-                    PlaneSlice: 0,
-                    ResourceMinLODClamp: 1.5,
+            let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+                Shader4ComponentMapping: 5768,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_SRV {
+                        MostDetailedMip: 0,
+                        MipLevels: 6,
+                        FirstArraySlice: 0,
+                        ArraySize: 1,
+                        PlaneSlice: 0,
+                        ResourceMinLODClamp: 1.5,
+                    },
                 },
-            },
-        };
-        show_from(&mut srv_arr, 2, 11);
-        // SAFETY: `ViewDimension` is `TEXTURE2DARRAY`.
-        let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
-        assert_eq!(varr.MostDetailedMip, 2);
-        assert_eq!(varr.MipLevels, 4);
-        assert_eq!(varr.ResourceMinLODClamp, 0.0);
+            };
+            show_from_as(&mut srv_arr, 2, 11, keep);
+            // SAFETY: `ViewDimension` is `TEXTURE2DARRAY`.
+            let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
+            assert_eq!(varr.MostDetailedMip, 2);
+            assert_eq!(varr.MipLevels, 4);
+            assert_eq!(varr.ResourceMinLODClamp, clamp_arr, "kept {keep}");
+        }
     }
 
     #[test]
