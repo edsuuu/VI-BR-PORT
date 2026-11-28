@@ -120,8 +120,35 @@ fn traced() -> bool {
     rtcalls::trace() != Trace::Off
 }
 
+/// One line, before the first import is bound, saying how the builder's
+/// imports will be bound and what the two switches held: the log of a run
+/// then shows that they reached the process (and that it runs this code)
+/// even if the title never calls its builder. Values other than those
+/// [`rtcalls::trace`] and `dxr::native` take leave them off, and so said.
+fn say_switches() {
+    let raw = |name| match std::env::var(name) {
+        Ok(v) => format!("{v:?}"),
+        Err(_) => "unset".to_string(),
+    };
+    tracing::info!(
+        "dxr: the title's imports of its structure builder are bound {} (VICTORY_DXR_TRACE {} = {:?}, \
+         VICTORY_DXR_NATIVE {} = {:?})",
+        if interposed() {
+            "through ours"
+        } else {
+            "as the title's own"
+        },
+        raw("VICTORY_DXR_TRACE"),
+        rtcalls::trace(),
+        raw("VICTORY_DXR_NATIVE"),
+        dxr::native(),
+    );
+}
+
 impl ImportResolver for Interpose<'_> {
     fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(say_switches);
         let found = self.inner.resolve(dll, symbol);
         if !dll.eq_ignore_ascii_case(BUILDER_DLL) || !interposed() {
             return found;
@@ -1110,6 +1137,8 @@ mod tests {
 
     #[test]
     fn without_the_switch_the_imports_are_bound_as_before() {
+        // The start-up line says so whatever the switches hold.
+        say_switches();
         // The tests run without VICTORY_DXR_TRACE and VICTORY_DXR_NATIVE.
         if interposed() {
             return;
