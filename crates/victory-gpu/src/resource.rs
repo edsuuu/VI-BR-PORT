@@ -1406,7 +1406,19 @@ impl Held {
 #[cfg(windows)]
 impl Drop for Held {
     fn drop(&mut self) {
-        object::release_boxed::<Resource>(self.0);
+        if object::release_boxed::<Resource>(self.0) == 0 {
+            // The title let go of the texture while an alias copy held it:
+            // the case the pin is for (the copy read it before it was
+            // freed here). Said the first time and at each power of two.
+            static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = LAST.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(
+                    n,
+                    "the texture an alias copy read was released by the title while the copy held it: freed after the copy"
+                );
+            }
+        }
     }
 }
 
