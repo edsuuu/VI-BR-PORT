@@ -14,14 +14,33 @@ RTX 4060 Ti) on a **1080p monitor**.
 **This repository holds no files, code or assets of the game.** You need your own copy.
 Nothing here is connected with, or endorsed by, the game's developer or publisher.
 
-## Where it stands (2026-11-27)
+## Where it stands (2026-11-28)
 
 **Playable from the opening through Lucia's prologue in the prison** (the cell, the
 corridor, the common room, the counselor's office) **and on into the first open-world
 mission (the boat)**, with the player in control, on the Series S profile.
 
-**Video** (NVIDIA RTX 4060 Ti 8 GB, the prison walk with the frame rate on screen; recorded
-on 26 Nov, before the gains below): <https://youtu.be/HI7cEpJPhP4>
+**Current numbers** (RTX 4060 Ti 8 GB, 1920x1080, the title's upscaler, mode 6): about
+**27 to 30 fps walking in the prison** and **30 fps standing still**, with the card 87 to
+94% busy. One machine; the table below holds the dated measurements.
+
+### What players use: the profiles of `scripts\play.ps1`
+
+| Profile | What it is |
+|---|---|
+| (default) | the settings the numbers here were measured with: Series S, 1080p, upscaler mode 6, thin lists, ray tests answer "nothing hit" |
+| `-Safe` | without the newer, faster ways; the first thing to try when something is wrong |
+| `-RayTracing` | the title's own ray-traced indirect light (lit interiors), about a third slower; run `victory shaders` without `VICTORY_RT_MISS` first, the shaders are another translation |
+| `-MouseKeyboard` | mouse and keyboard drive the pad (WASD, the mouse for the camera); keys in `%LOCALAPPDATA%\victory\bindings.ini`, copied from the repository's `bindings.ini` the first time |
+
+Any setting can be changed for one run with `-More @{VICTORY_THIN='0'}`.
+
+### What is in this repository
+
+**Source only: no binaries and no game files.** You build it yourself and bring your own
+copy of the title. The one data exception is the BCPack format's constant tables
+(`crates/victory-formats/src/bcpack-tables.bin`, about 78 KB); see
+[docs/asset-policy.md](docs/asset-policy.md).
 
 ### Benchmark
 
@@ -64,8 +83,21 @@ The charts are drawn from the logs; this repository keeps no pictures of the gam
 than a hundred runs of 4 to 12 minutes), and one crash of the title itself, four minutes
 into a run on 27 Nov, whose cause is not found yet. Long sessions have not been measured.
 
+**Fixed:** the sky (light blocks on the clouds, the rectangle above the horizon by the
+bridge), the water (no whitish water by day) and the cell window's glass (it no longer draws
+over Lucia's hair and shoulder).
+
 **Known picture problems:**
 
+- **Texture confetti**: tiles of other textures on clothes and blue dots on beards in some
+  launches; a candidate cause is texture memory written through one address and read through
+  another. Not fixed.
+- **Noise on faces and tattoos** (see the decorations item below).
+- **Purple dots on trees**, and some distant trees in a neon green.
+- **No native ray tracing yet**: the default stands in for the indirect light, so interiors
+  are dark and flat. `-RayTracing` uses the title's own light, at a cost in frame rate.
+- A rare crash of the title itself on the way to the boat (about one run in ten, likelier
+  with the PC under load); the cause is not found yet.
 - **Decorations baked onto characters come out wrong in some launches**: coloured squares
   on clothes (the man's shorts in the opening's first shot) or on tattooed skin (the
   guard's arms in the prison). The title bakes them once, from textures it picks by index,
@@ -82,8 +114,8 @@ into a run on 27 Nov, whose cause is not found yet. Long sessions have not been 
 - 35 programs of lighting, shadows and fog are still translated approximately on 32-lane
   cards.
 
-Fixed since 26 Nov: the prison's common room (it was dark under the fog; it is readable
-now), textures refused for want of card memory that was in fact free, the window glass,
+Fixed since 26 Nov, besides the above: the prison's common room (it was dark under the
+fog; it is readable now), textures refused for want of card memory that was in fact free,
 the unlit boat and the black rectangles on the sea.
 
 ## What this fork adds
