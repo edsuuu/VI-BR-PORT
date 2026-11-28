@@ -9,6 +9,8 @@
 # -LowVram      for 6 GB cards (RTX 2060, RTX 3060 Laptop, GTX 1660): 720p, no texture pool,
 #               1 GB of title buffers on the card, textures one mip level down, 256 lists in
 #               flight (the pause menu ran out of card memory at 1080p). Warm the pipelines first.
+# -LowRam       for 16 GB PCs: smaller windows of title memory, no breadcrumbs (untested)
+# -InPlace      the card reads title memory in place, no PC copies (untested; try with -LowRam)
 # -More         other settings, or other values for these: -More @{VICTORY_THIN='0'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -16,6 +18,8 @@ param(
     [switch]$Safe,
     [switch]$RayTracing,
     [switch]$LowVram,
+    [switch]$LowRam,
+    [switch]$InPlace,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [ValidateSet('series-s', 'series-x')][string]$Console = 'series-s',
     [hashtable]$More = @{}
@@ -56,6 +60,17 @@ if ($LowVram) {
     # sampled textures: ~280 -> ~100 ms a frame on a GTX 1660 6 GB (Impre-visible/victory-gtx1660).
     $settings.VICTORY_CARD_BUFFERS_MB = '1024'; $settings.VICTORY_CARD_WINDOWS_MB = '256'
     $settings.VICTORY_TEXTURE_MIP_DROP = '1'
+}
+if ($LowRam) {
+    # 16 GB PCs (untested in the game): windows of title memory cut to what is asked (4.1 GB of PC
+    # memory shared with the card were 4 MiB-grid windows on an RTX 2060 run), no command-list
+    # breadcrumbs. Smaller caches come from VICTORY_LOW_RAM, on by itself at <= 20 GiB.
+    $settings.VICTORY_WINDOW_KB = '256'; $settings.VICTORY_WINDOW_TAILS = '1'; $settings.VICTORY_D3D12_DRED = '0'
+}
+if ($InPlace) {
+    # The card reads title memory where it is, no PC copy of its windows (up to ~3.7 GB less on
+    # 16 GB, untested). The probe says in the log whether the driver takes it.
+    $settings.VICTORY_INPLACE_PROBE = '1'; $settings.VICTORY_INPLACE = '1'
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
