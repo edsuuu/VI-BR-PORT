@@ -713,8 +713,34 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
     }
     0
 }
-extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
-    front(this).put(BARRIER_GROUPS, &[u64::from(count)]);
+extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
+    // What the groups say of unordered access, read now: they are the
+    // title's, gone by the time the list is replayed (`VICTORY_GROUP_WAITS`
+    // goes by it there).
+    // SAFETY: the title's groups, for this call.
+    let writes = unsafe { super::group_writes(groups, count) };
+    front(this).put(BARRIER_GROUPS, &[groups_word(count, writes)]);
+}
+
+/// The recorded word of a barrier-groups call: the count, and above it what
+/// the groups say of unordered access.
+fn groups_word(count: u32, writes: super::GroupWrites) -> u64 {
+    let code: u64 = match writes {
+        super::GroupWrites::Ended => 0,
+        super::GroupWrites::Begun => 1,
+        super::GroupWrites::Other => 2,
+    };
+    u64::from(count) | code << 32
+}
+
+/// [`groups_word`] read back.
+fn word_groups(word: u64) -> (u32, super::GroupWrites) {
+    let writes = match word >> 32 {
+        1 => super::GroupWrites::Begun,
+        2 => super::GroupWrites::Other,
+        _ => super::GroupWrites::Ended,
+    };
+    (word as u32, writes)
 }
 extern "system" fn viewports(this: This, count: u32, items: *const D3D12_VIEWPORT) {
     let count = if items.is_null() { 0 } else { count };
@@ -886,7 +912,10 @@ fn translate(list: This, stream: &[u64], left: impl Fn() -> bool) -> (u64, bool)
             BARRIER => {
                 super::barrier(list, n as u32, at_or(w, 1));
             }
-            BARRIER_GROUPS => super::barrier_groups(list, n as u32, std::ptr::null()),
+            BARRIER_GROUPS => {
+                let (count, writes) = word_groups(w[0]);
+                super::barrier_groups_read(list, count, writes);
+            }
             VIEWPORTS => state::viewports(list, n as u32, at(w, 1, n)),
             SCISSORS => state::scissors(list, n as u32, at(w, 1, n)),
             BLEND_FACTOR => state::blend_factor(list, at(w, 1, n)),
@@ -1029,6 +1058,33 @@ mod tests {
 
     /// The pipeline the tests take for one of the bake's.
     pub(super) const BAKE: This = 0x1000 as This;
+
+    /// What the title's barrier groups say of unordered access outlives
+    /// them: read when recorded, the same when replayed.
+    #[test]
+    fn barrier_groups_keep_what_they_say() {
+        use super::super::GroupWrites;
+        // One buffer barrier (40 bytes; sync before, sync after, access
+        // before, access after first), as the PC's `D3D12_BARRIER_GROUP`.
+        let said = |before: u32, after: u32| {
+            let mut barrier = [0u32; 10];
+            barrier[2] = before;
+            barrier[3] = after;
+            let group = super::super::Group { kind: 2, count: 1, barriers: barrier.as_ptr().cast() };
+            // SAFETY: one group of one barrier, alive for the call.
+            let writes = unsafe { super::super::group_writes(std::ptr::from_ref(&group).cast(), 1) };
+            word_groups(groups_word(1, writes))
+        };
+        const UNORDERED: u32 = 0x10;
+        const SHADER_RESOURCE: u32 = 0x20;
+        assert_eq!(said(UNORDERED, SHADER_RESOURCE), (1, GroupWrites::Ended));
+        assert_eq!(said(SHADER_RESOURCE, UNORDERED), (1, GroupWrites::Begun));
+        assert_eq!(said(SHADER_RESOURCE, 0x8), (1, GroupWrites::Other));
+        // No groups: not understood, so a wait (as before).
+        // SAFETY: none are read.
+        let none = unsafe { super::super::group_writes(std::ptr::null(), 3) };
+        assert_eq!(word_groups(groups_word(3, none)), (3, GroupWrites::Ended));
+    }
 
     /// What the tests' translation saw: the value of each `TOPOLOGY` call,
     /// and whether the title's thread translated it.

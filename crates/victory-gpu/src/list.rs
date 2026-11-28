@@ -2531,9 +2531,27 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
     // SAFETY: the title's groups, for this call.
     #[cfg(windows)]
     let writes = unsafe { group_writes(groups, count) };
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if count > 0 {
+        // SAFETY: as above.
+        unsafe { group_barriers(groups, count, crate::copystat::group_barrier) };
+    }
+    #[cfg(windows)]
+    barrier_groups_read(this, count, writes);
+    #[cfg(not(windows))]
+    let _ = (this, count, groups);
+}
+
+/// [`barrier_groups`] once the groups are read: what thin lists
+/// (`list::thin`) record, since the title's groups are gone when they are
+/// replayed. They used to replay no groups at all, which reads as
+/// [`GroupWrites::Ended`]: every group waited for every earlier shader write
+/// whatever `VICTORY_GROUP_WAITS` said.
+#[cfg(windows)]
+pub(crate) fn barrier_groups_read(this: This, count: u32, writes: GroupWrites) {
     // Diagnostics: counted by what they say, and left out under
     // `VICTORY_BARRIER_TEST=groups`.
-    #[cfg(all(windows, feature = "diagnostics"))]
+    #[cfg(feature = "diagnostics")]
     if count > 0 {
         use crate::copystat::C;
         crate::copystat::add(C::WaitsForGroups, 1);
@@ -2545,13 +2563,10 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
             },
             1,
         );
-        // SAFETY: as above.
-        unsafe { group_barriers(groups, count, crate::copystat::group_barrier) };
         if crate::copystat::barrier_test() & 1 != 0 {
             return;
         }
     }
-    #[cfg(windows)]
     if count > 0
         && let Some(list) = host_list(this)
     {
@@ -2565,8 +2580,6 @@ extern "system" fn barrier_groups(this: This, count: u32, groups: *const u8) {
         // SAFETY: an open list.
         unsafe { list.list.ResourceBarrier(&[barrier]) };
     }
-    #[cfg(not(windows))]
-    let _ = (this, count, groups);
 }
 
 /// The bottom-of-pipe value writes `(address, value, flush, flags)`, 32 and
