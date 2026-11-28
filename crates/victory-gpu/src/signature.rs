@@ -76,6 +76,60 @@ pub(crate) fn layout<'a>(this: This) -> Option<(u32, &'a [[u32; 4]])> {
     Some((s.stride, &s.arguments))
 }
 
+
+/// The console's own indirect argument types (`D3D12XBOX_INDIRECT_ARGUMENT_TYPE_*`)
+/// by number, for the logs. The title's signatures seen so far hold one
+/// argument of type 0, 1, 2, 10 or 105 each; the others are not run.
+pub(crate) fn console_kind(kind: u32) -> Option<&'static str> {
+    Some(match kind {
+        100 => "padding",
+        101 => "primitive topology",
+        102 => "descriptor table",
+        103 => "pipeline state",
+        104 => "dispatch with flags (DispatchX)",
+        105 => "single-pass dispatch (DispatchL2)",
+        106 => "binning batch break",
+        107 => "mesh dispatch (DispatchMeshX)",
+        108 => "pipeline flush",
+        109 => "compute launch parameters",
+        _ => return None,
+    })
+}
+
+/// Which of a signature's arguments the host cannot run, named, for the log
+/// of a dropped execution (empty if every type is one it runs on its own).
+pub(crate) fn not_run(arguments: &[[u32; 4]]) -> String {
+    let mut named = Vec::new();
+    for [kind, ..] in arguments {
+        if let Some(name) = console_kind(*kind)
+            && *kind != 105
+        {
+            named.push(format!("{kind} {name}"));
+        }
+    }
+    if arguments.len() > 1 {
+        named.push(format!("{} arguments in one record", arguments.len()));
+    }
+    named.join(", ")
+}
+
+/// The dispatch flags of a single-pass dispatch (type 105) that the host
+/// cannot honour: counts in threads (`USE_THREAD_DIMENSIONS`, 0x20) would
+/// need the program's group size to divide by, which the host's indirect
+/// dispatch does not have.
+pub(crate) fn dispatch_flags_unmet(flags: u32) -> u32 {
+    flags & 0x20
+}
+
+/// Whether a type-105 signature with flags the host cannot honour is
+/// refused instead of run with its counts taken as groups:
+/// `VICTORY_INDIRECT_FLAGS_STRICT=1`, default off (the title's signatures
+/// seen so far carry no flags).
+pub(crate) fn flags_strict() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_FLAGS_STRICT").is_some_and(|v| v == "1"))
+}
+
 extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
     let found = object::is(iid, &SIGNATURE_IIDS).then_some(this);
     object::answer(COMMAND_SIGNATURE, iid, found, out)
@@ -292,5 +346,21 @@ mod tests {
             E_NOINTERFACE
         );
         assert!(signature.is_null());
+    }
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::*;
+
+    #[test]
+    fn console_argument_types_are_named_and_single_pass_alone_is_run() {
+        assert_eq!(not_run(&[[105, 0, 0, 0]]), "");
+        assert_eq!(not_run(&[[2, 0, 0, 0]]), "");
+        let named = not_run(&[[103, 0, 0, 0], [104, 0, 0, 0]]);
+        assert!(named.contains("103 pipeline state") && named.contains("104 dispatch"));
+        assert!(named.contains("2 arguments in one record"));
+        assert_eq!(dispatch_flags_unmet(0x8008 | 0x20), 0x20);
+        assert_eq!(dispatch_flags_unmet(0x8000), 0);
     }
 }
