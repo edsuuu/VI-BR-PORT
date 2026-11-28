@@ -1249,7 +1249,7 @@ fn flags_seen(flags: u32) {
         tracing::warn!(
             flags = format_args!("{flags:#x}"),
             page,
-            "CopyPageMappingsBatchX: flags the headers do not define; those bits are ignored"
+            "page mappings: flags the headers do not define; those bits are ignored"
         );
     } else {
         tracing::info!(
@@ -1257,7 +1257,7 @@ fn flags_seen(flags: u32) {
             page,
             no_hazard = flags & NO_HAZARD != 0,
             pages_2mb = flags & PAGES_2MB != 0,
-            "CopyPageMappingsBatchX: flags seen for the first time (VICTORY_PAGE_MAP_FLAGS=0: ignored)"
+            "page mappings: flags seen for the first time (VICTORY_PAGE_MAP_FLAGS=0: ignored)"
         );
     }
 }
@@ -1350,6 +1350,53 @@ extern "system" fn copy_page_mappings(
     S_OK
 }
 
+/// Whether the one-batch page-mapping calls are made
+/// (`VICTORY_PAGE_MAP_SINGLE=0`: not implemented, as before). The headers
+/// put `CopyPageMappingsX` and `ClearPageMappingsX` just ahead of the batch
+/// call; no run's log has had the title call them (each would have logged
+/// "method not implemented" at queue slot 0xe8 or 0xf0), and the first call
+/// of each is logged.
+fn page_map_single() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_MAP_SINGLE").is_none_or(|v| v != "0"))
+}
+
+/// `CopyPageMappingsX(destination, count, ranges, pool, pool pages,
+/// flags)`: [`copy_page_mappings`] of one batch.
+extern "system" fn copy_page_mappings_one(
+    this: This,
+    destination: u64,
+    count: u32,
+    ranges: *const PageRange,
+    pool: u64,
+    pool_pages: u32,
+    flags: u32,
+) -> HRESULT {
+    if !page_map_single() {
+        return object::E_NOTIMPL;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::info!(count, flags = format_args!("{flags:#x}"), "the title calls CopyPageMappingsX"));
+    if ranges.is_null() && count > 0 {
+        return E_INVALIDARG;
+    }
+    let batch = PageBatch { destination, count, ranges };
+    copy_page_mappings(this, 1, &batch, pool, pool_pages, flags)
+}
+
+/// `ClearPageMappingsX(destination, pages, flags)`: the pages unmapped, as
+/// a range of unmapped pages of [`copy_page_mappings`].
+extern "system" fn clear_page_mappings(this: This, destination: u64, pages: u32, flags: u32) -> HRESULT {
+    if !page_map_single() {
+        return object::E_NOTIMPL;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::info!(pages, flags = format_args!("{flags:#x}"), "the title calls ClearPageMappingsX"));
+    let range = PageRange { kind: 2, start: 0, count: pages };
+    let batch = PageBatch { destination, count: 1, ranges: &range };
+    copy_page_mappings(this, 1, &batch, 0, 0, flags)
+}
+
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a description.
@@ -1360,22 +1407,24 @@ extern "system" fn desc(this: This, out: *mut QueueDesc) {
 /// The queue methods by their slot in older titles' queues (the 2020-era
 /// layout): IUnknown 3, object 4, device child 1, queue 26 (12 as on PC,
 /// then console ones).
-const METHODS: [(usize, *const ()); 15] = [
+const METHODS: [(usize, *const ()); 17] = [
     (0, query as *const ()),
     (2, release as *const ()),
-    (7, object::parent_device as *const ()), // 0x38
-    (10, execute as *const ()),              // 0x50
-    (11, marker as *const ()),               // 0x58 set marker
-    (12, marker as *const ()),               // 0x60 begin event
-    (13, marker as *const ()),               // 0x68 end event
-    (14, signal as *const ()),               // 0x70
-    (15, wait as *const ()),                 // 0x78
-    (16, timestamp_frequency as *const ()),  // 0x80
-    (26, desc as *const ()),                 // 0xd0
-    (29, copy_page_mappings as *const ()),   // 0xe8 page mapping batch
-    (30, present as *const ()),              // 0xf0
-    (33, execute_x as *const ()),            // 0x108
-    (32, signal2_x as *const ()),            // 0x100
+    (7, object::parent_device as *const ()),   // 0x38
+    (10, execute as *const ()),                // 0x50
+    (11, marker as *const ()),                 // 0x58 set marker
+    (12, marker as *const ()),                 // 0x60 begin event
+    (13, marker as *const ()),                 // 0x68 end event
+    (14, signal as *const ()),                 // 0x70
+    (15, wait as *const ()),                   // 0x78
+    (16, timestamp_frequency as *const ()),    // 0x80
+    (26, desc as *const ()),                   // 0xd0
+    (27, copy_page_mappings_one as *const ()), // 0xd8 page mappings, one batch
+    (28, clear_page_mappings as *const ()),    // 0xe0 page mappings cleared
+    (29, copy_page_mappings as *const ()),     // 0xe8 page mapping batch
+    (30, present as *const ()),                // 0xf0
+    (33, execute_x as *const ()),              // 0x108
+    (32, signal2_x as *const ()),              // 0x100
 ];
 
 /// Newer titles' queues have two more methods before Signal, which moved
@@ -1558,9 +1607,42 @@ mod tests {
     /// layout, where the title calls it (title+0xf2cc80).
     #[test]
     fn the_batch_call_is_where_the_headers_put_it() {
-        let ours = copy_page_mappings as *const ();
-        let (slot, _) = METHODS.iter().copied().find(|&(_, f)| f == ours).expect("in the table");
+        let at = |ours: *const ()| METHODS.iter().copied().find(|&(_, f)| f == ours).expect("in the table").0;
+        let slot = at(copy_page_mappings as *const ());
         assert_eq!(newer_slot(slot) * 8, 0xf8);
         assert_eq!(slot * 8, 0xe8);
+        // The one-batch calls just ahead of it.
+        assert_eq!(newer_slot(at(copy_page_mappings_one as *const ())) * 8, 0xe8);
+        assert_eq!(newer_slot(at(clear_page_mappings as *const ())) * 8, 0xf0);
+    }
+
+    /// The one-batch calls map as a batch of their own would.
+    #[test]
+    fn one_batch_page_mapping_calls_map_as_a_batch() {
+        static SEEN: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+        // Ours alone: no other test maps pages.
+        const AT: u64 = 0x7777_0000_0000;
+        fn record(to: u64, from: u64, len: u64) -> bool {
+            if (AT..AT + (1 << 32)).contains(&to) {
+                SEEN.lock().unwrap().push((to, from, len));
+            }
+            true
+        }
+        crate::resource::use_page_mapper(record);
+        if !page_map_single() {
+            return;
+        }
+        let ranges = [PageRange { kind: 0, start: 1, count: 2 }];
+        let pool = 0x20_0000_0000;
+        let this = std::ptr::null_mut();
+        assert_eq!(copy_page_mappings_one(this, AT, 1, ranges.as_ptr(), pool, 4, 0), S_OK);
+        assert_eq!(clear_page_mappings(this, AT + (1 << 30), 3, 0), S_OK);
+        assert_eq!(copy_page_mappings_one(this, AT, 1, std::ptr::null(), pool, 4, 0), E_INVALIDARG);
+        let page = page_bytes(PAGES_2MB);
+        assert_eq!(clear_page_mappings(this, AT + (2 << 30), 1, PAGES_2MB), S_OK);
+        assert_eq!(
+            *SEEN.lock().unwrap(),
+            [(AT, pool + PAGE, 2 * PAGE), (AT + (1 << 30), 0, 3 * PAGE), (AT + (2 << 30), 0, page)]
+        );
     }
 }
