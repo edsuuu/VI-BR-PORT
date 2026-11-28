@@ -113,6 +113,8 @@ pub(super) enum C {
     InstancesUnknown,
     /// Of them, in memory the CPU could not read at submission.
     InstancesUnreadable,
+    /// Instances whose flags held the console's own bits (taken off).
+    InstancesConsoleFlags,
     /// Data read from the copy shaders wrote where a draw would read another.
     ShadersCopy,
     /// Data outside title buffers with a page in an arena of by-address

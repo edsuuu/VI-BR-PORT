@@ -132,15 +132,28 @@ fn rewrite(instances: u64, count: usize, to: usize, top: &Arc<Structure>) {
     }
 }
 
+/// The instance flags (`+55`) Direct3D on the PC defines: no culling,
+/// counter-clockwise front faces, forced opaque, forced non-opaque. The
+/// console adds its own in bits 6-7 (hints to its builder to pull the
+/// bottom level up into the top level), bits the PC reserves.
+const HOST_INSTANCE_FLAGS: u8 = 0x0f;
+
 /// Each instance description of `out` names its bottom level by the
 /// address `usable` gives for the title's (and the handle that holds it);
 /// one `usable` has nothing for is made inactive: no structure, mask 0.
-/// The handles named (runs of the same one once), and how many were not.
+/// Each keeps only the instance flags the PC defines (those that held the
+/// console's own are counted). The handles named (runs of the same one
+/// once), and how many were not.
 fn rename<H: Clone>(out: &mut [u8], mut usable: impl FnMut(u64) -> Option<(u64, H)>) -> (Vec<H>, u64) {
     let mut named = Vec::new();
     let mut unknown = 0;
+    let mut console_flags = 0;
     let mut last: (u64, Option<(u64, H)>) = (u64::MAX, None);
     for d in out.chunks_exact_mut(INSTANCE) {
+        if d[55] & !HOST_INSTANCE_FLAGS != 0 {
+            d[55] &= HOST_INSTANCE_FLAGS;
+            console_flags += 1;
+        }
         let blas = u64::from_le_bytes(d[56..64].try_into().unwrap_or_default());
         if blas != last.0 {
             last = (blas, usable(blas));
@@ -157,6 +170,7 @@ fn rename<H: Clone>(out: &mut [u8], mut usable: impl FnMut(u64) -> Option<(u64, 
             }
         }
     }
+    add(C::InstancesConsoleFlags, console_flags);
     (named, unknown)
 }
 
@@ -197,5 +211,19 @@ mod tests {
         assert_eq!(&out[2 * INSTANCE + 48..2 * INSTANCE + 51], &[9, 0, 0]);
         assert_eq!(&out[INSTANCE + 52..INSTANCE + 56], &(3u32 | 0x04 << 24).to_le_bytes());
         assert_eq!(&out[0..4], &1f32.to_le_bytes());
+    }
+
+    #[test]
+    fn instances_keep_only_the_flags_the_pc_defines() {
+        let mut out = [instance(1, 0xff, 0x1000), instance(2, 0xff, 0x1000), instance(3, 0xff, 0x2000)].concat();
+        // The console's builder hints (0x40, 0x80, 0xc0) beside the PC's flags.
+        out[55] = 0xc5;
+        out[INSTANCE + 55] = 0x42;
+        out[2 * INSTANCE + 55] = 0x0f;
+        // Unknown bottom levels lose the console's bits too.
+        rename(&mut out, |blas| (blas == 0x1000).then_some((0xa_0000, ())));
+        assert_eq!([out[55], out[INSTANCE + 55], out[2 * INSTANCE + 55]], [0x05, 0x02, 0x0f]);
+        // The contribution below the flags is the title's.
+        assert_eq!(&out[52..55], &[3, 0, 0]);
     }
 }
