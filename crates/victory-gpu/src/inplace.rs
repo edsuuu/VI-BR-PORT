@@ -409,6 +409,27 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
     out
 }
 
+/// The bytes `[at, at + len)` at the other addresses that show the same
+/// physical pages ([`shown_elsewhere`]): `(address, bytes)` for each page
+/// and each other address, the part of the page the range covers.
+pub(crate) fn ranges_elsewhere(at: usize, len: usize) -> Vec<(usize, usize)> {
+    let end = at.saturating_add(len);
+    elsewhere_parts(at, end, &shown_elsewhere(at & !(K64 - 1), end))
+}
+
+/// [`ranges_elsewhere`] from what [`shown_elsewhere`] said of the pages.
+fn elsewhere_parts(at: usize, end: usize, shown: &[(usize, Vec<usize>)]) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    for (page, others) in shown {
+        let (from, to) = (at.max(*page), end.min(page + K64));
+        if from >= to {
+            continue;
+        }
+        out.extend(others.iter().map(|other| (other + (from - page), to - from)));
+    }
+    out
+}
+
 /// The address of the 64 KiB page shown at `page` in every title view that
 /// shows it, `page`'s own address included; empty if `page` is not a view.
 pub(crate) fn pages_of(page: usize) -> Vec<usize> {
@@ -1312,6 +1333,20 @@ pub(crate) fn tick() {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A write over the end of one page and the start of the next is told
+    /// at each other address of each page, for the part it covers there.
+    #[test]
+    fn a_write_is_found_at_the_other_addresses_of_its_pages() {
+        const K64: usize = 64 << 10;
+        let (a, b) = (0x10_0000_0000_usize, 0x20_0000_0000_usize);
+        let shown = vec![(a, vec![b, b + 8 * K64]), (a + K64, vec![b + K64])];
+        // From 0x8000 into the first page to 0x1000 into the second.
+        let parts = elsewhere_parts(a + 0x8000, a + K64 + 0x1000, &shown);
+        assert_eq!(parts, vec![(b + 0x8000, 0x8000), (b + 8 * K64 + 0x8000, 0x8000), (b + K64, 0x1000)]);
+        // A page the range does not reach gives nothing.
+        assert!(elsewhere_parts(a, a + 0x100, &[(a + K64, vec![b])]).is_empty());
+    }
 
     /// Views as the runtime tells them: a range inside one view, or over
     /// views that continue each other in one section, is one run; over
