@@ -227,6 +227,16 @@ pub(crate) fn mapped(call: u64, ranges: &[(u64, u64, u64)]) {
     }
 }
 
+/// Batch calls that waited for the work before them
+/// (`VICTORY_MAP_IN_ORDER=1`), and the microseconds they waited.
+static ORDERED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A batch call waited `us` microseconds for the work before it.
+pub(crate) fn ordered(us: u64) {
+    ORDERED[0].fetch_add(1, Relaxed);
+    ORDERED[1].fetch_add(us, Relaxed);
+}
+
 /// The batch calls so far.
 pub(crate) fn calls() -> u64 {
     COUNTS[CALLS].load(Relaxed)
@@ -306,7 +316,8 @@ pub(crate) fn line() {
         "the tiled heap against its CPU view, since the start: {} CopyPageMappingsBatchX calls; {} pages taken from the pool \
          checked: {} the CPU view's page, {} another page, {} the CPU view empty; {} mapped from the CPU view \
          (VICTORY_MAP_FROM_TWIN=1); {} before the CPU view was found ({} of them shown at the GPU address already: \
-         the CPU view there too; distance {})",
+         the CPU view there too; distance {}); {} calls waited for the work before them, {:.1} ms in all \
+         (VICTORY_MAP_IN_ORDER=1)",
         c[CALLS],
         c[CHECKED],
         c[AGREE],
@@ -315,7 +326,9 @@ pub(crate) fn line() {
         c[FROM_TWIN],
         c[UNKNOWN],
         c[SAME],
-        if delta == 0 { "not known".to_string() } else { format!("{delta:#x}") }
+        if delta == 0 { "not known".to_string() } else { format!("{delta:#x}") },
+        ORDERED[0].load(Relaxed),
+        ORDERED[1].load(Relaxed) as f64 / 1e3
     );
 }
 

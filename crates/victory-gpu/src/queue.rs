@@ -1302,8 +1302,9 @@ fn map_batches(
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
-/// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run. The flags as [`page_bytes`] says.
+/// one constant page or of unmapped pages). Done at once, at the call
+/// (with the line of `VICTORY_THIN` on, earlier submissions may not have
+/// been prepared yet: [`in_order`]). The flags as [`page_bytes`] says.
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
@@ -1337,6 +1338,8 @@ extern "system" fn copy_page_mappings(
     });
     #[cfg(windows)]
     let gathered = crate::twin::before(gathered);
+    #[cfg(windows)]
+    in_order();
     match crate::resource::many_page_mapper() {
         Some(many) => ok &= many(&gathered),
         None => ok &= gathered.iter().fold(true, |ok, &(to, from, len)| map(to, from, len) && ok),
@@ -1350,6 +1353,30 @@ extern "system" fn copy_page_mappings(
         });
     }
     S_OK
+}
+
+/// Whether a page-mapping batch first waits for what the title gave its
+/// queues before it (`VICTORY_MAP_IN_ORDER=1`; off by default: mapped at
+/// once, as before). On the console the batch is a queue operation, done
+/// after the work submitted before it. Here that work may not have been
+/// prepared yet when the call comes (the line of `VICTORY_THIN` /
+/// `VICTORY_ASYNC_SUBMIT` holds up to two frames of it), and what was sent
+/// without a wait lands in title memory later: both then read and write the
+/// heap through the new mapping. With the switch the line is drained and
+/// the flights in the air are settled before the mapping is made (a wait of
+/// the title's thread at each call; what stands at an unmet wait is still
+/// passed).
+#[cfg(windows)]
+fn in_order() {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_MAP_IN_ORDER").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let began = std::time::Instant::now();
+    let _waiting = crate::timeline::span("a page mapping waits for the work before it");
+    before_sync();
+    crate::host::settle_for_fence();
+    crate::twin::ordered(began.elapsed().as_micros() as u64);
 }
 
 /// Whether the one-batch page-mapping calls are made
