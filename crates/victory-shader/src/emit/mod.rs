@@ -569,6 +569,58 @@ pub fn early_depth_names_any() -> bool {
     std::env::var_os("VICTORY_EARLY_DEPTH_FOR").is_some_and(|v| !v.is_empty())
 }
 
+thread_local! {
+    /// See [`with_null_fill_named`].
+    static NULL_FILL_NAMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the program taken as one named in
+/// `VICTORY_NULL_FILL_FOR` ([`null_fill_named`]) when `on`: its four-channel
+/// pixel-program samples that read nothing but zeros read
+/// [`null_fill_value`] instead (see `lower::null_fill`).
+pub fn with_null_fill_named<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = NULL_FILL_NAMED.replace(on);
+    let r = f();
+    NULL_FILL_NAMED.set(was);
+    r
+}
+
+/// Whether the program whose container's hash is `hash` is one of those named in
+/// `VICTORY_NULL_FILL_FOR`: hashes or their beginnings, separated by commas, as
+/// `VICTORY_EARLY_DEPTH_FOR` names them. Unset (the default): none.
+pub fn null_fill_named(hash: &str) -> bool {
+    static FOR: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let named = FOR.get_or_init(|| {
+        std::env::var("VICTORY_NULL_FILL_FOR")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    hash_named(named, hash)
+}
+
+/// Whether some program is named in `VICTORY_NULL_FILL_FOR` ([`null_fill_named`]): a caller
+/// hashes containers only then.
+pub fn null_fill_names_any() -> bool {
+    std::env::var_os("VICTORY_NULL_FILL_FOR").is_some_and(|v| !v.is_empty())
+}
+
+/// What a named program's all-zero samples read instead (`VICTORY_NULL_FILL_VALUE`, in every
+/// channel; default 0.5, the middle of a chroma channel stored as a colour).
+pub(crate) fn null_fill_value() -> f32 {
+    static VALUE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("VICTORY_NULL_FILL_VALUE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0.5)
+    })
+}
+
+/// Whether the program being lowered is one named in `VICTORY_NULL_FILL_FOR`.
+pub(crate) fn null_fill_on() -> bool {
+    NULL_FILL_NAMED.get()
+}
+
 /// Whether the paired form is tried for the program being translated: `VICTORY_WAVE_PAIRED=1`
 /// (every program), or [`with_paired_first`]. Off by default: each host lane does the work of
 /// two console lanes, and the form is new.
@@ -3537,6 +3589,22 @@ mod early_depth_tests {
 
     // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
     const COLOR: [u32; 4] = [0x7E00_02F2, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+
+    /// `VICTORY_NULL_FILL_FOR` names no program unless set, and the fill is scoped to the
+    /// translation it wraps.
+    #[test]
+    fn null_fill_is_off_unless_named_and_scoped() {
+        assert!(!null_fill_names_any());
+        assert!(!null_fill_named("659fe9cae59dbd88"));
+        assert!(!null_fill_on());
+        with_null_fill_named(true, || {
+            assert!(null_fill_on());
+            with_null_fill_named(false, || assert!(!null_fill_on()));
+            assert!(null_fill_on());
+        });
+        assert!(!null_fill_on());
+        assert_eq!(null_fill_value(), 0.5);
+    }
 
     /// By default (`VICTORY_EARLY_DEPTH` and `VICTORY_EARLY_DEPTH_FOR` unset)
     /// no program declares early depth, not even one with the console's bit:

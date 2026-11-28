@@ -486,8 +486,12 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
                     let paired = victory_shader::emit::paired_names_any() && victory_shader::emit::paired_named(hash);
                     // (`VICTORY_EARLY_DEPTH_FOR`: early depth for the programs it names, as a run has it)
                     let early = victory_shader::emit::early_depth_names_any() && victory_shader::emit::early_depth_named(hash);
-                    let translated = victory_shader::emit::with_early_depth_named(early, || {
-                        victory_shader::emit::with_paired_first(paired, || victory_shader::emit::translate(&bytes))
+                    // (`VICTORY_NULL_FILL_FOR`: the fill for all-zero samples, likewise)
+                    let fill = victory_shader::emit::null_fill_names_any() && victory_shader::emit::null_fill_named(hash);
+                    let translated = victory_shader::emit::with_null_fill_named(fill, || {
+                        victory_shader::emit::with_early_depth_named(early, || {
+                            victory_shader::emit::with_paired_first(paired, || victory_shader::emit::translate(&bytes))
+                        })
                     });
                     match translated {
                         Ok(t) => {

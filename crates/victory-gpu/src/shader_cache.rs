@@ -102,6 +102,9 @@ fn build() -> [u8; 32] {
             // Which pixel programs declare the console's early depth test.
             "VICTORY_EARLY_DEPTH",
             "VICTORY_EARLY_DEPTH_FOR",
+            // Which pixel programs read a fill value for samples of all zeros, and which.
+            "VICTORY_NULL_FILL_FOR",
+            "VICTORY_NULL_FILL_VALUE",
             // Whether the ray-tracing node test always misses.
             "VICTORY_RT_MISS",
         ] {
@@ -141,9 +144,11 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| {
         let paired = paired_first(c);
-        victory_shader::emit::with_early_depth_named(early_depth_named(c), || {
-            victory_shader::emit::with_paired_first(paired, || {
-                victory_shader::emit::with_wide_first(wide_first(c), || victory_shader::emit::translate(c))
+        victory_shader::emit::with_null_fill_named(null_fill_named(c), || {
+            victory_shader::emit::with_early_depth_named(early_depth_named(c), || {
+                victory_shader::emit::with_paired_first(paired, || {
+                    victory_shader::emit::with_wide_first(wide_first(c), || victory_shader::emit::translate(c))
+                })
             })
         })
         .map_err(|e| e.to_string())
@@ -188,6 +193,13 @@ fn paired_first(container: &[u8]) -> bool {
 fn early_depth_named(container: &[u8]) -> bool {
     victory_shader::emit::early_depth_names_any()
         && victory_shader::emit::early_depth_named(&blake3::hash(container).to_hex())
+}
+
+/// Whether `container` is one of the programs named in `VICTORY_NULL_FILL_FOR`
+/// (`victory_shader::emit::with_null_fill_named`). None unless named.
+fn null_fill_named(container: &[u8]) -> bool {
+    victory_shader::emit::null_fill_names_any()
+        && victory_shader::emit::null_fill_named(&blake3::hash(container).to_hex())
 }
 
 /// The cache entry's converter: the build and the container in, the

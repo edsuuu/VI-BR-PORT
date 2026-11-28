@@ -11925,6 +11925,27 @@ impl<'a> Lower<'a> {
                 &args,
             )
         };
+        // A named program ([`super::with_null_fill_named`]): a sample of all four channels whose
+        // result is zero in every one reads the fill value instead. For the tree impostors the
+        // host's null view (a texture the title has not streamed in, or has no host copy yet)
+        // gave a chroma of zero, which their colour decode turns into pure green.
+        if sample && *dmask == 0xF && self.s.pixel && super::null_fill_on() && gathered.is_none() {
+            let fill = self.s.m.f32(super::null_fill_value().to_bits());
+            let zero = self.s.m.i32(0);
+            let xs: Vec<V> = (0..4).map(|ch| self.s.m.extract(c, r, ch)).collect();
+            let mut all = None;
+            for &x in &xs {
+                let bits = self.as_int(x);
+                let is = self.s.m.cmp(c, pred::EQ, bits, zero);
+                all = Some(match all {
+                    None => is,
+                    Some(a) => self.s.m.bin(c, Bin::And, a, is),
+                });
+            }
+            let all = all.expect("four channels");
+            let filled: Vec<V> = xs.iter().map(|&x| self.s.m.select(c, all, fill, x)).collect();
+            gathered = Some([filled[0], filled[1], filled[2], filled[3]]);
+        }
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
