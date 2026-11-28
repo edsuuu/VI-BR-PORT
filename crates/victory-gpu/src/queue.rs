@@ -1230,6 +1230,12 @@ extern "system" fn copy_page_mappings(
     let mut ok = true;
     let many = crate::resource::many_page_mapper();
     let mut gathered: Vec<(u64, u64, u64)> = Vec::new();
+    // By the page, what the batch maps (`crate::truth`; only with
+    // `VICTORY_TEX_TRUTH` or `VICTORY_CLAMP_RESIDENT`, both off).
+    #[cfg(windows)]
+    let truth = crate::truth::wanted();
+    #[cfg(windows)]
+    let mut pages: Vec<crate::truth::Mapping> = Vec::new();
     let mut map = |to: u64, from: u64, len: u64| match many {
         Some(_) => {
             gathered.push((to, from, len));
@@ -1248,6 +1254,18 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
+            #[cfg(windows)]
+            if truth {
+                for k in 0..u64::from(r.count) {
+                    let index = match r.kind {
+                        0 if inside(r.count) => Some(r.start + k as u32),
+                        1 if inside(1) => Some(r.start),
+                        2 => None,
+                        _ => continue,
+                    };
+                    pages.push((at + k * PAGE, index, r.kind == 1 && r.count > 1));
+                }
+            }
             ok &= match r.kind {
                 0 if inside(r.count) => map(at, source, len),
                 1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
@@ -1260,6 +1278,10 @@ extern "system" fn copy_page_mappings(
     }
     if let Some(many) = many {
         ok &= many(&gathered);
+    }
+    #[cfg(windows)]
+    if truth {
+        crate::truth::batch(pool, pool_pages, &pages);
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();

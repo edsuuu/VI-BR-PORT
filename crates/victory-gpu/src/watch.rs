@@ -2423,6 +2423,7 @@ impl std::hash::Hasher for PageHash {
 
 /// What shaders wrote is about to go into title memory at `[at, at + len)`.
 pub(crate) fn landing(at: usize, len: usize) {
+    crate::truth::landing(at, len);
     {
         let frame = crate::frame::current();
         let (first, last) = (at / KERNEL_PAGE, (at + len.max(1) - 1) / KERNEL_PAGE);

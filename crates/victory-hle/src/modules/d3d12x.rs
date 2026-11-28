@@ -21,6 +21,11 @@ extern "system" fn create_device(
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     #[cfg(windows)]
+    victory_gpu::truth::use_runtime(victory_gpu::truth::Runtime {
+        title: crate::runtime::main_image,
+        compare: super::xmem::truth_compare,
+    });
+    #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)
 }

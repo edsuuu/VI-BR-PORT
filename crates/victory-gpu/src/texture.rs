@@ -1220,6 +1220,11 @@ impl Staging {
         use std::sync::atomic::Ordering::Relaxed;
         let started = std::time::Instant::now();
         let _texture = crate::timeline::span("a texture's refresh");
+        // Which of its pages the title still holds (`VICTORY_TEX_TRUTH`,
+        // `VICTORY_CLAMP_RESIDENT`; both off).
+        if crate::truth::wanted() {
+            crate::truth::refreshed(self.memory as u64, self.read as u64, &self.layout);
+        }
         let read = self.refresh_now();
         let preparing = &crate::host::PREPARING;
         preparing[2].fetch_add(started.elapsed().as_micros() as u64, Relaxed);
@@ -1477,6 +1482,7 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+        crate::truth::detiled(self.memory as u64, tiled);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
         // that gives levels their memory goes by this answer.

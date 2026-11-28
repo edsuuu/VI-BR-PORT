@@ -1078,6 +1078,8 @@ impl Capture {
             presents: std::mem::take(&mut self.presents),
         };
         frame.write(&r.folder.join("frame.bin"))?;
+        // Its textures' title memory as it is now (`VICTORY_TEX_TRUTH`, off).
+        crate::truth::captured(&r.folder);
         std::fs::write(r.folder.join("notes.txt"), notes.join("\n"))?;
         tracing::info!(folder = %r.folder.display(), "frame recorder: the frame is captured");
         Ok(())

@@ -1326,6 +1326,12 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
         return 0;
     }
     lift_thread();
+    // The numbers, for `VICTORY_TEX_TRUTH` (off): they check where it
+    // reads the title's own table of pool pages.
+    if victory_gpu::truth::on() && !pages.is_null() {
+        // SAFETY: the title passes `n` pages.
+        victory_gpu::truth::scattered(unsafe { std::slice::from_raw_parts(pages, n) }.iter().copied());
+    }
     if side_by_side() > 1 && n > 1 {
         // Read before any lock is taken, as in `XMemMapPhysicalPages`.
         let wanted: Vec<(usize, usize)> = (0..n)
@@ -1381,6 +1387,35 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         }
     }
     true
+}
+
+/// For `VICTORY_TEX_TRUTH` (`victory_gpu::truth`): for each (pool page
+/// address, GPU address, page number), whether the pool view shows that
+/// page, and whether the GPU address shows what the pool view does.
+pub fn truth_compare(pages: &[(u64, u64, u64)]) -> Vec<(victory_gpu::truth::Pool, bool)> {
+    use victory_gpu::truth::Pool;
+    let same = |a: &Slice, b: &Slice| Arc::ptr_eq(&a.section, &b.section) && a.index == b.index;
+    let physical = physical();
+    let table = page_table();
+    pages
+        .iter()
+        .map(|&(pool, gpu, number)| {
+            let shown = physical.slice_at(pool as usize);
+            let after = physical.slice_at(gpu as usize);
+            let said = match (table.pages.get(&(number as usize)), &shown) {
+                (None, _) => Pool::Unknown,
+                (_, None) => Pool::Hole,
+                (Some(named), Some(shown)) if same(named, shown) => Pool::Agrees,
+                _ => Pool::Other,
+            };
+            let followed = match (&shown, &after) {
+                (Some(s), Some(a)) => same(s, a),
+                (None, None) => true,
+                _ => false,
+            };
+            (said, followed)
+        })
+        .collect()
 }
 
 /// [`map_alias`] of many ranges, in order.
