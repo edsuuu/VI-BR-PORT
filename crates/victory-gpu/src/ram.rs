@@ -155,7 +155,8 @@ fn line() {
     let free = crate::host::available_physical_ram().unwrap_or(0);
     tracing::info!(
         "PC memory we hold (VICTORY_RAM_LOG=0: no line; the caps of what is kept for reuse {}), MB: windows of title memory {} ({windows}, over {} of title memory, \
-         {slot_held} of them {} held by descriptor slots); title buffers' copies {} ({} copies in all); lists' scratch {} \
+         {slot_held} of them {} held by descriptor slots); title buffers' copies {} ({} copies in all; of them {} our own \
+         memory, not shared with the card: VICTORY_CARD_SIDE_PRIVATE); lists' scratch {} \
          ({} of it kept spare), lists' other upload buffers {} ({}); blocks of texture staging {}; textures' own staging {} \
          ({stagings}); kept for submissions' sends {}; host lists {}; sum {}; shared with the card as the system counts it {}; \
          the process: private {}, working set {}; the PC's memory free as our caches see it (VICTORY_RAM_ASSUME_FREE_MB) {}",
@@ -165,6 +166,7 @@ fn line() {
         mb(slot_bytes),
         mb(mirror),
         copies,
+        mb(crate::shadow::private_side_bytes()),
         mb(alive(2)),
         mb(alive(4)),
         mb(alive(7)),

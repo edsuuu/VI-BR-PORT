@@ -27,6 +27,12 @@ pub(super) fn own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
 }
 
+/// Whether the submissions' own sends are on and their pass could be made:
+/// then the card never copies from a copy's CPU side.
+pub(super) fn ready(host: &Host) -> bool {
+    own() && pass(host).is_some()
+}
+
 /// Runs up to this many bytes go as pairs.
 const SHORT: usize = 256;
 

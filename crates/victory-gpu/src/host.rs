@@ -4924,8 +4924,26 @@ impl Host {
                             continue;
                         };
                         if own.is_none() {
-                            for &(a, b) in ranges {
-                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                            match staging {
+                                Some(staging) => {
+                                    for &(a, b) in ranges {
+                                        list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                    }
+                                }
+                                // A CPU side in our own memory
+                                // (`VICTORY_CARD_SIDE_PRIVATE`) has nothing
+                                // the card can copy from: the submission's
+                                // own sends could not be made.
+                                None if !ranges.is_empty() => {
+                                    static SAID: std::sync::Once = std::sync::Once::new();
+                                    SAID.call_once(|| {
+                                        tracing::error!(
+                                            "a submission's own sends could not be made and a title buffer's CPU side is our own \
+                                             memory (VICTORY_CARD_SIDE_PRIVATE=1): what changed in it did not go up"
+                                        );
+                                    });
+                                }
+                                None => {}
                             }
                         }
                         let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
@@ -10913,6 +10931,14 @@ impl Host {
             shared[2] >> 20,
             shared[3] >> 20
         );
+    }
+
+    /// Whether the card never reads a copy's CPU side: the submissions' own
+    /// sends are on and their pass made, and the diagnostics' check of what
+    /// went up (which compares that side on the card) is off. Then the side
+    /// may be memory of our own (`VICTORY_CARD_SIDE_PRIVATE`).
+    pub(crate) fn sends_own_ready(&self) -> bool {
+        send::ready(self) && !upcheck::on()
     }
 
     /// A buffer in system memory that the CPU maps (write-back, so reading
