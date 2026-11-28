@@ -203,6 +203,73 @@ pub(super) fn build_compute_shader(
     Ok((shader, res))
 }
 
+/// A descriptor selected by a root constant supplies the address that a lane read broadcasts.
+#[test]
+fn a_heap_view_address_can_be_passed_through_a_lane_read() {
+    let mut program = native(&[
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF408_0302,
+        0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 32 (output UAV)
+        0xBE87_0380, // s_mov_b32 s7, 0
+        0x8F04_8500, // s_lshl_b32 s4, s0, 5
+        0xF408_0203,
+        0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4 (view heap)
+        0x8709_FF09,
+        0x0000_FFFF, // s_and_b32 s9, s9, 0xffff
+        0x9090_8808, // s_lshr_b64 s[16:17], s[8:9], 8
+        0x7E02_0210, // v_mov_b32 v1, s16
+        0xD760_0003,
+        0x0001_0701, // v_readlane_b32 s3, v1, 3
+        0x7E04_0203, // v_mov_b32 v2, s3
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xE070_1000,
+        0x8003_0203, // buffer_store_dword v2, v3, s[12:15], 0 offen
+        0xBF81_0000, // s_endpgm
+    ]);
+    program.layout.push(RootParam {
+        root: RootType::ResourceHeap,
+        user_data: 6,
+        slot: 2,
+        ..program.layout[1]
+    });
+    program.io = StageIo::Cs(ComputeIo {
+        rsrc2: 7 << 1,
+        threads: [THREADS, 1, 1],
+    });
+    let (shader, _) = build_compute_shader(&program).expect("translates the lane read of a heap address");
+    assert_eq!(shader.root_srvs, [super::SLOT_STRIDES]);
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+    let addresses = [0x12_3456_7800u64, 0x03_89ab_cd00];
+    let first = super::SLOT_VIEW_ADDRESSES_OFFSET as usize / 4;
+    let mut metadata = vec![0; first + 2 * addresses.len()];
+    for (index, address) in addresses.into_iter().enumerate() {
+        metadata[first + 2 * index] = address as u32;
+        metadata[first + 2 * index + 1] = (address >> 32) as u32;
+    }
+    for (index, address) in [(0, addresses[0]), (1, addresses[1]), (super::SLOT_STRIDES_COUNT, 0)] {
+        let mut user_data = vec![0; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 0) {
+                user_data[u.index as usize] = index;
+            }
+        }
+        let out = host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(user_data)), (1, Root::View { srv: true, data: metadata.clone() })],
+                views: &[View::Buffer { data: &[0], stride: Stride::Raw }, View::RawUav(THREADS)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        ).expect("dispatch");
+        assert_eq!(out[0], [(address >> 8) as u32; THREADS as usize], "heap slot {index}");
+    }
+    eprintln!("ran on the hardware device: lane reads of two heap addresses and an out-of-range slot");
+}
+
 /// One thread's test: a node (by its index in the node list), the kind its
 /// pointer carries, and the ray; `None` leaves the thread masked out.
 type Case = Option<(usize, u32, Ray)>;

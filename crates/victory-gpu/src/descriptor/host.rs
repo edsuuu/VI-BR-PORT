@@ -173,10 +173,8 @@ pub(crate) struct HostHeap {
     /// 45), under the lock all of them need. (A free run that lies across
     /// the place the search starts from is seen by neither.)
     too_long: std::sync::atomic::AtomicU32,
-    /// View heaps: the bytes per element of the buffer view at each title
-    /// slot, for shaders that pick a buffer by an index they compute
-    /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
-    /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
+    /// View heaps: the upload buffer of strides and title addresses by
+    /// slot (`victory_shader::emit::SLOT_STRIDES`), its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
     /// Title slots holding buffer views. Such a view gets its host slot
     /// (and its memory a host copy) only when something reads it: a draw
@@ -1629,14 +1627,18 @@ impl HostHeap {
         ));
         let strides = (!sampler)
             .then(|| {
-                let bytes = u64::from(victory_shader::emit::SLOT_STRIDES_COUNT) * 4;
+                use victory_shader::emit::{SLOT_STRIDES_COUNT, SLOT_VIEW_ADDRESSES_OFFSET};
+                let bytes = u64::from(SLOT_VIEW_ADDRESSES_OFFSET) + u64::from(SLOT_STRIDES_COUNT) * 8;
                 let (buffer, data) = host.upload_buffer(bytes)?;
+                if !data.cast::<std::sync::atomic::AtomicU64>().is_aligned() {
+                    return None;
+                }
                 // SAFETY: the buffer's whole mapping; a live buffer.
                 let gpu = unsafe {
                     std::ptr::write_bytes(data, 0, bytes as usize);
                     buffer.GetGPUVirtualAddress()
                 };
-                crate::host::name(&buffer, || "element strides by view heap slot".to_owned());
+                crate::host::name(&buffer, || "strides and title addresses by view heap slot".to_owned());
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
@@ -2757,8 +2759,8 @@ impl HostHeap {
     }
 
     /// Records what title slot `index` now holds for shaders that pick
-    /// buffers from the heap: its element stride in the table, and whether
-    /// it is a buffer view at all.
+    /// buffers from the heap: its element stride and title address in the
+    /// metadata buffer, and whether it is a buffer view at all.
     /// `seen`: the slot was not written now, a draw or a pass made its
     /// host slot from what it held.
     /// Returns the title slots whose placed texture view the write made
@@ -2841,6 +2843,14 @@ impl HostHeap {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
             unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+            let address = view.and_then(view_address).unwrap_or(0);
+            let offset = victory_shader::emit::SLOT_VIEW_ADDRESSES_OFFSET as usize + index as usize * 8;
+            // SAFETY: the mapping was checked for alignment and initialized in `new`.
+            // Each slot has its own u64 inside the buffer.
+            unsafe {
+                let at = (*data as *mut u8).add(offset).cast::<u64>();
+                std::sync::atomic::AtomicU64::from_ptr(at).store(address, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         let was = if stride.is_some() {
             self.buffers.put(index);
@@ -5560,6 +5570,34 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         assert_eq!(view_kind(&uav(39, 0, 1)), 0, "raw");
         assert_eq!(view_kind(&uav(0, 16, 0)), 0, "structured");
         assert_eq!(view_stride(&uav(12, 0, 0)), Some(8));
+    }
+
+    #[test]
+    fn view_heap_slot_metadata_tracks_replaced_and_cleared_addresses() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use victory_shader::emit::SLOT_VIEW_ADDRESSES_OFFSET;
+
+        let Some(heap) = HostHeap::new(false, 8) else { return };
+        let (_, _, data) = heap.strides.as_ref().expect("view heap metadata");
+        let read = |slot: usize| {
+            let offset = SLOT_VIEW_ADDRESSES_OFFSET as usize + slot * 8;
+            // SAFETY: these slots are inside the initialized, aligned address table.
+            unsafe { AtomicU64::from_ptr((*data as *mut u8).add(offset).cast()).load(Ordering::Relaxed) }
+        };
+        let structure = |at: u64| {
+            let mut desc = [0u32; 10];
+            desc[1] = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+            (desc[4], desc[5]) = (at as u32, (at >> 32) as u32);
+            View::Shader(0, Some(desc))
+        };
+        let (first, second) = (0x12_3456_7800, 0x03_89ab_cd00);
+        assert_eq!(read(1), 0);
+        assert!(heap.note_buffer(1, Some(&structure(first)), false).is_empty());
+        assert!(heap.note_buffer(2, Some(&structure(second)), false).is_empty());
+        assert_eq!([read(1), read(2)], [first, second]);
+        assert!(heap.note_buffer(1, Some(&structure(second)), false).is_empty());
+        assert!(heap.note_buffer(2, None, false).is_empty());
+        assert_eq!([read(1), read(2)], [second, 0]);
     }
 
     /// What may stand for a texture that is not there yet: one of its kind in
