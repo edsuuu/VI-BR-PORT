@@ -16,6 +16,8 @@ use crate::{
     descriptor, dxgi, fence, frame, list, pipeline, query, queue, resource, root, signature,
 };
 
+mod deserialize;
+
 /// What D3D returns when none of the requested feature levels is supported.
 const UNSUPPORTED: HRESULT = 0x887A_0004_u32 as i32;
 
@@ -346,15 +348,15 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
+/// Device methods 0x1c8 and 0x218 (`SLOT`, `DeserializeGraphicsPipelineStateX`
+/// and `DeserializeComputePipelineStateX`) while `VICTORY_PSO_DESERIALIZE` is
+/// off ([`deserialize`]). The title calls both (title+0x2477578 and
+/// title+0x24800d5) as `(this, description, interface id, out)`, asks for
+/// `ID3D12PipelineState`, and on success keeps the object `out` names and
+/// draws with it; on failure it skips that pipeline of its list, silently.
+/// The calls fail with `out` null, and the first ones log the description's
+/// words and what its first word points at.
+/// shortcut: not implemented here. Answering `S_OK` without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
@@ -469,10 +471,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
+    f[57] = deserialize::create_graphics as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = deserialize::create_compute as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238

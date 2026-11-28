@@ -9,7 +9,8 @@
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: only vertex plus pixel pipelines from streams and compute
+//! shortcut: only vertex plus pixel pipelines from streams or of linked
+//! programs (device method 0x1c8, [`create_linked`]) and compute
 //! pipelines get host pipelines; mesh, tessellation and geometry stages,
 //! and the plain graphics description, keep their containers only. The 32-byte
 //! packet after the header stays zero: titles only copy it inline, which
@@ -798,25 +799,26 @@ fn hand_out_of(
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
 
-/// What the pipelines of one description of device method 0x1c8 are handed
-/// out from.
+/// What the pipelines of one description of device method 0x1c8 or 0x218
+/// are handed out from.
 struct Linked {
     shaders: Vec<Arc<Shader>>,
     #[cfg(windows)]
     host: Arc<make::Pending>,
 }
 
-/// Device method 0x1c8's descriptions by key (`crate::device`: what tells
-/// one from another), `None` for one that was refused. The title passes
-/// the same description thousands of times (one of them 16,384 times in a
-/// run): each time it gets an object of its own, of the same shaders and
-/// the same host pipeline, and nothing is read, checked or hashed again.
+/// Device methods 0x1c8's and 0x218's descriptions by key (`crate::device`:
+/// what tells one from another), `None` for one that was refused. The title
+/// passes the same programs in many descriptions, and may pass a
+/// description again: each time it gets an object of its own, of the same
+/// shaders and the same host pipeline, and its programs are not read,
+/// checked or made into containers again.
 static LINKED: Mutex<Option<HashMap<[u8; 32], Option<Linked>>>> = Mutex::new(None);
 
-/// The answer to a description of device method 0x1c8 seen before: a new
+/// The answer to a description of device method 0x1c8 or 0x218 seen before: a new
 /// pipeline object and `S_OK`, or `E_NOTIMPL` for one that was refused
 /// (`out` is left as it is). `None` for a description not seen yet.
-pub(crate) fn linked_again(key: &[u8; 32], iid: *const Iid, out: *mut This) -> Option<HRESULT> {
+pub(crate) fn deserialized_again(key: &[u8; 32], iid: *const Iid, out: *mut This) -> Option<HRESULT> {
     let linked = LINKED.lock().unwrap_or_else(|e| e.into_inner());
     let known = linked.as_ref()?.get(key)?;
     let Some(known) = known else {
@@ -837,8 +839,50 @@ pub(crate) fn linked_again(key: &[u8; 32], iid: *const Iid, out: *mut This) -> O
     ))
 }
 
-/// Remembers that the description `key` of device method 0x1c8 is refused.
-pub(crate) fn refuse_linked(key: [u8; 32]) {
+/// Whether two pipelines are of the same containers and, where there are
+/// host pipelines, of the same one (for the test of device method 0x1c8).
+#[cfg(test)]
+pub(crate) fn shares(a: This, b: This) -> bool {
+    let (a, b) = (pipeline(a), pipeline(b));
+    let same = a.shaders.len() == b.shaders.len() && a.shaders.iter().zip(&b.shaders).all(|(x, y)| Arc::ptr_eq(x, y));
+    #[cfg(windows)]
+    let same = same && Arc::ptr_eq(&a.host, &b.host);
+    same
+}
+
+/// Makes a pipeline's host pipeline on this thread, as its first draw would
+/// have a worker do; `Err` says which of its shaders does not translate, or
+/// that the host refused it (for the test of device method 0x1c8).
+#[cfg(all(test, windows))]
+pub(crate) fn made_now(this: This) -> Result<(), String> {
+    let p = pipeline(this);
+    for s in &p.shaders {
+        if let Err(e) = translate(&s.container) {
+            return Err(format!("{s:?}: {e}"));
+        }
+    }
+    match make::now(&p.host) {
+        true => Ok(()),
+        false => Err(format!("{:?}: no host pipeline", p.shaders)),
+    }
+}
+
+/// Whether the container `bytes` translates, translating it now (it is
+/// kept for its pipelines' first use): `Err` says why not
+/// (`VICTORY_PSO_DESERIALIZE_CHECK`). Without a host device nothing is
+/// translated yet, and it is taken to.
+pub(crate) fn translates(stage: &'static str, bytes: &[u8]) -> Result<(), String> {
+    #[cfg(windows)]
+    if crate::host::host().is_some() && shader(stage, bytes).translated().is_none() {
+        return Err(format!("a {stage} program that does not translate"));
+    }
+    #[cfg(not(windows))]
+    let _ = (stage, bytes);
+    Ok(())
+}
+
+/// Remembers that the description `key` of device method 0x1c8 or 0x218 is refused.
+pub(crate) fn refuse_deserialized(key: [u8; 32]) {
     let mut linked = LINKED.lock().unwrap_or_else(|e| e.into_inner());
     linked.get_or_insert_with(HashMap::new).insert(key, None);
 }
@@ -848,7 +892,7 @@ pub(crate) fn refuse_linked(key: [u8; 32]) {
 /// (`victory_shader::native::linked_container`), and its graphics state.
 /// From here on it is a pipeline like one from a stream
 /// ([`create_stream`]); the description `key` is answered from it from now
-/// on ([`linked_again`]).
+/// on ([`deserialized_again`]).
 pub(crate) fn create_linked(
     key: [u8; 32],
     vertex: &[u8],
@@ -857,17 +901,53 @@ pub(crate) fn create_linked(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
-    let mut shaders = vec![shader("vertex", vertex)];
-    shaders.extend(pixel.map(|p| shader("pixel", p)));
-    #[cfg(windows)]
-    let host = pending(&shaders, Some(Box::new(graphics)));
-    let known = Linked {
-        shaders: shaders.clone(),
-        #[cfg(windows)]
-        host: host.clone(),
-    };
     let mut linked = LINKED.lock().unwrap_or_else(|e| e.into_inner());
-    linked.get_or_insert_with(HashMap::new).insert(key, Some(known));
+    // Made under the lock: of two threads that create one description at
+    // once, the second finds the first one's host pipeline.
+    let known = linked.get_or_insert_with(HashMap::new).entry(key).or_insert(None);
+    let known = known.get_or_insert_with(|| {
+        let mut shaders = vec![shader("vertex", vertex)];
+        shaders.extend(pixel.map(|p| shader("pixel", p)));
+        Linked {
+            #[cfg(windows)]
+            host: pending(&shaders, Some(Box::new(graphics))),
+            shaders,
+        }
+    });
+    let shaders = known.shaders.clone();
+    #[cfg(windows)]
+    let host = known.host.clone();
+    drop(linked);
+    hand_out_of(
+        shaders,
+        #[cfg(windows)]
+        host,
+        #[cfg(windows)]
+        false,
+        iid,
+        out,
+    )
+}
+
+/// A pipeline of device method 0x218: its program as a container of ours
+/// (`victory_shader::native::deserialized_compute_container`). From here on
+/// it is a pipeline like one of `CreateComputePipelineState`
+/// ([`create_compute`]); the description `key` is answered from it from
+/// now on ([`deserialized_again`]).
+pub(crate) fn create_deserialized_compute(key: [u8; 32], container: &[u8], iid: *const Iid, out: *mut This) -> HRESULT {
+    let mut linked = LINKED.lock().unwrap_or_else(|e| e.into_inner());
+    let known = linked.get_or_insert_with(HashMap::new).entry(key).or_insert(None);
+    let known = known.get_or_insert_with(|| {
+        let shaders = vec![shader("compute", container)];
+        Linked {
+            #[cfg(windows)]
+            host: pending(&shaders, None),
+            shaders,
+        }
+    });
+    let shaders = known.shaders.clone();
+    #[cfg(windows)]
+    let host = known.host.clone();
     drop(linked);
     hand_out_of(
         shaders,
