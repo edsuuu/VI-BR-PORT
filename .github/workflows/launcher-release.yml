@@ -53,6 +53,7 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
+          # The launcher links the engine: building it builds victory too.
           $packages = @('-p', 'victory')
           if ('${{ inputs.launcher }}' -eq 'true') { $packages += @('-p', 'vi-launcher') }
           cargo build --release @packages

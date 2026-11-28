@@ -26,8 +26,7 @@ if (-not $Out) { $Out = Join-Path $root 'target\bundle' }
 if (-not [System.IO.Path]::IsPathRooted($Out)) { $Out = Join-Path $root $Out }
 
 if (-not $Built) {
-    $packages = @('-p', 'victory')
-    if (-not $NoLauncher) { $packages += @('-p', 'vi-launcher') }
+    $packages = if ($NoLauncher) { @('-p', 'victory') } else { @('-p', 'vi-launcher') }
     Push-Location $root
     try { cargo build --locked --release @packages; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE } } finally { Pop-Location }
 }
@@ -40,9 +39,7 @@ New-Item -ItemType Directory -Force $stage | Out-Null
 if ($NoLauncher) {
     Copy-Item -LiteralPath (Join-Path $release 'victory.exe') $stage
 } else {
-    New-Item -ItemType Directory -Force (Join-Path $stage 'victory') | Out-Null
     Copy-Item -LiteralPath (Join-Path $release 'vi-launcher.exe') $stage
-    Copy-Item -LiteralPath (Join-Path $release 'victory.exe') (Join-Path $stage 'victory')
 }
 foreach ($f in 'victory.example.toml', 'LICENSE', 'README.md') { Copy-Item -LiteralPath (Join-Path $root $f) $stage }
 $zip = Join-Path $Out "$name.zip"
