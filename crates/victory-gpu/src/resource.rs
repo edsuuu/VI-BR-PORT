@@ -1171,6 +1171,10 @@ pub(crate) struct HostTexture {
     /// The title's level its level 0 is ([`held_only`]): larger levels have
     /// no place in it.
     pub(crate) base: u32,
+    /// `base` was raised by [`mip_drop`] (by this many levels over what the
+    /// views alone asked for, at least 1): copies and views map the title's
+    /// subresources onto it ([`HostTexture::host_sub`]).
+    pub(crate) dropped: u32,
     /// Tells host copies apart that one texture had one after the other.
     pub(crate) serial: u64,
     /// Made in place of one with fewer levels: the slots that show that one
@@ -1297,6 +1301,82 @@ fn base_level(desc: &ResourceDesc, first: u32) -> u32 {
     base
 }
 
+/// Top levels left out of the host copies of textures the title samples
+/// only, to save card memory (`VICTORY_TEXTURE_MIP_DROP=0..=3`, default 0:
+/// none). Ported from Marvisak/VIctory#2146 (antikohza) onto [`base_level`]:
+/// a dropped copy is one whose level 0 is the title's level `n`, as for
+/// [`held_only`]. Shaders that ask a texture's size see the smaller one.
+#[cfg(windows)]
+pub(crate) fn mip_drop() -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *DROP.get_or_init(|| {
+        let n = std::env::var("VICTORY_TEXTURE_MIP_DROP")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            .min(3);
+        if n > 0 {
+            tracing::info!(mip_drop = n, min_size = mip_drop_min_size(), "texture mip drop on");
+        }
+        n
+    })
+}
+
+/// The smallest width and height of a texture whose levels [`mip_drop`]
+/// leaves out (`VICTORY_TEXTURE_MIP_DROP_MIN_SIZE`, default 1024).
+#[cfg(windows)]
+fn mip_drop_min_size() -> u64 {
+    static MIN: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("VICTORY_TEXTURE_MIP_DROP_MIN_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024)
+    })
+}
+
+/// The levels to leave out of a texture of `desc` for `drop` asked and a
+/// size floor of `min_size`, before the layout has its say ([`base_level`]):
+/// textures the title fills, of power-of-two sides of `min_size` or more,
+/// keeping two levels at least.
+#[cfg(any(windows, test))]
+fn drop_asked(desc: &ResourceDesc, drop: u32, min_size: u64) -> u32 {
+    const TARGET_DEPTH_UNORDERED: u32 = 0x7;
+    if drop == 0
+        || desc.dimension == BUFFER
+        || desc.flags & TARGET_DEPTH_UNORDERED != 0
+        || desc.sample_count > 1
+        || !desc.width.is_power_of_two()
+        || !desc.height.is_power_of_two()
+        || desc.width < min_size
+        || u64::from(desc.height) < min_size
+    {
+        return 0;
+    }
+    drop.min(u32::from(desc.mip_levels).saturating_sub(2))
+}
+
+/// The subresource of a host copy of `own` levels whose level 0 is the
+/// title's level `base` for the title's subresource `sub` (of `own + base`
+/// levels a slice or plane); `None` for a level it does not have.
+#[cfg(any(windows, test))]
+fn map_sub(sub: u32, own: u32, base: u32) -> Option<u32> {
+    let title = own + base;
+    let (slice, level) = (sub / title, sub % title);
+    (level >= base).then(|| slice * own + level - base)
+}
+
+/// The level a host copy of a texture of `desc` begins at for [`mip_drop`]
+/// alone (0: none left out).
+#[cfg(windows)]
+fn dropped_level(desc: &ResourceDesc) -> u32 {
+    match drop_asked(desc, mip_drop(), mip_drop_min_size()) {
+        0 => 0,
+        asked => base_level(desc, asked),
+    }
+}
+
 /// The bytes of title memory a placed texture with the resource description
 /// `desc` is read from for a view that starts at level `first`; `None` as
 /// [`placed_bytes`]. Remembered: asked for every slot that is looked at.
@@ -1354,7 +1434,8 @@ pub(crate) fn want_level(this: This, first: u32) {
         r.host.wanted.fetch_min(first, Relaxed);
         return;
     };
-    if host.base == 0 || host.base <= base_level(&r.desc, first) {
+    // (Levels [`mip_drop`] leaves out are not wanted back.)
+    if host.base == 0 || host.base <= base_level(&r.desc, first).max(host.base.min(dropped_level(&r.desc))) {
         return;
     }
     r.host.wanted.store(first, Relaxed);
@@ -1586,6 +1667,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 base = base_level(&r.desc, first);
             }
         }
+        // Levels left out for card memory ([`mip_drop`]): not of a texture
+        // made level by level, nor of one a texture the host writes lies
+        // over (what it shows is copied whole from that one).
+        let mut dropped = 0;
+        if shape_fits && tiled.is_none() {
+            let level = dropped_level(&r.desc);
+            if level > base && !(r.host.placed.load(Relaxed) && alias_of(this).is_some()) {
+                dropped = level - base;
+                base = level;
+            }
+        }
         let texture = match texture {
             Some(texture) => Some(texture),
             None => host_texture(&r.desc.from_level(base), r.host.state, clear),
@@ -1612,6 +1704,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             None => HostTexture::new(texture, state),
         };
         host.base = base;
+        host.dropped = dropped;
         host.grown.store(r.host.grown.swap(false, Relaxed), Relaxed);
         if base > 0 {
             HELD[0].fetch_add(1, Relaxed);
@@ -2437,6 +2530,18 @@ impl HostTexture {
         self.flags
     }
 
+    /// The host subresource of the title's subresource `sub` of a copy
+    /// [`mip_drop`] left levels out of; `None` for a level it left out. The
+    /// same index for every other copy (as before).
+    pub(crate) fn host_sub(&self, sub: u32) -> Option<u32> {
+        if self.dropped == 0 {
+            return Some(sub);
+        }
+        // SAFETY: a live resource.
+        let own = u32::from(unsafe { self.texture.GetDesc() }.MipLevels).max(1);
+        map_sub(sub, own, self.base)
+    }
+
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
@@ -2451,6 +2556,7 @@ impl HostTexture {
             filled: false,
             tiled: None,
             base: 0,
+            dropped: 0,
             serial: SERIAL.fetch_add(1, Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
@@ -2476,6 +2582,7 @@ impl HostTexture {
             filled: false,
             tiled: Some(tiled),
             base: 0,
+            dropped: 0,
             serial: SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
             grown: Default::default(),
             holds: Default::default(),
@@ -3533,6 +3640,33 @@ mod tests {
             layout: 0,
             ..buffer(0)
         }
+    }
+
+    /// `VICTORY_TEXTURE_MIP_DROP`: only sampled power-of-two textures of the
+    /// floor's size or more, two levels kept; subresources mapped past the
+    /// levels left out.
+    #[test]
+    fn mip_drop_asks_for_sampled_textures_only_and_maps_their_levels() {
+        let t = texture(2048, 2048, 28, 12);
+        assert_eq!(drop_asked(&t, 0, 1024), 0);
+        assert_eq!(drop_asked(&t, 2, 1024), 2);
+        assert_eq!(drop_asked(&t, 2, 4096), 0);
+        for flags in [1, 2, 4] {
+            assert_eq!(drop_asked(&ResourceDesc { flags, ..t }, 2, 1024), 0);
+        }
+        assert_eq!(drop_asked(&ResourceDesc { sample_count: 4, ..t }, 2, 1024), 0);
+        assert_eq!(drop_asked(&texture(1920, 1080, 28, 11), 1, 1024), 0);
+        assert_eq!(drop_asked(&buffer(1 << 20), 1, 1024), 0);
+        assert_eq!(drop_asked(&texture(1024, 1024, 28, 3), 3, 1024), 1);
+        assert_eq!(drop_asked(&texture(1024, 1024, 28, 2), 3, 1024), 0);
+        // 8 title levels, 2 left out: 6 on the host.
+        assert_eq!(map_sub(0, 6, 2), None);
+        assert_eq!(map_sub(1, 6, 2), None);
+        assert_eq!(map_sub(2, 6, 2), Some(0));
+        assert_eq!(map_sub(7, 6, 2), Some(5));
+        assert_eq!(map_sub(8, 6, 2), None);
+        assert_eq!(map_sub(10, 6, 2), Some(6));
+        assert_eq!(map_sub(5, 8, 0), Some(5));
     }
 
     fn heap(size: u64) -> This {

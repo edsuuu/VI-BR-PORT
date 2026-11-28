@@ -1021,6 +1021,49 @@ pub(crate) static CLIPPED_COPIES: [std::sync::atomic::AtomicU64; 2] =
 #[cfg(windows)]
 pub(crate) static SELF_COPIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// A whole-resource copy from host copy `from` to `to` whose first levels
+/// are other levels of the title's (`VICTORY_TEXTURE_MIP_DROP`): each level
+/// and slice both have, of the same size, as its own copy. Ported from
+/// Marvisak/VIctory#2146 (antikohza).
+#[cfg(windows)]
+fn copy_levels(list: &crate::host::HostList, to: &crate::resource::HostTexture, from: &crate::resource::HostTexture) {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_DESC, D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_TEXTURE_COPY_LOCATION,
+        D3D12_TEXTURE_COPY_LOCATION_0, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, ID3D12Resource,
+    };
+    // SAFETY: live resources.
+    let (a, b) = unsafe { (to.texture.GetDesc(), from.texture.GetDesc()) };
+    if a.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D
+        || a.Dimension != b.Dimension
+        || a.SampleDesc.Count != b.SampleDesc.Count
+        || crate::resource::family(a.Format.0 as u32) != crate::resource::family(b.Format.0 as u32)
+    {
+        tracing::debug!("a copy between host copies of other levels and unlike formats left out");
+        return;
+    }
+    let mips = |d: &D3D12_RESOURCE_DESC| u32::from(d.MipLevels).max(1);
+    let size = |d: &D3D12_RESOURCE_DESC, level: u32| ((d.Width >> level).max(1), (d.Height >> level).max(1));
+    let slices = u32::from(a.DepthOrArraySize.min(b.DepthOrArraySize)).max(1);
+    let last = (mips(&a) + to.base).min(mips(&b) + from.base);
+    let at = |texture: &ID3D12Resource, sub: u32| D3D12_TEXTURE_COPY_LOCATION {
+        // SAFETY: borrowed for the call; the list holds both textures.
+        pResource: unsafe { std::mem::transmute_copy(texture) },
+        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+    };
+    for slice in 0..slices {
+        for level in to.base.max(from.base)..last {
+            let (x, y) = (level - to.base, level - from.base);
+            if size(&a, x) != size(&b, y) {
+                continue;
+            }
+            let (t, f) = (at(&to.texture, slice * mips(&a) + x), at(&from.texture, slice * mips(&b) + y));
+            // SAFETY: an open list; both locations name live textures.
+            unsafe { list.list.CopyTextureRegion(&t, 0, 0, 0, &f, None) };
+        }
+    }
+}
+
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
@@ -1071,6 +1114,16 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             }
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
+            // Host copies of which `VICTORY_TEXTURE_MIP_DROP` left out
+            // other levels: not of one shape, so level by level.
+            if crate::resource::mip_drop() > 0
+                && let (Some(a), Some(b)) = (crate::resource::host_copy(dst), crate::resource::host_copy(src))
+                && (a.dropped > 0 || b.dropped > 0)
+                && a.base != b.base
+            {
+                copy_levels(list, &a, &b);
+                return;
+            }
             #[cfg(feature = "diagnostics")]
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
@@ -1098,6 +1151,21 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+/// `location` with the subresource of its texture's host copy
+/// (`crate::resource::HostTexture::host_sub`); `None` if that copy does not
+/// have it. A placed footprint as it is.
+#[cfg(windows)]
+fn host_sub(mut location: CopyLocation) -> Option<CopyLocation> {
+    const FOOTPRINT: u32 = 1;
+    if location.kind != FOOTPRINT
+        && crate::resource::mip_drop() > 0
+        && let Some(copy) = crate::resource::host_copy(location.resource)
+    {
+        location.footprint.offset = u64::from(copy.host_sub(location.footprint.offset as u32)?);
+    }
+    Some(location)
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -1162,6 +1230,12 @@ extern "system" fn copy_texture_region(
         if unlike(dst.resource, src.resource) {
             return;
         }
+        // A host copy `VICTORY_TEXTURE_MIP_DROP` left levels out of: the
+        // title's subresource is the host's at another index, and a copy to
+        // or from a level it does not have is left out.
+        let (Some(dst), Some(src)) = (host_sub(dst), host_sub(src)) else {
+            return;
+        };
         let mut from = src;
         // Both sides are the same subresource of one host texture (set below).
         let mut same = false;
@@ -1414,6 +1488,7 @@ fn read_back(
     if (x, y, z) != (0, 0, 0) {
         return Err("a destination corner other than the footprint's");
     }
+    let src = host_sub(src).ok_or("a level the host copy left out (VICTORY_TEXTURE_MIP_DROP)")?;
     let host = crate::host::host().ok_or("no host")?;
     let (footprint, [size, row, rows, pitch]) = dst.footprint.host_rows().ok_or("an unknown format")?;
     // The title's buffer holds every row at its own pitch.
@@ -1492,6 +1567,23 @@ extern "system" fn resolve(
         if unlike(dst, src) {
             return;
         }
+        // Levels `VICTORY_TEXTURE_MIP_DROP` left out, as for a copy: the
+        // host's subresource and, of a copy it left levels out of, its level.
+        let (mut dst_sub, mut src_sub, mut levels) = (dst_sub, src_sub, (0, 0));
+        if crate::resource::mip_drop() > 0 {
+            let host_sub = |this: This, sub: u32| match crate::resource::host_copy(this) {
+                Some(c) if c.dropped > 0 => {
+                    // SAFETY: a live resource.
+                    let mips = u32::from(unsafe { c.texture.GetDesc() }.MipLevels).max(1);
+                    c.host_sub(sub).map(|s| (s, s % mips))
+                }
+                _ => Some((sub, 0)),
+            };
+            let (Some((d, dl)), Some((s, sl))) = (host_sub(dst, dst_sub), host_sub(src, src_sub)) else {
+                return;
+            };
+            (dst_sub, src_sub, levels) = (d, s, (dl, sl));
+        }
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);
@@ -1504,7 +1596,9 @@ extern "system" fn resolve(
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
-            let (a, b) = (to.GetDesc(), from.GetDesc());
+            let (mut a, mut b) = (to.GetDesc(), from.GetDesc());
+            (a.Width, a.Height) = ((a.Width >> levels.0).max(1), (a.Height >> levels.0).max(1));
+            (b.Width, b.Height) = ((b.Width >> levels.1).max(1), (b.Height >> levels.1).max(1));
             let format = if crate::resource::stands_in(dst) { a.Format } else { DXGI_FORMAT(format as i32) };
             if (a.Width, a.Height) == (b.Width, b.Height) {
                 list.list

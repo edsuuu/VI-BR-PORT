@@ -113,7 +113,9 @@ pub(crate) struct Target {
 impl Target {
     pub(crate) fn new(resource: This) -> Option<Self> {
         // Keep the host copy independently of the title's resource lifetime.
-        let copy = crate::resource::host_copy(resource)?;
+        // (Not one `VICTORY_TEXTURE_MIP_DROP` left levels out of: its levels
+        // are not the title's.)
+        let copy = crate::resource::host_copy(resource).filter(|c| c.dropped == 0)?;
         let _mapping = crate::watch::title_memory_reading();
         let (layout, at, size) = crate::resource::title_texture(resource)?;
         let end = at.checked_add(size).filter(|&end| at != 0 && end > at)?;
