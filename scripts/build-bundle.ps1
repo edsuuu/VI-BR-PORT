@@ -47,7 +47,8 @@ if ($NoLauncher) {
 } else {
     Copy-Item -LiteralPath (Join-Path $release 'vi-launcher.exe') $stage
 }
-foreach ($f in 'victory.example.toml', 'LICENSE', 'README.md') { Copy-Item -LiteralPath (Join-Path $root $f) $stage }
+# The executable and its licence; how to use it is in the repository's README.
+Copy-Item -LiteralPath (Join-Path $root 'LICENSE') $stage
 $zip = Join-Path $Out "$name.zip"
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
