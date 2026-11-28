@@ -140,7 +140,7 @@ pub(crate) fn tick() {
 
 fn line() {
     let mb = |v: u64| v >> 20;
-    let [windows, window_bytes, cover, slot_held, slot_bytes] = crate::shadow::ram_windows();
+    let [windows, window_bytes, cover, slot_held, slot_bytes, copied, gone, gone_bytes, gone_slotted] = crate::shadow::ram_windows();
     let [copies, copy_bytes] = crate::shadow::alive();
     // What is not a window is a title buffer's copy (with its card side in
     // the card's memory, the CPU's side here).
@@ -155,7 +155,8 @@ fn line() {
     let free = crate::host::available_physical_ram().unwrap_or(0);
     tracing::info!(
         "PC memory we hold (VICTORY_RAM_LOG=0: no line; the caps of what is kept for reuse {}), MB: windows of title memory {} ({windows}, over {} of title memory, \
-         {slot_held} of them {} held by descriptor slots); title buffers' copies {} ({} copies in all; of them {} our own \
+         {slot_held} of them {} held by descriptor slots, {} of their pages ever copied, {gone} of them {} over title memory no \
+         longer committed and {} of that held by slots); title buffers' copies {} ({} copies in all; of them {} our own \
          memory, not shared with the card: VICTORY_CARD_SIDE_PRIVATE); lists' scratch {} \
          ({} of it kept spare), lists' other upload buffers {} ({}); blocks of texture staging {}; textures' own staging {} \
          ({stagings}); kept for submissions' sends {}; host lists {}; sum {}; shared with the card as the system counts it {}; \
@@ -164,6 +165,9 @@ fn line() {
         mb(window_bytes),
         mb(cover),
         mb(slot_bytes),
+        mb(copied),
+        mb(gone_bytes),
+        mb(gone_slotted),
         mb(mirror),
         copies,
         mb(crate::shadow::private_side_bytes()),

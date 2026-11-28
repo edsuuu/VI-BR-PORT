@@ -4588,6 +4588,25 @@ mod side_tests {
         drop(side);
         assert_eq!(private_side_bytes(), before);
     }
+
+    #[test]
+    fn committed_memory_is_found_anywhere_in_a_range() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree};
+        const LEN: usize = 8 << 16;
+        // SAFETY: plain allocations of our own, inside the reservation.
+        unsafe {
+            let at = VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_NOACCESS) as u64;
+            assert_ne!(at, 0);
+            assert!(!any_committed(at, LEN as u64), "reserved only");
+            assert!(!VirtualAlloc((at + (5 << 16)) as *const _, 1 << 16, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(any_committed(at, LEN as u64), "one page late in the range");
+            assert!(!any_committed(at, 5 << 16), "the range before it");
+            assert_ne!(VirtualFree((at + (5 << 16)) as *mut _, 1 << 16, MEM_DECOMMIT), 0);
+            assert!(!any_committed(at, LEN as u64), "decommitted again");
+            assert_ne!(VirtualFree(at as *mut _, 0, MEM_RELEASE), 0);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5480,17 +5499,62 @@ pub(crate) fn window_cover() -> u64 {
 /// once), and those a descriptor slot holds (a slot keeps the host buffer
 /// it views, `HostHeap::kept`) and their bytes. Under the read lock: the
 /// lookups go on meanwhile.
-pub(crate) fn ram_windows() -> [u64; 5] {
+///
+/// Then two measures of what could still be cut, each the most a change of
+/// docs/ram-mapa.md section 4 could take: the bytes of the windows' pages
+/// ever copied (the rest is zeros nothing wrote, what windows committed
+/// only where copied would not hold: 4.4), and the windows, and their
+/// bytes, whose title memory has no committed page left, then the bytes of
+/// those of them a slot holds (a slot of a view of memory the title let go:
+/// what the console would read there is stale, and only such windows could
+/// be let go under a slot without taking anything a shader reads: 4.6).
+pub(crate) fn ram_windows() -> [u64; 9] {
     let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-    let mut out = [loose.len() as u64, 0, cover(loose.keys().copied()), 0, 0];
+    let mut out = [loose.len() as u64, 0, cover(loose.keys().copied()), 0, 0, 0, 0, 0, 0];
     for s in loose.values() {
         out[1] += s.len;
-        if crate::host::references(&s.buffer) > 1 {
+        let slotted = crate::host::references(&s.buffer) > 1;
+        if slotted {
             out[3] += 1;
             out[4] += s.len;
         }
+        let pages = s.copied.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&at| at != 0).count() as u64;
+        out[5] += (pages * PAGE as u64).min(s.len);
+        if s.place.is_none() && !any_committed(s.start, s.len) {
+            out[6] += 1;
+            out[7] += s.len;
+            if slotted {
+                out[8] += s.len;
+            }
+        }
     }
     out
+}
+
+/// Whether any page of `[start, start + len)` is committed memory of the
+/// process (title memory lives in it).
+fn any_committed(start: u64, len: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let end = start.saturating_add(len);
+    let mut at = start;
+    while at < end {
+        // SAFETY: a plain structure of integers and pointers, all zeros valid.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query about our own address space into our structure.
+        let got = unsafe { VirtualQuery(at as *const _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if got == 0 {
+            return false;
+        }
+        if info.State == MEM_COMMIT {
+            return true;
+        }
+        let next = info.BaseAddress as u64 + info.RegionSize as u64;
+        if next <= at {
+            return false;
+        }
+        at = next;
+    }
+    false
 }
 
 /// Host copies alive and the bytes of title memory they copy ([`LIVE`]).
