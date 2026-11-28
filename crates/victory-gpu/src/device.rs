@@ -16,6 +16,8 @@ use crate::{
     descriptor, dxgi, fence, frame, list, pipeline, query, queue, resource, root, signature,
 };
 
+mod deserialize;
+
 /// What D3D returns when none of the requested feature levels is supported.
 const UNSUPPORTED: HRESULT = 0x887A_0004_u32 as i32;
 
@@ -346,15 +348,15 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
     }
 }
 
-/// Device methods 0x1c8 and 0x218 (`SLOT`). The title calls both
-/// (title+0x2477578 and title+0x24800d5) as `(this, description, interface
-/// id, out)`, asks for `ID3D12PipelineState`, and on success keeps the
-/// object `out` names and draws with it; on failure it goes without that
-/// pipeline, silently. What the descriptions hold is not known: the calls
-/// fail as they always did, with `out` null, and the first ones log the
-/// description's words and what its first word points at, so that the two
-/// methods can be written.
-/// shortcut: not implemented. Answering `S_OK` here without making the
+/// Device methods 0x1c8 and 0x218 (`SLOT`, `DeserializeGraphicsPipelineStateX`
+/// and `DeserializeComputePipelineStateX`) while `VICTORY_PSO_DESERIALIZE` is
+/// off ([`deserialize`]). The title calls both (title+0x2477578 and
+/// title+0x24800d5) as `(this, description, interface id, out)`, asks for
+/// `ID3D12PipelineState`, and on success keeps the object `out` names and
+/// draws with it; on failure it skips that pipeline of its list, silently.
+/// The calls fail with `out` null, and the first ones log the description's
+/// words and what its first word points at.
+/// shortcut: not implemented here. Answering `S_OK` without making the
 /// pipeline would hand the title whatever its stack held as an object.
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
@@ -395,6 +397,26 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             first_points_at = format_args!("{first:x?}"),
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
+        // Diagnostic: `VICTORY_PSO_DUMP=<dir>` writes the description and every block it names
+        // as (title address, byte count), to learn what the method is given.
+        #[cfg(windows)]
+        if let (Some(dir), Some(w)) = (std::env::var_os("VICTORY_PSO_DUMP"), description.as_ref()) {
+            let dir = std::path::Path::new(&dir);
+            let _ = std::fs::create_dir_all(dir);
+            let stem = format!("{SLOT:x}-{calls:05}");
+            let mut text = format!("{w:x?}\n");
+            for k in 1..w.len() - 1 {
+                let (at, len) = (w[k], w[k + 1]);
+                if (0x1_0000_0000..0x100_0000_0000).contains(&at) && (1..=0x10_0000).contains(&len) {
+                    let mut bytes = vec![0u8; len as usize];
+                    let got = crate::host::read_there(at as *const u8, &mut bytes);
+                    let head: String = bytes.iter().take(16).map(|b| format!("{b:02x}")).collect();
+                    text.push_str(&format!("word {k}: {at:#x} {len:#x} read {got} head {head}\n"));
+                    let _ = std::fs::write(dir.join(format!("{stem}-w{k}-{at:x}.bin")), &bytes);
+                }
+            }
+            let _ = std::fs::write(dir.join(format!("{stem}.txt")), text);
+        }
     }
     E_NOTIMPL
 }
@@ -449,10 +471,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
+    f[57] = deserialize::create_graphics as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = deserialize::create_compute as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238
