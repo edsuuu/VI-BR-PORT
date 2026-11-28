@@ -492,6 +492,12 @@ impl App {
             )),
             _ => None,
         };
+        let hover_status = match &missing {
+            Some(m) => format!("{status}
+
+{m}"),
+            None => status.clone(),
+        };
         let top = Rect::from_min_max(scene.min, pos2(scene.min.x + num("layout", "cardWidth").min(scene.width()), scene.max.y - num("size", "playHeight") - 40.0));
         ui.scope_builder(UiBuilder::new().max_rect(top).layout(Layout::top_down(egui::Align::Min)), |ui| {
             ui.spacing_mut().item_spacing.y = 12.0;
@@ -521,7 +527,16 @@ impl App {
             let no_game = matches!(plan, Err(PlanProblem::NoGame));
             let text = if no_game { self.t("play.choose_game") } else { self.t("play.button") }.to_uppercase();
             let busy = self.prep.as_ref().is_some_and(|p| !p.finished);
-            if theme::gradient_button(ui, &text, size, font, true, true, !busy && (plan.is_ok() || no_game)).clicked() {
+            let on = !busy && (plan.is_ok() || no_game);
+            let button = theme::gradient_button(ui, &text, size, font, true, true, on);
+            // Off, the mouse over it says why.
+            let button = if on {
+                button
+            } else {
+                let why = if busy { self.t("prep.title") } else { hover_status.clone() };
+                button.on_disabled_hover_text(why)
+            };
+            if button.clicked() {
                 if no_game {
                     if let Some(dir) = rfd::FileDialog::new().set_title(self.t("game.choose")).pick_folder() {
                         self.pick_game(dir);
