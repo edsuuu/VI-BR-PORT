@@ -87,6 +87,8 @@ mod ab;
 #[cfg(windows)]
 mod tdr;
 #[cfg(windows)]
+mod texmod;
+#[cfg(windows)]
 mod texture;
 pub mod timeline;
 #[cfg(windows)]

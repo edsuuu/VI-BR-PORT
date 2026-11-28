@@ -72,6 +72,11 @@ pub(crate) struct Shader {
     /// ([`crate::capture::note_ped_read`]).
     #[cfg(all(windows, feature = "diagnostics"))]
     pub(crate) peds: bool,
+    /// A pixel program of the title's interface (Scaleform, `SF_Batch*`):
+    /// what it samples the texture mods' dump can save
+    /// ([`crate::texmod::note_interface`]).
+    #[cfg(windows)]
+    pub(crate) interface: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -108,6 +113,19 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// A pixel program of the title's interface: Scaleform's, whose entry points
+/// are named `FTexTG*` (pictures, the buttons' icons among them) and
+/// `FText*` (the glyphs of text).
+#[cfg(windows)]
+fn interface(bytes: &[u8]) -> bool {
+    let has = |name: &[u8]| bytes.windows(name.len()).any(|w| w == name);
+    let yes = has(b"FTexTG") || has(b"FText");
+    if yes {
+        tracing::info!(bytes = bytes.len(), "an interface pixel program (Scaleform)");
+    }
+    yes
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -128,6 +146,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 bakes: bakes(bytes),
                 #[cfg(all(windows, feature = "diagnostics"))]
                 peds: stage == "pixel" && bytes.windows(14).any(|w| w == b"PS_DeferredPed"),
+                #[cfg(windows)]
+                interface: stage == "pixel" && interface(bytes),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })

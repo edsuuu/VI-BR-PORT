@@ -68,6 +68,9 @@ thread_local! {
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
     /// While a stage's tables are walked: whether that stage is a pixel
     /// program of the characters' G-buffer pass (`Shader::peds`).
+    /// While a stage's tables are walked: whether that stage is a pixel
+    /// program of the title's interface (`Shader::interface`).
+    static INTERFACE_STAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     #[cfg(feature = "diagnostics")]
     static PED_STAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// While `State::early_textures` runs the texture pass: the
@@ -1637,6 +1640,7 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            INTERFACE_STAGE.set(stage.shader.interface);
             #[cfg(feature = "diagnostics")]
             PED_STAGE.set(stage.shader.peds);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
@@ -1650,6 +1654,7 @@ impl State {
                 compute,
             );
             STORES.set(true);
+            INTERFACE_STAGE.set(false);
             #[cfg(feature = "diagnostics")]
             PED_STAGE.set(false);
             if made.iter().any(|m| m.1 == u32::MAX) {
@@ -4732,6 +4737,10 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             // every frame are never written in it) are saved too.
             #[cfg(feature = "diagnostics")]
             crate::capture::note_read_depth(*resource as This);
+            // What the interface samples (the texture mods' dump).
+            if INTERFACE_STAGE.get() {
+                crate::texmod::note_interface(*resource as This);
+            }
             // What a character's G-buffer draw samples (the guard's arm
             // that shows a normal map's blue).
             #[cfg(feature = "diagnostics")]

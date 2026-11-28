@@ -723,6 +723,13 @@ pub(crate) fn digest(bytes: &[u8]) -> Digest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Digest(u128);
 
+impl Digest {
+    /// Its 128 bits (the texture mods are named by them).
+    pub(crate) fn value(&self) -> u128 {
+        self.0
+    }
+}
+
 /// [`upload`] of the levels from `first` on, the ones a view shows: of a
 /// texture the title placed there may be no memory of the larger ones, and
 /// what lies there is another texture's. (After victory-amd 4436f8f1.)
@@ -1525,6 +1532,29 @@ impl Staging {
                 return;
             }
         }
+        // A mod replaces what was detiled; an interface texture is dumped.
+        if crate::texmod::on() {
+            // SAFETY: the mapped staging buffer, all of it.
+            let staged = unsafe { std::slice::from_raw_parts_mut(self.data, self.bytes as usize) };
+            crate::texmod::detiled(self.memory as usize, tiled, staged, || self.describe());
+        }
+    }
+
+    /// The staging buffer as the texture mods' dump describes it: the
+    /// title's texture, then each subresource's place in the buffer.
+    fn describe(&self) -> String {
+        use std::fmt::Write;
+        let mut out = format!("desc {:?}\nmips {} first {} bytes {}\n", self.layout.desc, self.mips, self.first, self.bytes);
+        for (i, (f, rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
+            let (mip, slice) = self.part(i);
+            let p = f.Footprint;
+            let _ = writeln!(
+                out,
+                "subresource {i} mip {mip} slice {slice} offset {} format {} width {} height {} depth {} pitch {} rows {rows}",
+                f.Offset, p.Format.0, p.Width, p.Height, p.Depth, p.RowPitch
+            );
+        }
+        out
     }
 }
 
@@ -1535,6 +1565,16 @@ pub(crate) fn unstage(resource: This) {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(map) = map.as_mut() {
         map.remove(&(resource as usize));
+    }
+}
+
+/// Makes the next refresh of a staged title texture detile it again (the
+/// texture mods' dump, for a texture it learnt about after its detiling).
+pub(crate) fn detile_again(resource: This) {
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(staging) = map.as_ref().and_then(|m| m.get(&(resource as usize))) {
+        staging.forget();
+        staging.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
