@@ -131,6 +131,16 @@ pub(crate) fn enabled() -> bool {
     config().is_some()
 }
 
+/// The cursor let go: the key bound to Menu (Esc) frees it, for the pause menu
+/// and other windows, and again takes it back. While free the mouse does not
+/// turn the camera and the cursor shows (lifecycle's WM_SETCURSOR); the keys
+/// still drive the pad, so the menus are walked with them.
+static RELEASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn cursor_released() -> bool {
+    RELEASED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Default)]
 struct Mouse {
     window: usize,
@@ -139,6 +149,8 @@ struct Mouse {
     last: Option<Instant>,
     last_motion: Option<Instant>,
     centered: bool,
+    /// The Menu key was down at the last sample (a press frees or takes the cursor).
+    menu_down: bool,
 }
 fn mouse() -> std::sync::MutexGuard<'static, Mouse> {
     static STATE: OnceLock<Mutex<Mouse>> = OnceLock::new();
@@ -225,7 +237,19 @@ pub(super) fn sample() -> Option<PadState> {
     let elapsed = m
         .last
         .map_or(Duration::from_millis(8), |last| now.duration_since(last));
-    if elapsed >= Duration::from_millis(8) {
+    let held = |vk: u8| (unsafe { GetAsyncKeyState(vk.into()) }) < 0;
+    let menu_down = b.buttons.iter().any(|&(vk, bit)| bit == MENU && held(vk));
+    if menu_down && !m.menu_down {
+        RELEASED.fetch_xor(true, std::sync::atomic::Ordering::Relaxed);
+        m.centered = false;
+    }
+    m.menu_down = menu_down;
+    if cursor_released() {
+        // No camera from the mouse, and the cursor left where the player puts it.
+        m.velocity = [0.0; 2];
+        m.stick = [0.0; 2];
+        m.last = Some(now);
+    } else if elapsed >= Duration::from_millis(8) {
         let displacement = recenter(hwnd);
         let delta = if m.centered {
             displacement.unwrap_or_default()
@@ -236,7 +260,6 @@ pub(super) fn sample() -> Option<PadState> {
         m.update_look(delta, now, elapsed, b.sensitivity);
         m.last = Some(now);
     }
-    let held = |vk: u8| (unsafe { GetAsyncKeyState(vk.into()) }) < 0;
     let axes = b
         .axes
         .each_ref()

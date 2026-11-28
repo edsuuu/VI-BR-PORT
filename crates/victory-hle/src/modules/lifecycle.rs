@@ -260,6 +260,7 @@ extern "system" fn window_proc(
     if message == wm::WM_SETCURSOR
         && (lparam as u16) == wm::HTCLIENT as u16
         && super::gameinput::mnk::enabled()
+        && !super::gameinput::mnk::cursor_released()
         && unsafe { wm::GetForegroundWindow() } == hwnd
     {
         unsafe { wm::SetCursor(std::ptr::null_mut()) };
