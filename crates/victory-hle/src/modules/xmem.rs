@@ -554,6 +554,15 @@ const FIRST_PAGE: usize = 0x10_0000;
 /// ([`FRAMES`]).
 const PAGE_LIMIT: usize = 1 << 25;
 
+/// Whether numbers freed are given again once new ones would pass the
+/// title's 21 bits ([`Pages::take`]; `VICTORY_XMEM_REUSE_PAGES=0`: numbers
+/// only grow, as before, for runs that measure how near a scene comes to the
+/// limit, `VICTORY_XMEM_PAGES_LINE`). On by default.
+fn reuse_numbers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_XMEM_REUSE_PAGES").is_none_or(|v| v != "0"))
+}
+
 impl Pages {
     /// The first of `n` numbers, [`FRAMES`] apart, for new pages: after the
     /// last given while they fit the title's 21 bits (as before), then the
@@ -561,7 +570,7 @@ impl Pages {
     fn take(&mut self, n: usize) -> Option<usize> {
         let len = n.checked_mul(FRAMES)?;
         let end = self.next_page.checked_add(len);
-        if let Some(end) = end.filter(|&end| end <= PAGE_LIMIT) {
+        if let Some(end) = end.filter(|&end| end <= PAGE_LIMIT || !reuse_numbers()) {
             let first = self.next_page;
             self.next_page = end;
             return Some(first);
