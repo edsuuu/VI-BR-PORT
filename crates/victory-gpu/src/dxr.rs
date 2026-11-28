@@ -2,30 +2,57 @@
 //! the host's driver builds from triangle lists and instances, which ray
 //! queries in compute programs walk in hardware.
 //!
-//! The layer does not use it yet. Today the title's structure builder
-//! (`XboxBvhBuilder.dll`) builds the console's own structures in title
-//! memory with compute programs we translate, and the title's ray programs
-//! walk them themselves around the console's node test
-//! (`victory_shader::emit`, `intersect.rs`). The builder's entry points take
-//! the standard D3D12 build descriptions (triangles, indices, instance
-//! descriptions), so the host could build those structures instead; this
-//! module holds what that needs on the host side and, in its tests, the
-//! proof that it works end to end on this card with programs of our own
-//! writer (`victory_shader::emit::ray_query_probe`) and what builds cost.
+//! Today the title's structure builder (`XboxBvhBuilder.dll`) builds the
+//! console's own structures in title memory with compute programs we
+//! translate, and the title's ray programs walk them themselves around the
+//! console's node test (`victory_shader::emit`, `intersect.rs`). The
+//! builder's entry points take the standard D3D12 build descriptions
+//! (triangles, indices, instance descriptions), so the host can build the
+//! same structures with its own hardware's builder.
 //!
-//! What runs outside the tests: [`log_tier`], at start-up.
+//! With `VICTORY_DXR_NATIVE=shadow` (or `1`; unset: off, the default, and
+//! nothing here runs but [`log_tier`] at start-up) the listening post in
+//! front of the title's builder (`victory_hle::modules::bvh_builder`) hands
+//! every description it decodes to [`record`] and [`copy`], which build
+//! the host's structures at the same place of the same title list as the
+//! console's ([`crate::list::external`]): they inherit the title's own
+//! ordering of skinning, builds and reads. No program reads them yet; a
+//! five-second line says what was built (`native::line`).
+//!
+//! - `native`: the recording (copies of the vertex data, refit or build,
+//!   barriers, timestamps), the counts and the line;
+//! - `top`: top levels, their instances rewritten at submission to name the
+//!   host's bottom levels;
+//! - `table`: the title's destination address to the host structure, with
+//!   generations and the refit-or-rebuild decision;
+//! - `pool`: the card memory structures and scratch memory are cut from.
+//!
+//! The tests prove the host side end to end on the card with programs of
+//! our own writer (`victory_shader::emit::ray_query_probe`) and measure
+//! what builds cost.
 
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_DATA_D3D12_OPTIONS5, ID3D12Device,
 };
 
-// The bookkeeping of the host's own structures (nothing builds one yet).
+mod native;
 mod pool;
 mod table;
+mod top;
+
+pub(crate) use native::{frame, line};
 
 /// `D3D12_RAYTRACING_TIER_1_1`: inline ray tracing (ray queries in any
 /// program), which a translated program needs to ask the host's hardware.
 pub(crate) const TIER_1_1: i32 = 11;
+
+/// The tier [`log_tier`] found (`D3D12_RAYTRACING_TIER_1_0` is 10).
+static TIER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// The tier [`log_tier`] found.
+pub(crate) fn tier() -> i32 {
+    TIER.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Logs the host's ray-tracing tier and returns it (0: none; 10 tier 1.0,
 /// 11 tier 1.1, 12 tier 1.2).
@@ -45,7 +72,156 @@ pub(crate) fn log_tier(device: &ID3D12Device) -> i32 {
         _ => "newer",
     };
     tracing::info!(tier = name, inline = tier >= TIER_1_1, "host ray tracing");
+    TIER.store(tier, std::sync::atomic::Ordering::Relaxed);
     tier
+}
+
+/// A DXGI format a structure build may be given, by name; others by number.
+pub(crate) fn format_name(f: u32) -> String {
+    let name = match f {
+        0 => "UNKNOWN",
+        2 => "R32G32B32A32_FLOAT",
+        6 => "R32G32B32_FLOAT",
+        10 => "R16G16B16A16_FLOAT",
+        11 => "R16G16B16A16_UNORM",
+        13 => "R16G16B16A16_SNORM",
+        16 => "R32G32_FLOAT",
+        24 => "R10G10B10A2_UNORM",
+        28 => "R8G8B8A8_UNORM",
+        31 => "R8G8B8A8_SNORM",
+        34 => "R16G16_FLOAT",
+        35 => "R16G16_UNORM",
+        37 => "R16G16_SNORM",
+        42 => "R32_UINT",
+        49 => "R8G8_UNORM",
+        51 => "R8G8_SNORM",
+        57 => "R16_UINT",
+        _ => return format!("format {f}"),
+    };
+    name.into()
+}
+
+/// What `VICTORY_DXR_NATIVE` asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Native {
+    /// Unset (the default): the host builds nothing.
+    Off,
+    /// `shadow`: the title's own builder runs as before and the host builds
+    /// the same structures beside it, which nothing reads yet.
+    Shadow,
+    /// `1`: only the host builds (the listening post stops calling the
+    /// title's builder; here the same as `shadow`).
+    Only,
+}
+
+/// `VICTORY_DXR_NATIVE` (see [`Native`]; anything else is off). With
+/// `VICTORY_RT_MISS=1` it is off whatever it says: every ray misses there,
+/// and the comparisons of runs made with it keep their meaning.
+pub fn native() -> Native {
+    static MODE: std::sync::OnceLock<Native> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        let asked = match std::env::var("VICTORY_DXR_NATIVE").as_deref().map(str::trim) {
+            Ok("shadow") => Native::Shadow,
+            Ok("1") => Native::Only,
+            _ => Native::Off,
+        };
+        if asked != Native::Off && victory_shader::emit::rt_miss() {
+            tracing::warn!("VICTORY_RT_MISS=1 turns VICTORY_DXR_NATIVE off: the host builds no structures");
+            return Native::Off;
+        }
+        if asked != Native::Off {
+            tracing::info!(
+                mode = ?asked,
+                "VICTORY_DXR_NATIVE: the host builds the title's ray-tracing structures beside the console's"
+            );
+        }
+        asked
+    })
+}
+
+/// Whether the host builds structures ([`native`] is not off).
+pub fn native_on() -> bool {
+    native() != Native::Off
+}
+
+/// One triangle geometry of a bottom-level build, as Direct3D's
+/// `D3D12_RAYTRACING_GEOMETRY_DESC` of type triangles holds it (title GPU
+/// addresses, which are the title's CPU addresses).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Triangles {
+    /// `D3D12_RAYTRACING_GEOMETRY_FLAGS` (1: opaque, 2: no duplicate any-hit).
+    pub flags: u32,
+    /// A 3x4 row-major matrix, or 0.
+    pub transform: u64,
+    /// DXGI formats.
+    pub index_format: u32,
+    pub vertex_format: u32,
+    pub index_count: u32,
+    pub vertex_count: u32,
+    pub index_buffer: u64,
+    pub vertex_buffer: u64,
+    pub vertex_stride: u64,
+}
+
+/// One geometry of a bottom-level build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Geometry {
+    Triangles(Triangles),
+    /// Procedural boxes (`D3D12_RAYTRACING_GEOMETRY_AABBS_DESC`).
+    Boxes { flags: u32, count: u64, start: u64, stride: u64 },
+    /// A kind the listening post does not know.
+    Other { kind: u32, flags: u32 },
+}
+
+/// What a build is of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Level {
+    /// The geometries as read from the title's description, and whether all
+    /// of them could be read.
+    Bottom { geometries: Vec<Geometry>, whole: bool },
+    /// `count` instance descriptions at `instances` (title memory), laid out
+    /// as `D3D12_ELEMENTS_LAYOUT` `layout` says (0: an array).
+    Top { instances: u64, count: u32, layout: u32 },
+}
+
+/// One build the title asked its builder for: Direct3D's
+/// `D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC`, decoded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Build {
+    pub dest: u64,
+    /// The structure an update starts from (0: none, or the destination).
+    pub source: u64,
+    /// `D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS`.
+    pub flags: u32,
+    pub level: Level,
+}
+
+/// Which of the title's calls a build comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Origin {
+    /// `BuildRaytracingAccelerationStructureBatched2X`.
+    Batched,
+    /// `RehydrateRaytracingAccelerationStructureBatched2X`: a structure the
+    /// title shipped packed, unpacked in place; the host builds it from the
+    /// geometries its description still names, from scratch.
+    Rehydrated,
+}
+
+/// The title recorded `builds` into its list `list` (the command list it
+/// passed its builder, one of ours): with [`native_on`], the host records its
+/// own builds of the same at this place of the list. Nothing otherwise.
+/// Call it after the title's builder recorded its own work, so that what
+/// the host records comes after it.
+pub fn record(list: *mut std::ffi::c_void, origin: Origin, builds: Vec<Build>) {
+    native::record(list.cast_const().cast(), origin, builds);
+}
+
+/// The title copied the structure at `source` to `dest` in its list `list`
+/// (`D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE` `mode`: 0 a clone, 1
+/// a compaction): with [`native_on`], the host copies its own structure the
+/// same way at this place of the list.
+pub fn copy(list: *mut std::ffi::c_void, dest: u64, source: u64, mode: i32) {
+    native::copy(list.cast_const().cast(), dest, source, mode);
 }
 
 /// Building on the host: test-only for now (nothing in the layer builds a
