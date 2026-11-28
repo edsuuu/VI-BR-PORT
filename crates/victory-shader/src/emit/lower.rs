@@ -25,6 +25,12 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// The host's ray query at a site that stands for a walk the translation
+/// took out (`walk/replace.rs`), a child module so it shares the emitter's
+/// state.
+#[path = "walk/query.rs"]
+mod query;
+
 /// Format loads that move 16-bit halves without the d16 form, a child
 /// module so it shares the emitter's state.
 #[path = "halves.rs"]
@@ -5688,9 +5694,13 @@ impl<'a> Lower<'a> {
             // program where its results are needed, and two trace programs
             // came out without their test that way.
             Fields::Image { .. } if name.starts_with("image_bvh") => {
-                return self
-                    .bvh(inst, b, i)
-                    .map_err(|why| unsupported(offset, why));
+                // (a site that stands for a walk taken out: the host's ray query)
+                let walk = super::walk::query_at(inst.machine.offset);
+                return match walk {
+                    Some(q) => self.ray_query(inst, b, i, &q),
+                    None => self.bvh(inst, b, i),
+                }
+                .map_err(|why| unsupported(offset, why));
             }
             Fields::Image { .. } => self.image(inst, b, i),
             Fields::Buffer { .. } => self.buffer(inst, b, i),

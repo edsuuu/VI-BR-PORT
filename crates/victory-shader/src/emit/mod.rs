@@ -549,7 +549,52 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
 }
 
 /// Emits a program whose earlier stages already ran.
+///
+/// The walks of the title's ray-tracing structure that `VICTORY_RT_QUERY`
+/// names ([`walk::families`]) come out of the program first
+/// ([`walk::take_out`]): every form below, and the choice among them, is
+/// then made on the program without them, as the native design's critic
+/// asks (item 8). A walk is what keeps some wave64 ray programs in a costly
+/// or approximate form, which the program without it may not need. A
+/// program that does not get through its earlier stages, or is refused,
+/// without its walks is emitted as it is. Off by default: nothing here then
+/// changes a translation.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    if let Some((q, queries)) = walk::take_out(native, p, st) {
+        let why = std::env::var_os("VICTORY_WAVE_WHY").is_some();
+        let n = queries.len();
+        let again = structure::structure(&q).and_then(|qst| {
+            let qres = resource::track(&q, &native.layout, native.stage, Some(&qst))?;
+            let qio = io::raise(&q, native)?;
+            walk::with_queries(queries, || emit_forms(c, native, &q, &qst, &qio, &qres))
+        });
+        match again {
+            Ok(shader) => {
+                if why {
+                    eprintln!("RT-QUERY {n} walks made host ray queries");
+                }
+                return Ok(shader);
+            }
+            Err(e) => {
+                if why {
+                    eprintln!("RT-QUERY {n} walks taken out, then refused ({e}): the program as it is");
+                }
+            }
+        }
+    }
+    emit_forms(c, native, p, st, io, res)
+}
+
+/// [`emit`] of the program as it is given: the forms of a console wave64
+/// program on a host of 32-lane waves, and the retries.
+fn emit_forms(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
