@@ -1054,7 +1054,7 @@ pub fn plausible_two_floats(memory: &dyn Memory, g: &Geometry) -> Option<bool> {
     else {
         return None;
     };
-    if vertex_buffer == 0 || vertex_count == 0 || vertex_stride < 8 || vertex_stride >= 0x8000 {
+    if vertex_buffer == 0 || vertex_count == 0 || !(8..0x8000).contains(&vertex_stride) {
         return None;
     }
     let n = (vertex_count as usize).min(PEEKED_VERTICES);
