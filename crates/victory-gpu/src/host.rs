@@ -702,6 +702,7 @@ static LANE_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomi
 /// The line of [`LANE_PARTS`], with the frame-rate lines. (Two clock reads
 /// a part, some 25 submissions a frame: nothing a frame would notice.)
 fn lane_line(frames: f64) {
+    crate::timeline::split_line(frames);
     let p: Vec<f64> = LANE_PARTS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64).collect();
     if p.iter().all(|&n| n == 0.0) {
         return;
