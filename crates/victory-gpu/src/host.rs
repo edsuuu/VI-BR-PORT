@@ -123,7 +123,8 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
+/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`,
+/// at most [`assumed_free`].
 pub(crate) fn available_physical_ram() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
@@ -131,7 +132,24 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some(m.ullAvailPhys.min(assumed_free()))
+}
+
+/// The most free PC memory our caches are told there is, in bytes
+/// (`VICTORY_RAM_ASSUME_FREE_MB`; unset: no limit). With 20 to 40 GB free
+/// on the 64 GB machine the runs are measured on, windows of title memory,
+/// staging buffers and the pipeline library's file are kept for five
+/// minutes ([`ram_idle_ms`]); on a 16 GB PC, with under 4 GiB free, for 2
+/// to 10 seconds. Set to 3000, the big machine lets go as the small one
+/// does, and shows what it then holds, without a process that takes the
+/// memory and makes the system page.
+fn assumed_free() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| assumed_free_for(std::env::var("VICTORY_RAM_ASSUME_FREE_MB").ok().as_deref()))
+}
+
+fn assumed_free_for(setting: Option<&str>) -> u64 {
+    setting.and_then(|v| v.trim().parse::<u64>().ok()).map_or(u64::MAX, |mb| mb.saturating_mul(1 << 20))
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -12101,6 +12119,15 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+    }
+
+    #[test]
+    fn free_memory_can_be_assumed_lower() {
+        use super::assumed_free_for;
+        assert_eq!(assumed_free_for(None), u64::MAX);
+        assert_eq!(assumed_free_for(Some(" 3000 ")), 3000 << 20);
+        assert_eq!(assumed_free_for(Some("lots")), u64::MAX);
+        assert_eq!(super::ram_idle_for(Some(assumed_free_for(Some("3000"))), true), 5_000);
     }
 
     #[test]
