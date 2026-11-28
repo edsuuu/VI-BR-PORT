@@ -12,7 +12,8 @@
 //! (`VICTORY_DXR_PROBE_EYE=x,y,z`, or else the middle of the instances'
 //! places, each axis's median) at it with ray queries. The distances and the
 //! instances hit are saved as two PNGs in `VICTORY_DXR_PROBE_DIR` (by
-//! default `dxr-probe` in the working directory).
+//! default the folder of the frame pictures, `VICTORY_CAPTURE`, or else
+//! `dxr-probe` in the working directory).
 //!
 //! The critic's item 6: the probe also fires a grid of 24 x 12 of the same
 //! rays at the **console's** top level of the same destination with a walk
@@ -25,8 +26,18 @@
 //! geometry, primitive, barycentrics; the console's facing), and a text file
 //! beside the pictures lists every ray. What moves between the frames of the
 //! rounds (a refit bottom level) differs by that much.
+//!
+//! The critic's item 3 (the console's bottom levels lie in a frame of their
+//! own, turned and scaled against the title's object space): of the hits
+//! both sides make at the same distance in the same instance, the line also
+//! says what that frame is (the instance node's turn times the title's
+//! instance transform: the same axes, the axes swapped, turned over or
+//! scaled, or something else; mirrored or not), how often the triangle's
+//! flip bit goes with the mirroring, what Direct3D's front face is from the
+//! console's winding, and the bottom levels' frame words. The host's own
+//! facing is compared once the probe's program writes it.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -79,8 +90,15 @@ fn every() -> u64 {
     })
 }
 
+/// `VICTORY_DXR_PROBE_DIR`; else the folder of the title's frame pictures
+/// (`VICTORY_CAPTURE`, `crate::capture`), so the probe's lie beside the
+/// title's of about the same frames; else `dxr-probe` in the working
+/// directory.
 fn folder() -> PathBuf {
-    std::env::var_os("VICTORY_DXR_PROBE_DIR").map_or_else(|| PathBuf::from("dxr-probe"), PathBuf::from)
+    std::env::var_os("VICTORY_DXR_PROBE_DIR")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("VICTORY_CAPTURE").filter(|v| !v.is_empty()))
+        .map_or_else(|| PathBuf::from("dxr-probe"), PathBuf::from)
 }
 
 fn eye_asked() -> Option<[f32; 3]> {
@@ -238,8 +256,20 @@ struct Round {
 #[derive(Default)]
 struct Cache {
     pages: HashMap<u64, Box<[u8]>>,
-    /// Pages with no place on the card.
-    absent: HashSet<u64>,
+    /// Pages that had no place on the card when they were asked for, and
+    /// how often (a page gets its place at a submission, `crate::memory`:
+    /// one the walk needs is asked for again in the next rounds).
+    absent: HashMap<u64, u32>,
+}
+
+/// Rounds a page with no place is asked for in, at most.
+const ABSENT_TRIES: u32 = 3;
+
+impl Cache {
+    /// Whether `page` had no place each time it was asked for.
+    fn gone(&self, page: u64) -> bool {
+        self.absent.get(&page).is_some_and(|&n| n >= ABSENT_TRIES)
+    }
 }
 
 impl Pages for Cache {
@@ -264,8 +294,8 @@ struct Run {
     count: u32,
     fired: u64,
     sent: Arc<Mutex<Option<Sent>>>,
-    /// The host's hits, once read back.
-    host: Option<Vec<[u32; 8]>>,
+    /// The host's hits, once read back ([`HIT`] dwords each).
+    host: Option<Vec<u32>>,
     cache: Cache,
     round: Option<Round>,
     rounds: u32,
@@ -454,7 +484,7 @@ pub(super) fn tick() {
         }
         // SAFETY: the readback mapping of `RAYS` hits, written frames ago.
         let all = unsafe { std::slice::from_raw_parts(kit.hits_data, (RAYS * PROBE_HIT_DWORDS) as usize) };
-        let hits: Vec<[u32; 8]> = all.chunks_exact(8).map(|h| std::array::from_fn(|k| h[k])).collect();
+        let hits = all.to_vec();
         pictures(run, &hits);
         run.host = Some(hits);
     }
@@ -465,7 +495,7 @@ pub(super) fn tick() {
         }
         for (slot, &(page, there)) in round.pages.iter().enumerate() {
             if !there {
-                run.cache.absent.insert(page);
+                *run.cache.absent.entry(page).or_insert(0) += 1;
                 continue;
             }
             // SAFETY: inside the readback mapping, written frames ago.
@@ -487,7 +517,7 @@ pub(super) fn tick() {
     let missing: BTreeSet<u64> = walked
         .iter()
         .filter_map(|w| match *w {
-            Walked::Missing(p) if !run.cache.absent.contains(&p) => Some(p),
+            Walked::Missing(p) if !run.cache.gone(p) => Some(p),
             _ => None,
         })
         .collect();
@@ -502,21 +532,46 @@ pub(super) fn tick() {
     st.next = now + every();
 }
 
-/// The host's hit of pixel `i` as (t, instance index, id, primitive,
-/// geometry, barycentrics), if it hit.
-fn host_hit(hits: &[[u32; 8]], i: usize) -> Option<(f32, u32, u32, u32, u32, [f32; 2])> {
-    let h = hits.get(i)?;
-    (h[0] == COMMITTED_TRIANGLE_HIT)
-        .then(|| (f32::from_bits(h[1]), h[2], h[3], h[4], h[5], [f32::from_bits(h[6]), f32::from_bits(h[7])]))
+/// Dwords of one ray's result from the probe's program: committed status,
+/// t, instance index, instance id, primitive, geometry, the two
+/// barycentrics; a ninth, if the program writes one, is taken as
+/// `CommittedTriangleFrontFace` (it does not today: `emit/rayquery.rs`).
+const HIT: usize = PROBE_HIT_DWORDS as usize;
+
+/// What the host's query found for one ray.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HostHit {
+    t: f32,
+    index: u32,
+    id: u32,
+    primitive: u32,
+    geometry: u32,
+    uv: [f32; 2],
+    /// Front-facing, if the program says.
+    front: Option<bool>,
 }
 
-fn pictures(run: &Run, hits: &[[u32; 8]]) {
-    let far = (0..hits.len()).filter_map(|i| host_hit(hits, i).map(|h| h.0)).fold(1.0f32, f32::max);
+/// The host's hit of pixel `i`, if it hit.
+fn host_hit(hits: &[u32], i: usize) -> Option<HostHit> {
+    let h = hits.get(i * HIT..i * HIT + HIT)?;
+    (h[0] == COMMITTED_TRIANGLE_HIT).then(|| HostHit {
+        t: f32::from_bits(h[1]),
+        index: h[2],
+        id: h[3],
+        primitive: h[4],
+        geometry: h[5],
+        uv: [f32::from_bits(h[6]), f32::from_bits(h[7])],
+        front: h.get(8).map(|&f| f != 0),
+    })
+}
+
+fn pictures(run: &Run, hits: &[u32]) {
+    let far = (0..RAYS as usize).filter_map(|i| host_hit(hits, i).map(|h| h.t)).fold(1.0f32, f32::max);
     let mut depth = Vec::with_capacity((RAYS * 3) as usize);
     let mut ids = Vec::with_capacity((RAYS * 3) as usize);
     for i in 0..RAYS as usize {
         match host_hit(hits, i) {
-            Some((t, index, ..)) => {
+            Some(HostHit { t, index, .. }) => {
                 let v = (255.0 * (1.0 - (1.0 + t.max(0.0)).ln() / (1.0 + far).ln())).clamp(16.0, 255.0) as u8;
                 depth.extend([v, v, v]);
                 let h = (index.wrapping_add(1)).wrapping_mul(0x9E37_79B9);
@@ -545,21 +600,103 @@ fn near(a: f32, b: f32) -> bool {
     (a - b).abs() <= 1e-3 * a.abs().max(b.abs()).max(1.0)
 }
 
-fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits: &[[u32; 8]]) {
-    let contribution = |index: u32| {
-        let d = sent.instances.get(index as usize * INSTANCE..index as usize * INSTANCE + INSTANCE)?;
-        Some(u32::from_le_bytes(d[52..56].try_into().unwrap_or_default()) & 0xff_ffff)
-    };
+/// How the console's frame of a bottom level stands to the title's object
+/// space, seen from one hit (the critic's item 3): the instance node's turn
+/// times the title's instance transform (3x3s) maps the title's object
+/// space into the frame the console's nodes are in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Frame {
+    /// The title's own axes (but for rounding).
+    Same,
+    /// Its axes swapped, turned over or scaled (one entry a row and a
+    /// column), as the builder's 64 turns of the axes and per-axis scales
+    /// would give.
+    Axes,
+    /// Anything else (another instance's transform, or a turn the walk read
+    /// wrong).
+    Other,
+}
+
+/// The [`Frame`] of `p` (rows of three), and whether it mirrors (its
+/// determinant is negative: every triangle winds the other way round in
+/// the console's frame than in the title's object space).
+fn frame(p: &[f32; 9]) -> (Frame, bool) {
+    let det = p[0] * (p[4] * p[8] - p[5] * p[7]) - p[1] * (p[3] * p[8] - p[5] * p[6]) + p[2] * (p[3] * p[7] - p[4] * p[6]);
+    let same = p.iter().enumerate().all(|(k, &v)| (v - if k % 4 == 0 { 1.0 } else { 0.0 }).abs() <= 1e-3);
+    if same {
+        return (Frame::Same, false);
+    }
+    let mut columns = [false; 3];
+    let axes = p.chunks_exact(3).all(|row| {
+        let (c, big) = row.iter().map(|v| v.abs()).enumerate().fold((0, 0.0f32), |a, b| if b.1 > a.1 { b } else { a });
+        let alone = big > 0.0 && big.is_finite() && row.iter().enumerate().all(|(k, v)| k == c || v.abs() <= 1e-3 * big);
+        alone && !std::mem::replace(&mut columns[c], true)
+    });
+    (if axes { Frame::Axes } else { Frame::Other }, det < 0.0)
+}
+
+/// The 3x3 of a title instance description's transform (rows of three).
+fn title_turn(d: &[u8]) -> [f32; 9] {
+    let f = |k: usize| f32::from_le_bytes(d[4 * k..4 * k + 4].try_into().unwrap_or_default());
+    [f(0), f(1), f(2), f(4), f(5), f(6), f(8), f(9), f(10)]
+}
+
+/// `a b` of two 3x3s (rows of three).
+fn times(a: &[f32; 9], b: &[f32; 9]) -> [f32; 9] {
+    std::array::from_fn(|k| (0..3).map(|i| a[3 * (k / 3) + i] * b[3 * i + k % 3]).sum())
+}
+
+/// `D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_FRONT_COUNTERCLOCKWISE`.
+const FRONT_COUNTERCLOCKWISE: u8 = 0x2;
+
+/// A triangle's roles byte: bit 5 (the flip bit of the public layout of this
+/// node format, `nativo-programas.md` 2.4).
+const ROLES_FLIP: u32 = 0x20;
+
+/// The facing of a hit both sides made at the same distance in the same
+/// instance: the console's frame against the title's object space and what
+/// Direct3D's front face is from the console's winding (Direct3D takes the
+/// winding in object space, clockwise from the origin unless the instance
+/// says counterclockwise; the console's denominator is the winding in its
+/// own frame, which a mirroring frame turns round).
+struct Facing {
+    frame: Frame,
+    mirrored: bool,
+    flip: bool,
+    front: bool,
+}
+
+fn facing(c: &walk::Hit, instance: &[u8]) -> Facing {
+    let title = title_turn(instance);
+    let p = c.turn.map_or(title, |m| times(&m, &title));
+    let (frame, mirrored) = frame(&p);
+    let counterclockwise = instance[55] & FRONT_COUNTERCLOCKWISE != 0;
+    Facing { frame, mirrored, flip: c.roles & ROLES_FLIP != 0, front: c.clockwise ^ mirrored ^ counterclockwise }
+}
+
+fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits: &[u32]) {
+    let instance = |index: u32| sent.instances.get(index as usize * INSTANCE..index as usize * INSTANCE + INSTANCE);
+    let contribution = |index: u32| instance(index).map(|d| u32::from_le_bytes(d[52..56].try_into().unwrap_or_default()) & 0xff_ffff);
     let [mut both, mut neither, mut host_only, mut console_only, mut unfinished, mut absent] = [0u32; 6];
     let [mut t_same, mut id_same, mut contribution_same, mut geometry_same, mut primitive_same, mut uv_same, mut clockwise] =
         [0u32; 7];
+    // Of the hits at the same distance and instance id: the frames, the
+    // facings, and the host's facing where the program says it.
+    let [mut faced, mut frame_same, mut frame_axes, mut frame_other, mut mirrored, mut flipped, mut flip_agrees, mut front] =
+        [0u32; 8];
+    let [mut host_faced, mut host_front, mut face_same] = [0u32; 3];
+    // The frame words of the bottom levels the console's rays hit.
+    let mut frame_words: BTreeMap<u32, u32> = BTreeMap::new();
     let mut listing = String::new();
     let mut first = Vec::new();
     for (k, (&(x, y), w)) in rays.iter().zip(walked).enumerate() {
         let i = (y * WIDTH + x) as usize;
         let h = host_hit(hits, i);
+        if let Walked::Hit(c) = w {
+            *frame_words.entry(c.frame_word).or_insert(0) += 1;
+        }
         let line = match (h, w) {
-            (Some((t, index, id, primitive, geometry, uv)), Walked::Hit(c)) => {
+            (Some(HostHit { t, index, id, primitive, geometry, uv, front: host_says }), Walked::Hit(c)) => {
                 both += 1;
                 let hc = contribution(index).unwrap_or(u32::MAX);
                 let same = [
@@ -577,13 +714,38 @@ fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits:
                     *n += u32::from(s);
                 }
                 clockwise += u32::from(c.clockwise);
+                let mut face_differs = false;
+                let mut faces = String::new();
+                if same[0] && same[1]
+                    && let Some(d) = instance(index)
+                {
+                    let f = facing(c, d);
+                    faced += 1;
+                    match f.frame {
+                        Frame::Same => frame_same += 1,
+                        Frame::Axes => frame_axes += 1,
+                        Frame::Other => frame_other += 1,
+                    }
+                    mirrored += u32::from(f.mirrored);
+                    flipped += u32::from(f.flip);
+                    flip_agrees += u32::from(f.flip == f.mirrored);
+                    front += u32::from(f.front);
+                    let _ = write!(faces, "; frame {:?}{}, front as Direct3D says from the console's winding {}", f.frame, if f.mirrored { " mirrored" } else { "" }, f.front);
+                    if let Some(hf) = host_says {
+                        host_faced += 1;
+                        host_front += u32::from(hf);
+                        face_same += u32::from(hf == f.front);
+                        face_differs = hf != f.front;
+                        let _ = write!(faces, ", the host's {hf}");
+                    }
+                }
                 let text = format!(
                     "host t {t} instance {index} id {id} contribution {hc} geometry {geometry} primitive {primitive} uv {:.4} {:.4}; \
-                     console t {} id {} contribution {} geometry {} (flags {:#x}) primitive {} uv {:.4} {:.4} clockwise {} roles {:#x} instance node {:#x} (flags {:#x})",
+                     console t {} id {} contribution {} geometry {} (flags {:#x}) primitive {} uv {:.4} {:.4} clockwise {} roles {:#x} instance node {:#x} (flags {:#x}) frame word {:#x}{faces}",
                     uv[0], uv[1], c.t, c.id, c.contribution, c.geometry, c.geometry_flags, c.primitive, c.barycentrics[0], c.barycentrics[1],
-                    c.clockwise, c.roles, c.instance, c.instance_flags
+                    c.clockwise, c.roles, c.instance, c.instance_flags, c.frame_word
                 );
-                if same.iter().any(|s| !s) && first.len() < 8 {
+                if (face_differs || same.iter().any(|s| !s)) && first.len() < 8 {
                     first.push(format!("ray {k} ({x}, {y}): {text}"));
                 }
                 text
@@ -592,7 +754,7 @@ fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits:
                 neither += 1;
                 "both miss".into()
             }
-            (Some((t, index, id, ..)), Walked::Miss) => {
+            (Some(HostHit { t, index, id, .. }), Walked::Miss) => {
                 host_only += 1;
                 let text = format!("host only: t {t} instance {index} id {id}");
                 if first.len() < 8 {
@@ -609,12 +771,13 @@ fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits:
                 text
             }
             (_, Walked::Missing(p)) => {
-                if run.cache.absent.contains(p) {
+                let gone = run.cache.gone(*p);
+                if gone {
                     absent += 1;
                 } else {
                     unfinished += 1;
                 }
-                format!("console walk unfinished: page {p:#x} {}", if run.cache.absent.contains(p) { "has no place" } else { "not read" })
+                format!("console walk unfinished: page {p:#x} {}", if gone { "has no place" } else { "not read" })
             }
             (_, Walked::Broken(why)) => {
                 unfinished += 1;
@@ -624,12 +787,25 @@ fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits:
         let d = direction(x, y);
         let _ = writeln!(listing, "ray {k} pixel ({x}, {y}) direction ({:.4} {:.4} {:.4}): {line}", d[0], d[1], d[2]);
     }
+    let host_facing = if host_faced > 0 {
+        format!("; the host's query says front-facing {host_front} of {host_faced}, the same as from the console's winding {face_same}")
+    } else {
+        format!("; the host's facing is not read back (the probe program writes {HIT} dwords a ray)")
+    };
+    let mut words: Vec<(u32, u32)> = frame_words.into_iter().collect();
+    words.sort_by_key(|&(w, n)| (std::cmp::Reverse(n), w));
+    let words: Vec<String> = words.iter().take(6).map(|(w, n)| format!("{w:#x} x{n}")).collect();
     tracing::info!(
         "host ray tracing probe {} (frame {}, top level {:#x} of {} instances, eye ({:.1} {:.1} {:.1}), {} page rounds, {} pages read): \
          of {} rays against the host's and the console's structures both hit {both}, both miss {neither}, only the host hit {host_only}, \
          only the console {console_only}, console walk unfinished {unfinished} and {absent} at pages with no place; of the {both} both hit \
          the same distance {t_same}, instance id {id_same}, contribution {contribution_same}, geometry {geometry_same}, primitive \
-         {primitive_same}, barycentrics {uv_same}; the console's hits clockwise {clockwise} (the host's facing is not read back)",
+         {primitive_same}, barycentrics {uv_same}; the console's hits clockwise {clockwise}; of the {faced} at the same distance and \
+         instance id, the console's frame of the bottom level (its instance node's turn times the title's transform) is the title's \
+         object space in {frame_same}, the axes swapped, turned over or scaled in {frame_axes} and something else in {frame_other}, \
+         mirrored in {mirrored}; the triangle's flip bit set in {flipped} (the same as the mirroring in {flip_agrees}); front-facing as \
+         Direct3D says from the console's winding {front}{host_facing}; the frame words (+60) of the bottom levels the console's rays \
+         hit: {}",
         run.number,
         sent.frame,
         run.dest,
@@ -640,6 +816,7 @@ fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits:
         run.rounds,
         run.cache.pages.len(),
         rays.len(),
+        if words.is_empty() { "none".to_string() } else { words.join(", ") },
     );
     for f in &first {
         tracing::info!("host ray tracing probe {}: {f}", run.number);
@@ -722,6 +899,68 @@ mod tests {
         // The last one inactive.
         d[2 * INSTANCE + 51] = 0;
         assert_eq!(middle(&d)[0], 5.0);
+    }
+
+    #[test]
+    fn the_consoles_frame_is_told_from_its_turn_and_the_titles_transform() {
+        assert_eq!(frame(&[1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]), (Frame::Same, false));
+        // x and y swapped and scaled by 2: the axes, mirrored.
+        assert_eq!(frame(&[0.0, 2.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0]), (Frame::Axes, true));
+        // A quarter turn about z and scales: the axes, not mirrored.
+        assert_eq!(frame(&[0.0, -4.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.5]), (Frame::Axes, false));
+        // A turn of 30 degrees is something else; so are two rows on one axis.
+        let (s, c) = (0.5f32, 0.75f32.sqrt());
+        let title = [c, -s, 0.0, s, c, 0.0, 0.0, 0.0, 1.0];
+        assert_eq!(frame(&title).0, Frame::Other);
+        assert_eq!(frame(&[1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]).0, Frame::Other);
+        assert_eq!(frame(&[f32::NAN; 9]).0, Frame::Other);
+        // An instance node's turn that undoes the title's 30 degrees, then
+        // swaps x and y: the console's frame is the title's axes swapped.
+        let back = [c, s, 0.0, -s, c, 0.0, 0.0, 0.0, 1.0];
+        let swap = [0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        let turn = times(&swap, &back);
+        assert_eq!(frame(&times(&turn, &title)), (Frame::Axes, true));
+        // Facing: clockwise in a mirroring frame is counterclockwise in the
+        // title's object space, a back face unless the instance turns it.
+        let mut d = vec![0u8; INSTANCE];
+        for k in [0, 5, 10] {
+            d[4 * k..4 * k + 4].copy_from_slice(&1f32.to_le_bytes());
+        }
+        let hit = walk::Hit {
+            t: 1.0,
+            barycentrics: [0.25, 0.25],
+            id: 0,
+            contribution: 0,
+            instance_flags: 0,
+            geometry: 0,
+            geometry_flags: 0,
+            primitive: 0,
+            clockwise: true,
+            roles: ROLES_FLIP | 0x9,
+            instance: 0,
+            turn: Some(swap),
+            frame_word: 0,
+        };
+        let f = facing(&hit, &d);
+        assert_eq!((f.frame, f.mirrored, f.flip, f.front), (Frame::Axes, true, true, false));
+        d[55] = FRONT_COUNTERCLOCKWISE;
+        assert!(facing(&hit, &d).front);
+        // No turn and the title's identity: the console's winding as it is.
+        let plain = walk::Hit { turn: None, roles: 0x9, ..hit };
+        d[55] = 0;
+        let f = facing(&plain, &d);
+        assert_eq!((f.frame, f.mirrored, f.flip, f.front), (Frame::Same, false, false, true));
+    }
+
+    #[test]
+    fn a_hit_takes_a_ninth_dword_as_the_hosts_facing_if_there_is_one() {
+        let mut hits = vec![0u32; 2 * HIT];
+        hits[HIT..HIT + 8].copy_from_slice(&[COMMITTED_TRIANGLE_HIT, 2f32.to_bits(), 3, 7, 11, 1, 0.5f32.to_bits(), 0.25f32.to_bits()]);
+        assert_eq!(host_hit(&hits, 0), None);
+        let h = host_hit(&hits, 1).unwrap();
+        assert_eq!((h.t, h.index, h.id, h.primitive, h.geometry, h.uv), (2.0, 3, 7, 11, 1, [0.5, 0.25]));
+        assert_eq!(h.front.is_some(), HIT > 8);
+        assert_eq!(host_hit(&hits, 2), None);
     }
 
     #[test]
