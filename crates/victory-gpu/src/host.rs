@@ -363,6 +363,48 @@ pub(crate) fn keep_freed() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_FREED").is_none_or(|v| v != "0"))
 }
 
+/// Whether the PC has little memory (`VICTORY_LOW_RAM=1`, or unset and at
+/// most 20 GiB of RAM; `=0`: never). On 16 GB the title's ~10 GB and our
+/// ~7.6 GB of PC memory shared with the card (RTX 2060 run, 2026-11-27) left
+/// 0.3 GB free and Windows paged the title out: the caches of memory kept
+/// "for later" are then smaller (scratch chunks, send memory, idle lists).
+pub(crate) fn low_ram() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = match std::env::var("VICTORY_LOW_RAM").as_deref() {
+            Ok("1") => true,
+            Ok("0") => false,
+            _ => total_physical_ram().is_some_and(|total| low_ram_for(total)),
+        };
+        if on {
+            tracing::info!("little PC memory: smaller caches of scratch, send memory and idle lists (VICTORY_LOW_RAM=0: as before)");
+        }
+        on
+    })
+}
+
+fn low_ram_for(total: u64) -> bool {
+    total <= 20 << 30
+}
+
+#[cfg(test)]
+#[test]
+fn sixteen_gb_is_little_memory_thirty_two_is_not() {
+    // 16 GB as Windows reports it (less than 16 GiB), and 32 GB.
+    assert!(low_ram_for(16 * 1000 * 1000 * 1000));
+    assert!(low_ram_for(16 << 30));
+    assert!(!low_ram_for(32 << 30));
+}
+
+fn total_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some(m.ullTotalPhys)
+}
+
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
 /// when free physical RAM is low. Never returns less than 2,000 ms.
@@ -1844,8 +1886,10 @@ const SCRATCH_CHUNK: u64 = 4 << 20;
 const SCRATCH_FIRST: u64 = 256 << 10;
 /// The most bytes of chunks kept while no list holds them.
 const SPARE_MOST: u64 = 128 << 20;
-/// The same with [`keep_freed`].
+/// The same with [`keep_freed`] (a quarter of it with [`low_ram`]: 834 MB of
+/// chunks, 537 of them spare, on a 16 GB PC).
 const SPARE_KEPT: u64 = 1 << 30;
+const SPARE_KEPT_LOW_RAM: u64 = 256 << 20;
 
 /// Whether lists share their scratch chunks: a list takes a chunk when it
 /// first needs one, a small one first, and gives all of them back when it
@@ -1926,7 +1970,11 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                spare.give(chunk, size, match (keep_freed(), low_ram()) {
+            (true, false) => SPARE_KEPT,
+            (true, true) => SPARE_KEPT_LOW_RAM,
+            (false, _) => SPARE_MOST,
+        })
             } else {
                 Some(chunk)
             };
