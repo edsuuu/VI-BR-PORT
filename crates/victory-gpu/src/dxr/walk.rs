@@ -21,7 +21,11 @@
 //! - a triangle node keeps two triangles: the geometry index above the
 //!   geometry flags at `+48`, the primitive index of triangle 1 at `+56` and
 //!   of every other kind (0, 2, 3) at `+52`, the triangle's vertex roles in
-//!   byte `k` of `+60`;
+//!   byte `k` of `+60`; of the flags byte, `0x80` marks a pair (a pointer to
+//!   triangle 0 stands for triangle 1 as well, which the walk then meets in
+//!   the same node) and `0x40` says triangle 1 is stored with its winding
+//!   turned; neither is a Direct3D geometry flag, and the hit's flags are
+//!   without them;
 //! - a bottom level's header keeps its frame at `+60` (the critic's item 3);
 //!   the walks do not read it, the instance node's turn already takes the
 //!   ray there [inf], and the walk here only hands it on with each hit.
@@ -92,6 +96,12 @@ struct Instance {
 /// Nodes walked at most a ray.
 const STEPS: usize = 1 << 20;
 
+/// The console's own bits of a triangle node's flags byte (`+48`): the
+/// node holds a pair (triangle 1 is met through triangle 0's pointer), and
+/// triangle 1's winding is stored turned.
+const PAIR: u32 = 0x80;
+const TURNED_SECOND: u32 = 0x40;
+
 fn words<const N: usize>(pages: &dyn Pages, address: u64) -> Result<[u32; N], u64> {
     let mut bytes = vec![0u8; 4 * N];
     pages.read(address, &mut bytes)?;
@@ -153,6 +163,9 @@ fn walk_inner(
                     return Err(Ok("a triangle in the top level"));
                 };
                 let w = words::<28>(pages, at).map_err(Err)?;
+                if k == 0 && w[12] & PAIR != 0 {
+                    stack.push((base, pointer | 1, instance.clone()));
+                }
                 let ray = bvh::Ray::new(o, d, far);
                 let [num, den, i, j] = bvh::triangle(&bvh::triangle_vertices(&w, k), &ray);
                 if num == f32::INFINITY {
@@ -169,7 +182,7 @@ fn walk_inner(
                     contribution: inst.contribution,
                     instance_flags: inst.flags,
                     geometry: w[12] >> 8,
-                    geometry_flags: w[12] & 0xff,
+                    geometry_flags: w[12] & 0xff & !(PAIR | TURNED_SECOND),
                     primitive: w[13 + usize::from(k == 1)],
                     clockwise: den > 0.0,
                     roles: w[15] >> (8 * k) & 0xff,
@@ -376,6 +389,31 @@ mod tests {
             let Walked::Hit(h) = walk(&m, TOP, at, [0.0, 0.0, 1.0], 0.0, 100.0, 0x01) else { panic!("{at:?}") };
             assert_eq!((h.t, h.primitive), (5.0, 2f32.to_bits()), "{at:?}");
         }
+    }
+
+    #[test]
+    fn a_pointer_to_triangle_zero_of_a_pair_meets_both() {
+        let mut m = scene();
+        // The box names triangle 0 only.
+        let around = [-1.0, -1.0, 4.0, 5.0, 5.0, 6.0];
+        let off = [f32::NAN; 6];
+        let mut b = vec![1 << 3, bvh::NONE, bvh::NONE, bvh::NONE];
+        b.extend(bits(&around));
+        b.extend(bits(&around));
+        b.extend(bits(&off));
+        b.extend(bits(&off));
+        m.put(BLAS + 2 * 64, &b);
+        // Triangle 1's side (x + y > 4): nothing without the pair bit.
+        let ray = |m: &Fake| walk(m, TOP, [3.0, 3.0, 0.0], [0.0, 0.0, 1.0], 0.0, 100.0, 0x01);
+        assert_eq!(ray(&m), Walked::Miss);
+        // A pair whose second is stored turned: triangle 1 is met, and the
+        // hit's flags are the geometry's alone.
+        m.put(BLAS + 64 + 48, &[2 << 8 | PAIR | TURNED_SECOND | 1]);
+        let Walked::Hit(h) = ray(&m) else { panic!() };
+        assert_eq!((h.t, h.geometry, h.geometry_flags, h.primitive), (5.0, 2, 1, 12));
+        // Triangle 0's side still finds triangle 0.
+        let Walked::Hit(h) = walk(&m, TOP, [1.0, 1.0, 0.0], [0.0, 0.0, 1.0], 0.0, 100.0, 0x01) else { panic!() };
+        assert_eq!(h.primitive, 11);
     }
 
     #[test]
