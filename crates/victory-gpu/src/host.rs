@@ -228,6 +228,8 @@ struct Aside {
     fence: ID3D12Fence,
     event: windows::Win32::Foundation::HANDLE,
     value: u64,
+    /// The calls the last signal covers, and its value ([`mapped_turn`]).
+    covered: (u64, u64),
     _keep: (ID3D12CommandAllocator, [ID3D12Resource; 2]),
 }
 // SAFETY: D3D12 objects are free-threaded, the event is waited on by one
@@ -246,6 +248,8 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
         return Ok(());
     }
     let started = std::time::Instant::now();
+    // (Counted before the lock: memory made before this call.)
+    let ticket = MAPPED_ENTERED.fetch_add(1, Ordering::SeqCst) + 1;
     let mut aside = ASIDE.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: plain object creation; the objects the list names are kept.
     unsafe {
@@ -287,16 +291,49 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
                 fence: device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?,
                 event: CreateEventW(None, false, false, None)?,
                 value: 0,
+                covered: (0, 0),
                 _keep: (allocator, [from, to]),
             });
         }
         let Some(a) = aside.as_mut() else { return Ok(()) };
-        a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
-        a.value += 1;
-        a.queue.Signal(&a.fence, a.value)?;
-        if a.fence.GetCompletedValue() < a.value {
-            a.fence.SetEventOnCompletion(a.value, a.event)?;
-            WaitForSingleObject(a.event, INFINITE);
+        if mapped_shared() {
+            // A signal sent after this call began covers it: the one sent
+            // last if it did, else a new one. Waited for with the lock let
+            // go, so that the threads making memory meanwhile share it.
+            let (send, target) = mapped_turn(&mut a.covered, ticket, || {
+                a.value += 1;
+                (MAPPED_ENTERED.load(Ordering::SeqCst), a.value)
+            });
+            if send {
+                a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
+                a.queue.Signal(&a.fence, target)?;
+            }
+            let fence = a.fence.clone();
+            drop(aside);
+            if fence.GetCompletedValue() < target {
+                thread_local! {
+                    static EVENT: windows::Win32::Foundation::HANDLE =
+                        // SAFETY: an unnamed auto-reset event, kept for the thread's life.
+                        unsafe { CreateEventW(None, false, false, None) }.unwrap_or_default();
+                }
+                let event = EVENT.with(|e| *e);
+                if event.is_invalid() {
+                    // (No event: the fence blocks the call until it is reached.)
+                    fence.SetEventOnCompletion(target, windows::Win32::Foundation::HANDLE::default())?;
+                } else {
+                    fence.SetEventOnCompletion(target, event)?;
+                    WaitForSingleObject(event, INFINITE);
+                }
+            }
+            MAPPED[3].fetch_add(u64::from(!send), Ordering::Relaxed);
+        } else {
+            a.queue.ExecuteCommandLists(&[Some(a.list.clone())]);
+            a.value += 1;
+            a.queue.Signal(&a.fence, a.value)?;
+            if a.fence.GetCompletedValue() < a.value {
+                a.fence.SetEventOnCompletion(a.value, a.event)?;
+                WaitForSingleObject(a.event, INFINITE);
+            }
         }
     }
     let us = started.elapsed().as_micros() as u64;
@@ -306,16 +343,51 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
     let n = MAPPED[0].load(Ordering::Relaxed);
     if n == 1 || n.is_multiple_of(200) {
         tracing::info!(
-            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms",
+            "new card memory waited for until it is mapped (VICTORY_WAIT_RESIDENT=0: not), since the start: {n} times, {:.1} ms, the longest {:.1} ms; \
+             {} of them met by another's signal (VICTORY_MAPPED_SHARED)",
             MAPPED[1].load(Ordering::Relaxed) as f64 / 1000.0,
-            MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0
+            MAPPED[2].load(Ordering::Relaxed) as f64 / 1000.0,
+            MAPPED[3].load(Ordering::Relaxed)
         );
     }
     Ok(())
 }
 
-/// Times, microseconds and the longest of [`mapped`].
-static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Times, microseconds and the longest of [`mapped`]; and of those, the
+/// times another call's signal was waited for ([`mapped_shared`]).
+static MAPPED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// Calls of [`mapped`] begun so far.
+static MAPPED_ENTERED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether [`mapped`]'s waits are shared (`VICTORY_MAPPED_SHARED=1`; off by
+/// default: each call sends its own signal and waits for it holding the lock,
+/// so the calls of all threads are done one after the other).
+///
+/// The copy queue's work starts only when all mappings asked for before it
+/// was sent are done, so a signal sent after a call began covers that call's
+/// memory: a call whose memory a signal sent since covers waits for that
+/// one, and none waits under the lock. In the opening's first scene (run
+/// intro-fim-1, 28 Nov) 8,800 such waits by then, 590 ms, most of them in
+/// ten seconds, by the threads that translate the title's calls.
+fn mapped_shared() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_MAPPED_SHARED"))
+}
+
+/// [`mapped_shared`]'s turn for the call numbered `ticket` (calls are
+/// numbered as they begin, from 1). `covered`: the calls the last signal
+/// covers (those begun before it was sent) and its value. `signal` gives a
+/// new signal's value and the calls begun by then, if one is to be sent.
+/// Whether to send it, and the value to wait for.
+fn mapped_turn(covered: &mut (u64, u64), ticket: u64, signal: impl FnOnce() -> (u64, u64)) -> (bool, u64) {
+    if covered.0 >= ticket {
+        return (false, covered.1);
+    }
+    let (begun, value) = signal();
+    *covered = (begun.max(ticket), value);
+    (true, value)
+}
 
 /// New memory (made with [`not_resident`]) is resident when this returns.
 pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
@@ -1138,6 +1210,29 @@ mod tests {
     }
 
     use super::*;
+
+    /// Calls begun before a signal was sent wait for that one; a call begun
+    /// after it sends its own (`VICTORY_MAPPED_SHARED`).
+    #[test]
+    fn a_mapping_wait_is_met_by_a_signal_sent_after_it_began() {
+        let mut covered = (0, 0);
+        let mut value = 0;
+        // Calls 1 to 3 have begun; call 1 sends, and its signal covers all three.
+        let mut signal = |begun: u64| {
+            value += 1;
+            move || (begun, value)
+        };
+        assert_eq!(mapped_turn(&mut covered, 1, signal(3)), (true, 1));
+        assert_eq!(mapped_turn(&mut covered, 3, || unreachable!()), (false, 1));
+        assert_eq!(mapped_turn(&mut covered, 2, || unreachable!()), (false, 1));
+        // Call 4 began after it: a signal of its own, which covers 4 and 5.
+        assert_eq!(mapped_turn(&mut covered, 4, signal(5)), (true, 2));
+        assert_eq!(mapped_turn(&mut covered, 5, || unreachable!()), (false, 2));
+        // A count read below the caller's own (it cannot be: the caller's
+        // number was taken first) still covers the caller.
+        assert_eq!(mapped_turn(&mut covered, 7, signal(6)), (true, 3));
+        assert_eq!(covered, (7, 3));
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
