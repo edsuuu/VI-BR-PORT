@@ -26,6 +26,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use super::cfg::{Loop, Loops};
+
+mod fields;
+pub use fields::{Field, FieldLoad};
 use crate::gfx10::{Fields, NULL, Operand};
 use crate::ir::{EXEC, Inst, Program, Reg, Value};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
@@ -146,6 +149,9 @@ pub enum Role {
     Ray,
     /// A value computed from an instance's transform (object space).
     ObjectSpace,
+    /// The DXR hit kind of the accepted triangle: 0xfe for its front face,
+    /// 0xff for its back, the instance's winding taken into account.
+    HitKind,
     /// The same value on every path through the region.
     Constant(u32),
     /// The value the register held at the entry, whatever the walk did.
@@ -172,6 +178,7 @@ impl Role {
             Role::State => "state".into(),
             Role::Ray => "ray".into(),
             Role::ObjectSpace => "object-space".into(),
+            Role::HitKind => "hit-kind".into(),
             Role::Constant(k) => format!("const {k:#x}"),
             Role::Entry => "entry".into(),
             Role::Other(s) => s.clone(),
@@ -183,7 +190,7 @@ impl Role {
     fn has_accessor(&self) -> bool {
         matches!(
             self,
-            Role::T | Role::BaryI | Role::BaryJ | Role::HitNode | Role::Constant(_) | Role::Lanes | Role::Entry
+            Role::T | Role::BaryI | Role::BaryJ | Role::HitNode | Role::HitKind | Role::Constant(_) | Role::Lanes | Role::Entry
         )
     }
 }
@@ -262,6 +269,13 @@ pub struct Walk {
     pub after: Vec<(Reg, After)>,
     /// What keeps the region from being replaced by a query, if anything.
     pub refusals: Vec<String>,
+    /// The loads after the region of the hit's node fields, which a query
+    /// gives (`fields.rs`).
+    pub fields: Vec<FieldLoad>,
+    /// What a query has to give beyond the walks of milestone M3a (hit kind,
+    /// barycentrics, node fields, a cap in a register): the walk fits only
+    /// the replacement that gives them ([`Walk::fits_extended`]).
+    pub extended: Vec<&'static str>,
 }
 
 /// What the code after the region does with an output.
@@ -277,9 +291,28 @@ pub struct After {
 
 impl Walk {
     /// Whether the census finds the walk fit for milestone M3a's replacement:
-    /// family A0 and nothing refused.
+    /// family A0 and nothing refused, nothing [`Walk::extended`] needed.
     pub fn fits(&self) -> bool {
+        self.family == Family::A0 && self.refusals.is_empty() && self.extended.is_empty()
+    }
+
+    /// Whether the walk fits the replacement that also gives the hit kind,
+    /// the barycentrics and the hit's node fields (`VICTORY_RT_QUERY=a0f`).
+    pub fn fits_extended(&self) -> bool {
         self.family == Family::A0 && self.refusals.is_empty()
+    }
+
+    /// The verdict of the report lines.
+    fn verdict(&self) -> String {
+        if self.fits() {
+            "fits A0".to_owned()
+        } else if self.fits_extended() {
+            format!("fits A0 with {}", self.extended.join(", "))
+        } else if self.refusals.is_empty() {
+            format!("{}, not in M3a", self.family.name())
+        } else {
+            format!("refused: {}", self.refusals.join("; "))
+        }
     }
 
     /// One tab-separated line: label, walk number, family, mold, exit kind,
@@ -291,13 +324,7 @@ impl Walk {
             ExitKind::Closest => "closest",
             ExitKind::Unknown => "unknown",
         };
-        let verdict = if self.fits() {
-            "fits A0".to_owned()
-        } else if self.refusals.is_empty() {
-            format!("{}, not in M3a", self.family.name())
-        } else {
-            format!("refused: {}", self.refusals.join("; "))
-        };
+        let verdict = self.verdict();
         format!(
             "WALKTSV\t{label}\t{n}\t{}\t{:?}\t{exit}\t{objects}\t{}\t{verdict}",
             self.family.name(),
@@ -419,16 +446,17 @@ impl Walk {
             }
             out.push(format!("  after:{s}"));
         }
-        out.push(format!(
-            "  verdict: {}",
-            if self.fits() {
-                "fits A0".to_owned()
-            } else if self.refusals.is_empty() {
+        if !self.fields.is_empty() {
+            let f: Vec<String> = self.fields.iter().map(|f| format!("{:#x}={}", f.offset, f.field.text())).collect();
+            out.push(format!("  node fields after: {}", f.join(" ")));
+        }
+        let verdict = match self.verdict() {
+            _ if self.refusals.is_empty() && !self.fits_extended() => {
                 format!("family {}: not in M3a", self.family.name())
-            } else {
-                format!("refused: {}", self.refusals.join("; "))
             }
-        ));
+            v => v,
+        };
+        out.push(format!("  verdict: {verdict}"));
         out
     }
 }
@@ -853,6 +881,65 @@ impl<'a> Facts<'a> {
             }
         }
         false
+    }
+
+    /// Whether `v`, a value an accept saves, is the DXR hit kind as the
+    /// console's traversal makes it (the GDK's `DetermineHitKind`): 0xfe
+    /// where the triangle's denominator is positive (a select of 0xfe and
+    /// 0xff on a compare of the reciprocal with 0), flipped by one bit, the
+    /// instance's counter-clockwise flag (`v_xor_b32` with a `v_bfe_u32` of
+    /// width 1).
+    fn hit_kind(&self, v: Value) -> bool {
+        let def = |v: Value| match self.defs.get(&v) {
+            Some(&Def::Inst(b, i)) => Some(self.inst((b, i))),
+            _ => None,
+        };
+        let Some(x) = def(v).filter(|x| x.name() == "v_xor_b32" && plain(x)) else {
+            return false;
+        };
+        let src = sources(x);
+        if src.len() != 2 {
+            return false;
+        }
+        let side = |n: usize| match arg(x, &src[n]) {
+            Arg::Value(w) => def(w),
+            _ => None,
+        };
+        let select = |s: &Inst| {
+            let ss = sources(s);
+            if s.name() != "v_cndmask_b32" || !plain(s) || ss.len() != 3 {
+                return false;
+            }
+            let k = |n: usize| match arg(s, &ss[n]) {
+                Arg::Const(k) => Some(k),
+                Arg::Value(w) => self.konst(w),
+                Arg::None => None,
+            };
+            let pair = (k(0), k(1));
+            let Arg::Value(m) = arg(s, &ss[2]) else { return false };
+            let Some(c) = def(m) else { return false };
+            let cs = sources(c);
+            if cs.len() < 2 || !plain(c) {
+                return false;
+            }
+            let rcp = |n: usize| matches!(arg(c, &cs[n]), Arg::Value(w) if def(w).is_some_and(|r| r.name() == "v_rcp_f32"));
+            let zero = |n: usize| arg(c, &cs[n]) == Arg::Const(0);
+            // (whether the mask is true where the reciprocal is positive)
+            let positive = match (c.name(), zero(0) && rcp(1), rcp(0) && zero(1)) {
+                ("v_cmp_lt_f32", true, _) | ("v_cmp_gt_f32", _, true) => true,
+                ("v_cmp_gt_f32", true, _) | ("v_cmp_lt_f32", _, true) => false,
+                _ => return false,
+            };
+            pair == if positive { (Some(0xff), Some(0xfe)) } else { (Some(0xfe), Some(0xff)) }
+        };
+        let bit = |s: &Inst| {
+            let ss = sources(s);
+            s.name() == "v_bfe_u32" && ss.len() == 3 && arg(s, &ss[2]) == Arg::Const(1)
+        };
+        match (side(0), side(1)) {
+            (Some(a), Some(b)) => (select(a) && bit(b)) || (select(b) && bit(a)),
+            _ => false,
+        }
     }
 
     /// The constant term of the address of memory access `site`: its own
@@ -1312,6 +1399,8 @@ fn lone(facts: &Facts, sites: Vec<Site>) -> Walk {
         descriptor_load: None,
         after: Vec::new(),
         refusals: vec!["a node test outside any loop".into()],
+        fields: Vec::new(),
+        extended: Vec::new(),
     }
 }
 
@@ -1865,6 +1954,7 @@ fn walk(facts: &Facts, loops: &Loops, l: &Loop, sites: Vec<Site>) -> Walk {
 
     // The outputs' roles.
     let saves: HashMap<u8, Saved> = acc.as_ref().map(|a| a.saves.iter().cloned().collect()).unwrap_or_default();
+    let mut register_cap: HashSet<Value> = HashSet::new();
     for live in &mut outputs {
         let (roots, seen) = facts.roots(live.value, region);
         let uncapped = not_capped(facts, live.value, region);
@@ -1885,6 +1975,7 @@ fn walk(facts: &Facts, loops: &Loops, l: &Loop, sites: Vec<Site>) -> Walk {
                 Saved::BaryJ => Role::BaryJ,
                 Saved::NodePointer => Role::HitNode,
                 Saved::Const(_) => Role::State,
+                Saved::Value(v) if facts.hit_kind(*v) => Role::HitKind,
                 Saved::Value(v) if facts.made_of_transform(*v, region, &loads48) => Role::ObjectSpace,
                 Saved::Value(_) => Role::Other("saved at a hit".into()),
             },
@@ -1897,7 +1988,13 @@ fn walk(facts: &Facts, loops: &Loops, l: &Loop, sites: Vec<Site>) -> Walk {
                 let w = facts.inst(s);
                 w.writes.iter().any(|&(_, v)| facts.made_of_transform(v, region, &loads48))
             }) => Role::ObjectSpace,
-            _ if uncapped.is_some() => Role::Constant(uncapped.unwrap_or(0)),
+            _ if uncapped.is_some() => {
+                let (k, register) = uncapped.unwrap_or((0, false));
+                if register {
+                    register_cap.insert(live.value);
+                }
+                Role::Constant(k)
+            }
             _ if inside.is_empty() => Role::State,
             _ => {
                 let names: Vec<&str> = inside.iter().map(|&s| facts.inst(s).name()).collect();
@@ -1950,11 +2047,13 @@ fn walk(facts: &Facts, loops: &Loops, l: &Loop, sites: Vec<Site>) -> Walk {
 
     // What keeps the region from being a query.
     let mut refusals = Vec::new();
+    // (what the hit's node fields read after the walk, made from a query, lift)
+    let mut by_fields = Vec::new();
     for live in outputs.iter().filter(|l| l.role == Some(Role::HitNode)) {
         match live.miss {
             None => refusals.push(format!("a hit node ({:?}) whose miss value is no constant", live.reg)),
             Some(m) if !facts.only_tested(live.value, m, region, loops, &mut seen) => {
-                refusals.push(format!("a hit node ({:?}) read otherwise than tested for a hit", live.reg))
+                by_fields.push(format!("a hit node ({:?}) read otherwise than tested for a hit", live.reg))
             }
             Some(_) => {}
         }
@@ -2009,10 +2108,39 @@ fn walk(facts: &Facts, loops: &Loops, l: &Loop, sites: Vec<Site>) -> Walk {
         if a.stores > 0 && outputs.iter().any(|l| l.reg == *r && matches!(l.role, Some(Role::HitNode | Role::NodePointer))) {
             refusals.push(format!("a node pointer ({r:?}) reaches a store"));
         }
-        if !a.loads.is_empty() && outputs.iter().any(|l| l.reg == *r && matches!(l.role, Some(Role::HitNode | Role::NodePointer))) {
+        let hit = outputs.iter().any(|l| l.reg == *r && l.role == Some(Role::HitNode));
+        let node = outputs.iter().any(|l| l.reg == *r && l.role == Some(Role::NodePointer));
+        if !a.loads.is_empty() && (hit || node) {
             let offs: Vec<String> = a.loads.iter().map(|o| format!("+{o}")).collect();
-            refusals.push(format!("node fields read after the walk through {r:?}: {}", offs.join(" ")));
+            let why = format!("node fields read after the walk through {r:?}: {}", offs.join(" "));
+            if node { refusals.push(why) } else { by_fields.push(why) }
         }
+    }
+    // The hit's node fields, where the code after reads them: what a query
+    // gives in their place (`fields.rs`), or why not.
+    let mut fields = Vec::new();
+    let mut extended = Vec::new();
+    if !by_fields.is_empty() {
+        match fields::fields(facts, loops, region, &outputs, descriptor_load, &mut seen) {
+            Ok(f) if !f.is_empty() => {
+                fields = f;
+                extended.push("node fields");
+            }
+            Ok(_) => refusals.extend(by_fields),
+            Err(why) => {
+                refusals.extend(by_fields);
+                refusals.push(format!("node fields: {why}"));
+            }
+        }
+    }
+    if outputs.iter().any(|l| l.role == Some(Role::HitKind)) {
+        extended.push("hit kind");
+    }
+    if outputs.iter().any(|l| matches!(l.role, Some(Role::BaryI | Role::BaryJ))) {
+        extended.push("barycentrics");
+    }
+    if outputs.iter().any(|l| register_cap.contains(&l.value)) {
+        extended.push("a cap in a register");
     }
     refusals.sort();
     refusals.dedup();
@@ -2045,6 +2173,8 @@ fn walk(facts: &Facts, loops: &Loops, l: &Loop, sites: Vec<Site>) -> Walk {
         descriptor_load,
         after,
         refusals,
+        fields,
+        extended,
     }
 }
 
@@ -2297,14 +2427,14 @@ fn cull_factor(facts: &Facts, region: &[bool]) -> Option<i32> {
 /// x, 0xfffe` or `0xffff`), such as the flag some walks raise when they stop
 /// at the cap. `None` for any other value, and for one the cap's test does
 /// not reach.
-fn not_capped(facts: &Facts, v: Value, region: &[bool]) -> Option<u32> {
-    let mut touched = false;
+fn not_capped(facts: &Facts, v: Value, region: &[bool]) -> Option<(u32, bool)> {
+    let mut touched = 0;
     let k = uncapped(facts, v, region, 0, &mut touched)?;
-    touched.then_some(k)
+    (touched != 0).then_some((k, touched & 2 != 0))
 }
 
 /// [`not_capped`]'s evaluation; lane masks are the lane's own bit (0 or 1).
-fn uncapped(facts: &Facts, v: Value, region: &[bool], depth: u32, touched: &mut bool) -> Option<u32> {
+fn uncapped(facts: &Facts, v: Value, region: &[bool], depth: u32, touched: &mut u8) -> Option<u32> {
     if depth > 12 {
         return None;
     }
@@ -2329,7 +2459,7 @@ fn uncapped(facts: &Facts, v: Value, region: &[bool], depth: u32, touched: &mut 
     }
     let inst = facts.inst((b, i));
     let src = sources(inst);
-    let val =|op: &Operand, touched: &mut bool| -> Option<u32> {
+    let val = |op: &Operand, touched: &mut u8| -> Option<u32> {
         match *op {
             // (a lane that runs has its own bit of EXEC)
             Operand::Scalar { code, .. } if code == EXEC => Some(1),
@@ -2346,9 +2476,33 @@ fn uncapped(facts: &Facts, v: Value, region: &[bool], depth: u32, touched: &mut 
             let Fields::Sop { imm: Some(0xfffe | 0xffff), .. } = inst.fields else {
                 return None;
             };
-            *touched = true;
+            *touched |= 1;
             // (the count is small: below the cap)
             Some(u32::from(n.contains("_lt_") || n.contains("_le_")))
+        }
+        // A cap the program holds in a register (a bound from before the
+        // region, which the count of the walk's rounds is tested against):
+        // the count is below it. (`touched` bit 2: a host query never stops
+        // at such a cap, which the title may have set low on purpose.)
+        n if n.starts_with("s_cmp_") && n.ends_with("_u32") && src.len() >= 2 => {
+            let counts = |o: &Operand| {
+                let Arg::Value(w) = arg(inst, o) else { return false };
+                let Some(&Def::Inst(cb, ci)) = facts.defs.get(&w) else { return false };
+                let c = facts.inst((cb, ci));
+                region[cb]
+                    && matches!(c.name(), "s_add_i32" | "s_add_u32")
+                    && sources(c).iter().any(|s| arg(c, s) == Arg::Const(1))
+            };
+            let bound = |o: &Operand| matches!(arg(inst, o), Arg::Value(w) if !facts.inside(w, region));
+            let (x, y) = if counts(&src[0]) && bound(&src[1]) {
+                (1, u32::MAX)
+            } else if bound(&src[0]) && counts(&src[1]) {
+                (u32::MAX, 1)
+            } else {
+                return None;
+            };
+            *touched |= 2;
+            compare(&format!("v_cmp_{}", &n["s_cmp_".len()..]), x, y).map(u32::from)
         }
         "s_cselect_b32" | "s_cselect_b64" if src.len() >= 2 => {
             let scc = inst.read(Reg::Scc)?;
