@@ -48,6 +48,10 @@ pub struct Config {
     /// than its own default (VICTORY_CACHE_DIR): one an engine already warmed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_dir: Option<String>,
+    /// The pad's buttons drawn on screen as the PC's keys (the texture mods
+    /// in [`crate::paths::pc_icons_dir`], VICTORY_TEXTURE_MODS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pc_icons: Option<bool>,
     #[serde(flatten)]
     pub rest: Map<String, Value>,
 }
@@ -71,6 +75,7 @@ impl Default for Config {
             fullscreen: None,
             mouse_keyboard: None,
             cache_dir: None,
+            pc_icons: None,
             rest: Map::new(),
         }
     }
