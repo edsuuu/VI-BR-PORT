@@ -85,6 +85,123 @@ impl Swizzle {
     }
 }
 
+/// What a texture description's layout field asks for, as the console's
+/// layout library reads it: 0 "pick one", 1 row major, 2 and 3 the 64 KiB
+/// layouts of reserved (tiled) resources, or `0x100 | swizzle mode` (modes
+/// 0 to 0x1f), optionally with a bank rotation index in bits 12 to 15.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutKind {
+    Pick,
+    RowMajor,
+    /// A reserved resource whose swizzle the library chooses.
+    Reserved,
+    /// A reserved resource in the standard swizzle.
+    ReservedStandard,
+    Mode(Swizzle),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutField {
+    pub kind: LayoutKind,
+    /// Index from bits 12 to 15; 0 when absent.
+    pub bank_rotation: u8,
+}
+
+impl LayoutField {
+    /// Reads a layout field. `None` for values the library rejects: bits
+    /// outside the mode mask, a mode above 0x1f, a rotation without a mode.
+    ///
+    /// `VICTORY_XG_KIT_LAYOUTS=0` brings back the older reading (0, 1 and
+    /// `0x100..=0x1ff`, no reserved layouts, no rotation); the default is on.
+    pub fn parse(raw: u32) -> Option<LayoutField> {
+        static KIT: OnceLock<bool> = OnceLock::new();
+        let kit = *KIT
+            .get_or_init(|| std::env::var_os("VICTORY_XG_KIT_LAYOUTS").is_none_or(|v| v != "0"));
+        Self::parse_with(raw, kit)
+    }
+
+    pub fn parse_with(raw: u32, kit: bool) -> Option<LayoutField> {
+        let plain = |kind| {
+            Some(LayoutField {
+                kind,
+                bank_rotation: 0,
+            })
+        };
+        if !kit {
+            return match raw {
+                0 => plain(LayoutKind::Pick),
+                1 => plain(LayoutKind::RowMajor),
+                l if l & !0xff == 0x100 => plain(LayoutKind::Mode(Swizzle(l & 0xff))),
+                _ => None,
+            };
+        }
+        let bank_rotation = (raw >> 12 & 0xf) as u8;
+        let low = raw & 0xfff;
+        if raw >> 16 != 0 || low & !0x11f != 0 {
+            return None;
+        }
+        let kind = match low {
+            0 => LayoutKind::Pick,
+            1 => LayoutKind::RowMajor,
+            2 => LayoutKind::Reserved,
+            3 => LayoutKind::ReservedStandard,
+            l if l & 0x100 != 0 => LayoutKind::Mode(Swizzle(l & 0x1f)),
+            _ => return None,
+        };
+        // The rotation belongs to a swizzle mode's field only.
+        if bank_rotation != 0 && !matches!(kind, LayoutKind::Mode(_)) {
+            return None;
+        }
+        Some(LayoutField {
+            kind,
+            bank_rotation,
+        })
+    }
+
+    /// The swizzle mode the layout library takes for a new texture of this
+    /// dimension: `None` when it makes no texture (a reserved 1D one).
+    pub fn resolve(self, dimension: Dimension, depth: bool, target: bool) -> Option<Swizzle> {
+        match self.kind {
+            LayoutKind::RowMajor => Some(Swizzle::LINEAR),
+            LayoutKind::Mode(s) => Some(s),
+            LayoutKind::Pick | LayoutKind::Reserved | LayoutKind::ReservedStandard => {
+                self.suggest(dimension, depth, target)
+            }
+        }
+    }
+
+    /// The mode `XGSuggestSwizzleMode` answers: for a reserved layout the
+    /// 64 KiB `_T` kind, else by use (linear for 1D, the XOR depth and
+    /// render modes for targets, else 4 KiB standard).
+    ///
+    /// shortcut: the library's own table for the reserved case is not
+    /// known (the kit only says the answer is a `_T` mode); GFX10 has the
+    /// standard `_T` mode, so it is the answer whatever the use. Revisit
+    /// with a run of the real library.
+    pub fn suggest(self, dimension: Dimension, depth: bool, target: bool) -> Option<Swizzle> {
+        if self.reserved() {
+            return (dimension != Dimension::Tex1d).then_some(Swizzle::SW_64KB_S_T);
+        }
+        Some(if dimension == Dimension::Tex1d {
+            Swizzle::LINEAR
+        } else if depth {
+            Swizzle::SW_64KB_Z_X
+        } else if target {
+            Swizzle::SW_64KB_R_X
+        } else {
+            Swizzle::SW_4KB_S
+        })
+    }
+
+    /// Whether the layout asks for a reserved (tiled) resource.
+    pub fn reserved(self) -> bool {
+        matches!(
+            self.kind,
+            LayoutKind::Reserved | LayoutKind::ReservedStandard
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dimension {
     Tex1d,
@@ -946,6 +1063,81 @@ mod tests {
             samples: 1,
             swizzle,
         }
+    }
+
+    #[test]
+    fn layout_fields_follow_the_library() {
+        use LayoutKind::*;
+        let field = |raw| LayoutField::parse_with(raw, true);
+        let kind = |raw| field(raw).map(|f| f.kind);
+        assert_eq!(kind(0), Some(Pick));
+        assert_eq!(kind(1), Some(RowMajor));
+        assert_eq!(kind(2), Some(Reserved));
+        assert_eq!(kind(3), Some(ReservedStandard));
+        // Every swizzle mode of the library, 0 to 0x1f.
+        for mode in 0..0x20 {
+            assert_eq!(kind(0x100 | mode), Some(Mode(Swizzle(mode))), "{mode}");
+        }
+        // Past the mode mask 0x11f, and unknown low values, are rejected.
+        for raw in [0x4, 0x7, 0x20, 0x120, 0x13f, 0x1ff, 0x200, 0x10000, 0x1_0100] {
+            assert_eq!(field(raw), None, "{raw:#x}");
+        }
+        // A bank rotation index rides in bits 12 to 15 of a mode's field.
+        let rotated = field(0x3_0000 >> 4 | 0x100 | 0x1b).unwrap();
+        assert_eq!((rotated.kind, rotated.bank_rotation), (Mode(Swizzle(0x1b)), 3));
+        assert_eq!(field(0xf119).unwrap().bank_rotation, 15);
+        // Not beside the other layouts.
+        for raw in [0x1000, 0x1001, 0x2002, 0x3003] {
+            assert_eq!(field(raw), None, "{raw:#x}");
+        }
+        // The older reading.
+        let old = |raw| LayoutField::parse_with(raw, false).map(|f| f.kind);
+        assert_eq!((old(2), old(3), old(0x1119), old(0x120)), (None, None, None, Some(Mode(Swizzle(0x20)))));
+        assert_eq!(old(0x105), Some(Mode(Swizzle(5))));
+    }
+
+    #[test]
+    fn layouts_resolve_to_modes() {
+        let f = |raw| LayoutField::parse_with(raw, true).unwrap();
+        let (t2, t1) = (Dimension::Tex2d, Dimension::Tex1d);
+        assert_eq!(f(0).resolve(t2, false, false), Some(Swizzle::SW_4KB_S));
+        assert_eq!(f(0).resolve(t2, false, true), Some(Swizzle::SW_64KB_R_X));
+        assert_eq!(f(0).resolve(t2, true, true), Some(Swizzle::SW_64KB_Z_X));
+        assert_eq!(f(0).resolve(t1, true, true), Some(Swizzle::LINEAR));
+        assert_eq!(f(1).resolve(t2, true, false), Some(Swizzle::LINEAR));
+        assert_eq!(f(0x10a).resolve(t1, false, false), Some(Swizzle(10)));
+        for raw in [2, 3] {
+            assert_eq!(f(raw).resolve(t2, false, false), Some(Swizzle::SW_64KB_S_T));
+            assert_eq!(f(raw).resolve(Dimension::Tex3d, false, false), Some(Swizzle::SW_64KB_S_T));
+            assert_eq!(f(raw).resolve(t1, false, false), None);
+            assert!(f(raw).reserved());
+        }
+        // A suggestion ignores a mode already in the field.
+        assert_eq!(f(0x10a).suggest(t2, false, false), Some(Swizzle::SW_4KB_S));
+        assert_eq!(f(0x10a).suggest(t1, false, false), Some(Swizzle::LINEAR));
+        assert!(!f(0x10a).reserved());
+    }
+
+    /// The reserved layouts give the 64 KiB `_T` sizes: whole blocks, 64 KiB
+    /// alignment, a tail for the small mips; they cannot be copied (XOR).
+    #[test]
+    fn reserved_layouts_have_64k_blocks() {
+        let f = LayoutField::parse_with(2, true).unwrap();
+        for (w, h, bpe, size) in [
+            (256, 256, 4, 256 << 10),
+            (128, 128, 4, 64 << 10),
+            (512, 256, 2, 256 << 10),
+            (64, 64, 8, 64 << 10),
+        ] {
+            let s = f.resolve(Dimension::Tex2d, false, false).unwrap();
+            let l = Layout::new(&desc(w, h, 1, bpe, s)).unwrap();
+            assert_eq!((l.size, l.alignment), (size, 65536), "{w}x{h}x{bpe}");
+            assert!(!l.addressable());
+        }
+        let s = f.resolve(Dimension::Tex2d, false, false).unwrap();
+        let chain = Layout::new(&desc(256, 256, 9, 4, s)).unwrap();
+        assert_eq!((chain.alignment, chain.first_tail_mip < 9), (65536, true));
+        assert_eq!(chain.size % 65536, 0);
     }
 
     #[test]
