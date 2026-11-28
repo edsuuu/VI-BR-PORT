@@ -1,0 +1,47 @@
+name: Launcher CI
+
+# Started by hand only (Actions > Launcher CI > Run workflow): checks and
+# builds the launcher on Windows and Linux and keeps the two executables as
+# artifacts. The repository's own CI (ci.yml) is unchanged.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  launcher:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: launcher
+      # The window's libraries (OpenGL, X11, Wayland, the keyboard map).
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev
+      - name: Clippy
+        run: cargo clippy -p vi-launcher --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test -p vi-launcher --locked
+      - name: Build
+        run: cargo build -p vi-launcher --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vi-launcher-${{ runner.os }}
+          path: |
+            target/release/vi-launcher.exe
+            target/release/vi-launcher
+          if-no-files-found: error
