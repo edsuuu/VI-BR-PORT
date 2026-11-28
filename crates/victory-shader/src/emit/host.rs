@@ -157,13 +157,20 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV.
+        // By slot, then kind: 0 CBV, 1 SRV, 2 UAV. A shader that asks where
+        // the title's ray-tracing structure is (`USER_STRUCTURE`) reads the
+        // host's as the root SRV `SLOT_STRUCTURE`.
         let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
                 let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
                 let srvs = s.root_srvs.iter().map(|&r| (r, 1));
-                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
+                let structure = s
+                    .user_data
+                    .iter()
+                    .any(|u| u.root == crate::native::RootType::Other(super::USER_STRUCTURE))
+                    .then_some((super::SLOT_STRUCTURE, 1));
+                cbvs.chain(srvs).chain(structure).chain(s.root_uavs.iter().map(|&r| (r, 2)))
             })
             .collect();
         views.sort_unstable();
@@ -631,6 +638,11 @@ pub enum Root {
         srv: bool,
         data: Vec<u32>,
     },
+    /// A ray-tracing structure the host's driver builds, bound as a root
+    /// SRV ([`Host::dispatch`] only): a top level of one instance (identity
+    /// transform, ID 0, mask 0xff, no flags) of a bottom level of these
+    /// triangles, one opaque geometry.
+    Structure(Vec<[[f32; 3]; 3]>),
 }
 
 /// Bindings for [`Host::draw`]: root arguments and the heap contents.
@@ -868,7 +880,7 @@ impl Host {
                         at.ptr += (index * size) as u64;
                         list.SetGraphicsRootDescriptorTable(*param, at);
                     }
-                    Root::View { .. } => return Err("root views in a draw".into()),
+                    Root::View { .. } | Root::Structure(_) => return Err("root views in a draw".into()),
                 }
             }
             list.OMSetRenderTargets(1, Some(&rtv), false, None);
@@ -1416,6 +1428,101 @@ impl Host {
                             list.SetComputeRootConstantBufferView(*param, va);
                         }
                         keep.push(b);
+                    }
+                    Root::Structure(triangles) => {
+                        let device: ID3D12Device5 = dev.cast().map_err(err)?;
+                        let builds: ID3D12GraphicsCommandList4 = list.cast().map_err(err)?;
+                        let words: Vec<u32> = triangles.iter().flatten().flatten().map(|f| f.to_bits()).collect();
+                        let vertices = upload(&words)?;
+                        let geometry = D3D12_RAYTRACING_GEOMETRY_DESC {
+                            Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
+                            Flags: D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE,
+                            Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
+                                Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
+                                    Transform3x4: 0,
+                                    IndexFormat: DXGI_FORMAT_UNKNOWN,
+                                    VertexFormat: DXGI_FORMAT_R32G32B32_FLOAT,
+                                    IndexCount: 0,
+                                    VertexCount: 3 * triangles.len() as u32,
+                                    IndexBuffer: 0,
+                                    VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE {
+                                        StartAddress: vertices.GetGPUVirtualAddress(),
+                                        StrideInBytes: 12,
+                                    },
+                                },
+                            },
+                        };
+                        // A level built into a structure of its own, ordered before what reads it.
+                        let mut level = |inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS| -> Result<u64, String> {
+                            let mut sizes = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
+                            device.GetRaytracingAccelerationStructurePrebuildInfo(&inputs, &mut sizes);
+                            let space = |size: u64, state| {
+                                make(
+                                    D3D12_HEAP_TYPE_DEFAULT,
+                                    &buffer(size.max(256), D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
+                                    state,
+                                )
+                            };
+                            let result = space(
+                                sizes.ResultDataMaxSizeInBytes,
+                                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+                            )?;
+                            let scratch = space(sizes.ScratchDataSizeInBytes, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
+                            builds.BuildRaytracingAccelerationStructure(
+                                &D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+                                    DestAccelerationStructureData: result.GetGPUVirtualAddress(),
+                                    Inputs: inputs,
+                                    SourceAccelerationStructureData: 0,
+                                    ScratchAccelerationStructureData: scratch.GetGPUVirtualAddress(),
+                                },
+                                None,
+                            );
+                            builds.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+                                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                                Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                                        // SAFETY: a borrowed pointer; the barrier never releases it.
+                                        pResource: std::mem::transmute_copy(&result),
+                                    }),
+                                },
+                            }]);
+                            let at = result.GetGPUVirtualAddress();
+                            keep.push(result);
+                            keep.push(scratch);
+                            Ok(at)
+                        };
+                        let bottom = level(D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL,
+                            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                            NumDescs: 1,
+                            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                            Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                                pGeometryDescs: &geometry,
+                            },
+                        })?;
+                        // The instance: a 3x4 identity, ID 0 and mask 0xff, contribution 0 and
+                        // no flags, the bottom level's address.
+                        let mut instance = [0u32; 16];
+                        for k in [0, 5, 10] {
+                            instance[k] = 1.0f32.to_bits();
+                        }
+                        instance[12] = 0xff << 24;
+                        instance[14] = bottom as u32;
+                        instance[15] = (bottom >> 32) as u32;
+                        let instances = upload(&instance)?;
+                        let top = level(D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                            Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+                            Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+                            NumDescs: 1,
+                            DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                            Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                                InstanceDescs: instances.GetGPUVirtualAddress(),
+                            },
+                        })?;
+                        list.SetComputeRootShaderResourceView(*param, top);
+                        keep.push(vertices);
+                        keep.push(instances);
                     }
                 }
             }

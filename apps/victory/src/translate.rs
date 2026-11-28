@@ -74,6 +74,9 @@ struct Tally {
     /// With `--list`: one line per program and outcome.
     list: bool,
     lines: Vec<String>,
+    /// With `--walk-report`: the walks of the programs that have one.
+    walk: bool,
+    walk_lines: Vec<String>,
 }
 
 impl Tally {
@@ -134,6 +137,7 @@ impl Tally {
             *self.exports.entry(k).or_default() += n;
         }
         self.lines.extend(other.lines);
+        self.walk_lines.extend(other.walk_lines);
         for (reason, (n, example)) in other.failed {
             self.failed.entry(reason).or_insert((0, example)).0 += n;
         }
@@ -238,6 +242,7 @@ pub fn run(
     validate: bool,
     pipelines: bool,
     list: bool,
+    walk_report: bool,
     jobs: Option<usize>,
 ) -> Result<()> {
     // Dumped shaders and validator reports are game-derived (rule #1).
@@ -293,6 +298,7 @@ pub fn run(
                     s.spawn(|| {
                         let mut t = Tally {
                             list,
+                            walk: walk_report,
                             ..Tally::default()
                         };
                         let mut checks = Checks {
@@ -389,6 +395,11 @@ pub fn run(
     failed.sort_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
+    }
+    let mut walks = t.walk_lines;
+    walks.sort();
+    for w in walks {
+        println!("{w}");
     }
     Ok(())
 }
@@ -553,6 +564,13 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                 // Per-lane descriptors are traced on the per-lane form; its
                 // failure is listed after the resources' and I/O's.
                 let structured = structure::structure(&program);
+                if t.walk {
+                    let label = format!("{} {:?}", example(), p.stage);
+                    let lines = emit::walk::report(&label, &program, structured.as_ref().ok());
+                    if !lines.is_empty() {
+                        t.walk_lines.push(lines.join("\n"));
+                    }
+                }
                 let lanes = structured.as_ref().ok();
                 let res = match resource::track(&program, &p.layout, p.stage, lanes) {
                     Ok(r) => {
@@ -951,7 +969,7 @@ mod tests {
         // SAFETY: no other test in this binary touches the environment.
         unsafe { std::env::set_var("VICTORY_EMIT_DUMP", env!("CARGO_MANIFEST_DIR")) };
         let missing = std::env::temp_dir().join("victory-translate-no-such-dir");
-        let err = super::run(vec![missing], false, false, false, Some(1)).unwrap_err();
+        let err = super::run(vec![missing], false, false, false, false, Some(1)).unwrap_err();
         // SAFETY: as above; unset so a later test's `run` is not refused.
         unsafe { std::env::remove_var("VICTORY_EMIT_DUMP") };
         assert!(

@@ -89,6 +89,12 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
+        /// Also print, for each program that walks a ray-tracing structure in
+        /// software, the walk the translator finds there and whether a host ray
+        /// query could stand for it (`WALK` and `WALKTSV` lines). Changes no
+        /// translation.
+        #[arg(long)]
+        walk_report: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
@@ -201,6 +207,7 @@ fn main() -> Result<()> {
             validate,
             pipelines,
             list,
+            walk_report,
             jobs,
             warm,
         } => {
@@ -215,7 +222,7 @@ fn main() -> Result<()> {
             if let Some(file) = warm {
                 return translate::warm(paths, &file, jobs);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, walk_report, jobs)
         }
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]

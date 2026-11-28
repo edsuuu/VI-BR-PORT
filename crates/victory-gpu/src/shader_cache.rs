@@ -85,6 +85,8 @@ fn build() -> [u8; 32] {
             "VICTORY_BVH_BOUNDS",
             // Whether the ray-tracing node test always misses.
             "VICTORY_RT_MISS",
+            // Which walks of the title's structure become host ray queries.
+            "VICTORY_RT_QUERY",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
