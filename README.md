@@ -24,6 +24,9 @@ mission (the boat)**, with the player in control, on the Series S profile.
 **27 to 30 fps walking in the prison** and **30 fps standing still**, with the card 87 to
 94% busy. One machine; the table below holds the dated measurements.
 
+**Video** (NVIDIA RTX 4060 Ti 8 GB, the prison walk with the frame rate on screen; recorded
+on 26 Nov, before the latest gains): <https://youtu.be/HI7cEpJPhP4>
+
 ### What players use: the profiles of `scripts\play.ps1`
 
 | Profile | What it is |
