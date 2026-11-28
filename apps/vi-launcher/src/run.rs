@@ -209,6 +209,46 @@ pub fn file_sha256(path: &Path) -> std::io::Result<String> {
     Ok(options::hex(&hasher.finalize()))
 }
 
+/// The engine's cache of translated shaders and made pipelines: VICTORY_CACHE_DIR
+/// when set, else where VIctory keeps it by default (%LOCALAPPDATA%ictorycache).
+fn engine_cache() -> Option<PathBuf> {
+    std::env::var_os("VICTORY_CACHE_DIR")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join("victory").join("cache")))
+}
+
+/// Deletes the translated shaders and the made pipelines, and the stamp that
+/// says they are ready, so the next Play translates and warms again. Returns
+/// the bytes freed.
+pub fn clear_shaders() -> std::io::Result<u64> {
+    fn size(p: &Path) -> u64 {
+        std::fs::read_dir(p).map_or(0, |rd| {
+            rd.filter_map(Result::ok)
+                .map(|e| match e.file_type() {
+                    Ok(t) if t.is_dir() => size(&e.path()),
+                    _ => e.metadata().map_or(0, |m| m.len()),
+                })
+                .sum()
+        })
+    }
+    let mut freed = 0;
+    if let Some(cache) = engine_cache() {
+        for sub in ["shaders", "pipelines"] {
+            let dir = cache.join(sub);
+            if dir.is_dir() {
+                freed += size(&dir);
+                std::fs::remove_dir_all(&dir)?;
+            }
+        }
+    }
+    let stamp = paths::stamp_path();
+    if stamp.is_file() {
+        std::fs::remove_file(stamp)?;
+    }
+    Ok(freed)
+}
+
 fn read_stamp() -> Map<String, Value> {
     std::fs::read_to_string(paths::stamp_path())
         .ok()

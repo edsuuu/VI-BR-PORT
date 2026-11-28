@@ -128,6 +128,10 @@ pub struct App {
     /// The key bindings as typed in their text box (read when first shown).
     bindings_text: Option<String>,
     bindings_note: Option<String>,
+    /// After clearing the compiled shaders: what was freed (or why not).
+    shaders_note: Option<String>,
+    /// The clear button asks once more before deleting.
+    shaders_confirm: bool,
     /// The tray icon while the game is open.
     tray: Option<crate::tray::Tray>,
 }
@@ -158,6 +162,8 @@ impl App {
             crash_text: None,
             bindings_text: None,
             bindings_note: None,
+            shaders_note: None,
+            shaders_confirm: false,
             tray: None,
         };
         app.flags_text = flags::with_base(&app.config.flags, &options::base_flags());
@@ -1194,6 +1200,25 @@ impl App {
                     }
                 }
             });
+            // The compiled shaders: cleared on request, made again by the next Play.
+            let busy = self.prep.as_ref().is_some_and(|p| !p.finished);
+            let detail = self.shaders_note.clone().unwrap_or_else(|| text::get(lang, "shaders.clear.detail"));
+            let key = if self.shaders_confirm { "shaders.clear.confirm" } else { "shaders.clear" };
+            let mut clear = false;
+            setting_row(ui, h, 220.0, &text::get(lang, "shaders.title"), &detail, "textMuted", |ui| {
+                clear = ui.add_enabled_ui(!busy, |ui| theme::outline_button(ui, &text::get(lang, key), None, false)).inner.clicked();
+            });
+            if clear {
+                if self.shaders_confirm {
+                    self.shaders_confirm = false;
+                    self.shaders_note = Some(match run::clear_shaders() {
+                        Ok(bytes) => text::fill(lang, "shaders.cleared", &[&format!("{:.1}", bytes as f64 / (1u64 << 30) as f64)]),
+                        Err(e) => e.to_string(),
+                    });
+                } else {
+                    self.shaders_confirm = true;
+                }
+            }
             let (state, ink) = self.update_state().unwrap_or_default();
             let checking = matches!(self.update, Update::Checking(_) | Update::Downloading { .. });
             let mut check = false;

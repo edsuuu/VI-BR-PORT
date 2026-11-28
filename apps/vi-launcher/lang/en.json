@@ -82,5 +82,10 @@
   "controls.saved": "Keys saved.",
   "controls.reset": "Back to the default",
   "crash.title": "THE GAME CRASHED",
-  "crash.hint": "The logs of the last hour are below. Copy them and send them with what you were doing when it crashed."
+  "crash.hint": "The logs of the last hour are below. Copy them and send them with what you were doing when it crashed.",
+  "shaders.title": "Compiled shaders",
+  "shaders.clear.detail": "Deletes the translated shaders and the pipelines. The next Play makes them again (a few minutes).",
+  "shaders.clear": "Clear",
+  "shaders.clear.confirm": "Confirm clearing",
+  "shaders.cleared": "Cleared: {0} GB. The next Play makes them again."
 }

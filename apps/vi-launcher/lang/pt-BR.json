@@ -82,5 +82,10 @@
   "controls.saved": "Teclas salvas.",
   "controls.reset": "Voltar ao padrão",
   "crash.title": "O JOGO CAIU",
-  "crash.hint": "Os logs da última hora estão abaixo. Copie e mande junto com o que você estava fazendo quando caiu."
+  "crash.hint": "Os logs da última hora estão abaixo. Copie e mande junto com o que você estava fazendo quando caiu.",
+  "shaders.title": "Shaders compilados",
+  "shaders.clear.detail": "Apaga os shaders traduzidos e os pipelines. Na próxima vez em JOGAR eles são feitos de novo (alguns minutos).",
+  "shaders.clear": "Limpar",
+  "shaders.clear.confirm": "Confirmar limpeza",
+  "shaders.cleared": "Limpo: {0} GB. Na próxima vez em JOGAR eles são feitos de novo."
 }
