@@ -66,6 +66,9 @@ thread_local! {
     /// While a stage's tables are walked (`State::tables`): whether that
     /// stage's shader can store to buffers (`Translated::stores`).
     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    /// While a stage's tables are walked: that stage's program hash, for
+    /// [`note_empty`] (0 unless `VICTORY_EMPTY_VIEW_LOG=1`).
+    static PROGRAM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// While a stage's tables are walked: whether that stage is a pixel
     /// program of the characters' G-buffer pass (`Shader::peds`).
     #[cfg(feature = "diagnostics")]
@@ -878,6 +881,62 @@ macro_rules! once {
     }};
 }
 
+/// With `VICTORY_EMPTY_VIEW_LOG=1` (off by default: two locks per table
+/// entry a draw reads), says once per program and table entry why the
+/// shader view or unordered view a draw reads through a table has no host
+/// resource (`HostHeap::why_empty`): such a slot reads zeros, and a
+/// shader that decodes colour from it draws what the zeros make of it.
+/// `index`: the host slot the draw binds; `handle`: the title's slot.
+fn note_empty(host: &crate::descriptor::host::HostHeap, index: u32, handle: u64, u: &UsedResource) {
+    if !matches!(u.kind, ResourceType::Srv | ResourceType::Uav) {
+        return;
+    }
+    note_empty_at(host, index, handle, (u.slot, u.table_offset_dwords, u.lower_bound));
+}
+
+/// [`note_empty`] for the entry at dword `dwords` of the table in root
+/// parameter `slot`, read as shader register `register` (`u32::MAX`: a
+/// slot the shader picks by index, `RootIndexedView`).
+fn note_empty_at(
+    host: &crate::descriptor::host::HostHeap,
+    index: u32,
+    handle: u64,
+    (slot, dwords, register): (u8, u32, u32),
+) {
+    if !crate::descriptor::host::empty_view_log() {
+        return;
+    }
+    static SAID: std::sync::Mutex<std::collections::BTreeSet<(u64, u8, u32)>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let program = PROGRAM.get();
+    let key = (program, slot, dwords);
+    {
+        let said = SAID.lock().unwrap_or_else(|e| e.into_inner());
+        if said.len() >= 4096 || said.contains(&key) {
+            return;
+        }
+    }
+    let view = crate::descriptor::view(handle);
+    // (A slot picked by index may hold constants, made in upload memory.)
+    if matches!(view, Some(View::Constant(..) | View::Sampler(_) | View::ConsoleSampler(_))) {
+        return;
+    }
+    let Some(why) = host.why_empty(index, view.as_ref()) else {
+        return;
+    };
+    if !SAID.lock().unwrap_or_else(|e| e.into_inner()).insert(key) {
+        return;
+    }
+    tracing::warn!(
+        program = format_args!("{program:016x}"),
+        entry = format_args!("s{slot}+{dwords}"),
+        register = if register == u32::MAX { "by index".to_owned() } else { register.to_string() },
+        host_slot = index,
+        view = ?view,
+        "a view a draw reads has no host resource: {why}"
+    );
+}
+
 fn set(roots: &mut Vec<Root>, slot: u32, root: Root) {
     let slot = slot as usize;
     if roots.len() <= slot {
@@ -1637,6 +1696,9 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            if crate::descriptor::host::empty_view_log() {
+                PROGRAM.set(u64::from_str_radix(&stage.shader.hash, 16).unwrap_or(0));
+            }
             #[cfg(feature = "diagnostics")]
             PED_STAGE.set(stage.shader.peds);
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
@@ -3661,6 +3723,7 @@ impl State {
                 host.slot_tabled(index);
             }
         }
+        note_empty(host, index, handle, u);
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -3947,6 +4010,9 @@ impl State {
                     if was != (listed.ready, listed.tabled) {
                         crate::descriptor::host::note_listed(recording, words, listed);
                     }
+                    if let Some(u) = entries().find(|u| u.table_offset_dwords / 8 == k) {
+                        note_empty(host, index, table + u64::from(k) * 32, u);
+                    }
                     continue;
                 }
                 let used = entries().find(|u| u.table_offset_dwords / 8 == k);
@@ -3991,6 +4057,11 @@ impl State {
                             once!(slot, "a table entry without a view");
                         }
                     }
+                }
+                if let Some(u) = used {
+                    note_empty(host, index, table + u64::from(k) * 32, u);
+                } else if selected.binary_search(&k).is_ok() {
+                    note_empty_at(host, index, table + u64::from(k) * 32, (slot, k * 8, u32::MAX));
                 }
             }
             made.push((slot, first * 32));

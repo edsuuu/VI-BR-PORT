@@ -1161,8 +1161,20 @@ impl Player {
                             }
                         }
                     }
+                    // Slots shown from each base: 12, or `VICTORY_SLOTS_SPAN`
+                    // (a program may read a table far past its first twelve,
+                    // TL_PS_PBR_MATERIAL_TRANSLUCENCY up to +164). A base is
+                    // a guess from the constants: a table holding constant
+                    // buffers is made afresh for the draw in dynamic slots
+                    // (`draw::State::tables`), and the title's own slots of it,
+                    // listed too, are not what the draw reads.
+                    let span = std::env::var("VICTORY_SLOTS_SPAN")
+                        .ok()
+                        .and_then(|n| n.trim().parse::<u32>().ok())
+                        .unwrap_or(12)
+                        .min(4096);
                     for base in bases {
-                        for k in 0..12 {
+                        for k in 0..span {
                             let s = self.slot_at(heap, base + k, i);
                             if s.kind != slot::EMPTY {
                                 say(format!("  slot {base}+{k}: {}", self.slot_text(&s)));

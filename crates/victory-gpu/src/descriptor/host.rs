@@ -1201,6 +1201,79 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
     }
 }
 
+/// Whether draws say why a view they read has no host resource
+/// (`crate::draw`'s `note_empty`); `VICTORY_EMPTY_VIEW_LOG=1`, off by
+/// default.
+pub(crate) fn empty_view_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_EMPTY_VIEW_LOG").is_some_and(|v| v == "1"))
+}
+
+/// Why the host could not make `view` (what [`make`] needs and found
+/// missing), in words for the log. Looks only; makes nothing.
+fn why_unmade(view: &View) -> String {
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(r, desc) | View::Unordered(r, _, desc) => {
+            let unordered = matches!(view, View::Unordered(..));
+            let this = *r as crate::object::This;
+            if let Some((_, len)) = crate::resource::buffer_bytes(this) {
+                return if desc.is_none() {
+                    format!("a view of a buffer of {len} bytes without a description")
+                } else {
+                    format!("a view of a buffer of {len} bytes the host refused (range or format)")
+                };
+            }
+            let texture = if unordered {
+                crate::resource::host_resource(this).cloned()
+            } else {
+                crate::resource::host_copy(this).map(|copy| copy.texture.clone())
+            };
+            let Some(texture) = texture else {
+                return format!(
+                    "the title's resource {r:#x} has no host copy (a texture not uploaded yet, or one the host never made)"
+                );
+            };
+            let mut format = desc.as_ref().map(|d| DXGI_FORMAT(d[0] as i32));
+            // SAFETY: a live resource.
+            let own = unsafe { texture.GetDesc() }.Format.0;
+            if !fits(&texture, format.as_mut(), unordered) {
+                return format!(
+                    "the host refuses this view of the texture: view format {}, texture format {own}",
+                    desc.map_or(0, |d| d[0])
+                );
+            }
+            "the view can be made now: the slot was left null (made later, or made null again when its memory went)".into()
+        }
+        View::Placed(unordered, resource, desc) if resource[0] != BUFFER => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            if *unordered {
+                format!("unordered access to a texture placed at {address:#x} is not mirrored")
+            } else if address == 0 {
+                format!(
+                    "a texture view of placed memory at address 0: the title named no memory yet (view format {})",
+                    desc[0]
+                )
+            } else if crate::resource::texture_at_made(address, resource).is_none() {
+                format!("no texture the host knows at {address:#x} (view format {})", desc[0])
+            } else {
+                format!("the texture placed at {address:#x} has no host copy yet (view format {})", desc[0])
+            }
+        }
+        View::Placed(_, resource, desc) => {
+            let len = u64::from(resource[4]) | u64::from(resource[5]) << 32;
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            if len == 0 {
+                "a view of an empty title buffer".into()
+            } else {
+                format!("no host copy of the buffer memory at {address:#x} ({len} bytes), or a range the host refused")
+            }
+        }
+        View::Constant(address, _) => format!("no host copy of the constant buffer memory at {address:#x}"),
+        View::Sampler(_) | View::ConsoleSampler(_) => "a sampler".into(),
+    }
+}
+
 /// Buffer views left null because the host would refuse them
 /// ([`buffer_view_ok`]), since the start.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3009,6 +3082,20 @@ impl HostHeap {
     /// What slot `index` views.
     fn kept_in(&self, index: u32) -> Option<ID3D12Resource> {
         self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Why slot `index`, which a draw reads as the title's `view` (none:
+    /// the title slot holds no view of ours), views no host resource; none
+    /// if it views one ([`empty_view_log`]).
+    pub(crate) fn why_empty(&self, index: u32, view: Option<&View>) -> Option<String> {
+        let held = self.kept.get(index as usize)?.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        if held {
+            return None;
+        }
+        Some(match view {
+            None => "the title slot holds no view of ours (never written, or its resource was released)".into(),
+            Some(view) => why_unmade(view),
+        })
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -5192,6 +5279,21 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reasons told for views of placed memory the host cannot make,
+    /// as the logs show them (a placed RGBA8 2D view at address 0).
+    #[test]
+    fn views_of_no_memory_say_why() {
+        let mut resource = [0u32; 14];
+        resource[0] = 3;
+        let mut desc = [0u32; 16];
+        desc[..3].copy_from_slice(&[28, 4, 5768]);
+        let why = why_unmade(&View::Placed(false, resource, desc));
+        assert!(why.contains("address 0"), "{why}");
+        assert!(why_unmade(&View::Placed(true, resource, desc)).contains("not mirrored"));
+        resource[0] = 1;
+        assert!(why_unmade(&View::Placed(false, resource, desc)).contains("empty title buffer"));
+    }
 
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.
