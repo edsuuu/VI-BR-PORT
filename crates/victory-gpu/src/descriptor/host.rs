@@ -4480,6 +4480,20 @@ fn make_twinned(
             Some(None)
         }
         View::ConsoleSampler(words) => {
+            if crate::sampler::flags_on() {
+                let flags = crate::sampler::console_flags(words);
+                if flags != 0 {
+                    crate::sampler::note_flags(flags);
+                }
+                if let (Some(desc2), Ok(device11)) = (
+                    crate::sampler::console2(words),
+                    windows::core::Interface::cast::<ID3D12Device11>(device),
+                ) {
+                    // SAFETY: a slot of our sampler heap.
+                    unsafe { device11.CreateSampler2(&desc2, at) };
+                    return Some(None);
+                }
+            }
             let desc = crate::sampler::console(words);
             // SAFETY: a slot of our sampler heap.
             unsafe { device.CreateSampler(&desc, at) };
