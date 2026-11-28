@@ -1641,7 +1641,7 @@ impl State {
             let t = stage.translated();
             // Diagnostics (`VICTORY_SMASH_WATCH`): the program that declares
             // the writes of this stage's views.
-            if crate::smash::on() {
+            if crate::smash::checks() {
                 crate::smash::program(Some(stage.shader.hash.as_str()));
             }
             STORES.set(t.stores);

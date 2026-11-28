@@ -2253,7 +2253,7 @@ fn under_wide() -> bool {
 /// shortcut: a piece with very many runs has them joined over small gaps,
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
-    if crate::smash::on() {
+    if crate::smash::checks() {
         crate::smash::before_put(crate::smash::Path::PutBack, at, title, merged);
     }
     crate::watch::landing(at, title.len());
@@ -3096,7 +3096,7 @@ impl Shadow {
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
         // Diagnostics (`VICTORY_SMASH_WATCH`): which program declared it.
-        if crate::smash::on() {
+        if crate::smash::checks() {
             list.smash_declare(address as usize, (address + len) as usize);
         }
     }

@@ -872,7 +872,7 @@ impl Written {
         crate::timeline::told("written when its list had run", at as usize, value);
         // Diagnostics (`VICTORY_SMASH_WATCH`): a title pointer this changes.
         #[cfg(windows)]
-        if crate::smash::on() {
+        if crate::smash::checks() {
             crate::smash::before_value(at as usize, value, bytes);
         }
         // SAFETY: the title names writable GPU memory (unified with ours).

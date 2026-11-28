@@ -67,6 +67,13 @@ pub(crate) fn on() -> bool {
     level() > 0 || guard()
 }
 
+/// Whether the paths other than the landing look before they write (and
+/// draws note their programs): with `VICTORY_SMASH_WATCH` only. The guard
+/// alone needs the landing's look ([`before_merge`]) and nothing else.
+pub(crate) fn checks() -> bool {
+    level() > 0
+}
+
 /// `VICTORY_SMASH_GUARD=1` (off by default; with it the checks of `1` are
 /// on): a landing does not put the card's bytes over a title pointer in the
 /// ways the crashes saw ([`watch_flags`]). Title memory and the CPU's side
@@ -595,7 +602,13 @@ pub(crate) unsafe fn before_merge(card: bool, title: usize, now: *const u8, held
             let t = u64::from_le_bytes(page[i..i + 8].try_into().unwrap_or_default());
             let m = merged(t, c, h);
             if smashes(t, m) {
-                note(Event { path, at: title + i, was: t, now: m, card: Some((c, h)), landing: landing_number(), frame: crate::frame::current(), ms: ms() });
+                // (The guard alone notes nothing: the GPU's own data looks
+                // like this some 90,000 times a second in the world, runs
+                // barco-q-w1..3, and noting them all took about 1.8 ms a
+                // frame, prisao-q-w1.)
+                if level() > 0 {
+                    note(Event { path, at: title + i, was: t, now: m, card: Some((c, h)), landing: landing_number(), frame: crate::frame::current(), ms: ms() });
+                }
                 if guard() && watch_flags(t, m) {
                     keep.push((i, t, m));
                 }

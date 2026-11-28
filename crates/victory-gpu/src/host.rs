@@ -4213,7 +4213,7 @@ fn read_backs(list: &HostList) {
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
                     // Diagnostics (`VICTORY_SMASH_WATCH`).
-                    if crate::smash::on() {
+                    if crate::smash::checks() {
                         let src = from.add(line * row.next_multiple_of(256));
                         crate::smash::before_copy(crate::smash::Path::ReadBack, *at + line * pitch, src, *row);
                     }
@@ -5756,7 +5756,7 @@ impl Host {
                 let mut hand_back = relay_hand_back(&back);
                 // Diagnostics (`VICTORY_SMASH_WATCH`): what is landed, for
                 // what a merge into a title pointer says.
-                if crate::smash::on() {
+                if crate::smash::checks() {
                     let numbers = flights.iter().map(|f| f.number).collect();
                     let declared = flights
                         .iter()
@@ -9378,7 +9378,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if title_dst {
         // Diagnostics (`VICTORY_SMASH_WATCH`): a title pointer this changes
         // (a source that cannot be read is taken as the zeros it leaves).
-        if crate::smash::on() {
+        if crate::smash::checks() {
             crate::smash::before_copy(crate::smash::Path::Copy, dst as usize, src, len);
         }
         // The kernel writes the destination: it must not be guarded.
