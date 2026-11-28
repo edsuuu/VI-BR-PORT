@@ -538,9 +538,18 @@ impl App {
             let font = FontId::new(theme::type_size("play"), FontFamily::Name("display".into()));
             // Without a game folder the same button chooses it, then it is Play.
             let no_game = matches!(plan, Err(PlanProblem::NoGame));
-            let text = if no_game { self.t("play.choose_game") } else { self.t("play.button") }.to_uppercase();
+            // Without the engine (its own victory.exe, released apart) the button chooses it.
+            let no_engine = matches!(plan, Err(PlanProblem::NoVictory(_)));
+            let text = if no_engine {
+                self.t("play.choose_engine")
+            } else if no_game {
+                self.t("play.choose_game")
+            } else {
+                self.t("play.button")
+            }
+            .to_uppercase();
             let busy = self.prep.as_ref().is_some_and(|p| !p.finished);
-            let on = !busy && (plan.is_ok() || no_game);
+            let on = !busy && (plan.is_ok() || no_game || no_engine);
             let button = theme::gradient_button(ui, &text, size, font, true, true, on);
             // Off, the mouse over it says why.
             let button = if on {
@@ -550,7 +559,12 @@ impl App {
                 button.on_disabled_hover_text(why)
             };
             if button.clicked() {
-                if no_game {
+                if no_engine {
+                    if let Some(exe) = rfd::FileDialog::new().set_title(self.t("engine.title")).add_filter("victory.exe", &["exe"]).pick_file() {
+                        self.config.victory_exe = Some(exe.display().to_string());
+                        self.save();
+                    }
+                } else if no_game {
                     if let Some(dir) = rfd::FileDialog::new().set_title(self.t("game.choose")).pick_folder() {
                         self.pick_game(dir);
                     }

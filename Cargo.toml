@@ -13,7 +13,6 @@ publish = false
 
 [workspace.dependencies]
 # Internal crates
-victory = { path = "apps/victory" }
 victory-core = { path = "crates/victory-core" }
 victory-pe = { path = "crates/victory-pe" }
 victory-loader = { path = "crates/victory-loader" }

@@ -3817,7 +3817,6 @@ dependencies = [
  "tiny_http",
  "tray-icon",
  "ureq",
- "victory",
  "windows-sys 0.61.2",
  "zip",
 ]

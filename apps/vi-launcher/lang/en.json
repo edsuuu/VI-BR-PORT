@@ -12,7 +12,7 @@
   "game.problem.not_exe": "{0} is not a valid executable (an unfinished copy?).",
   "build.missing": "victory.exe was not found. Looked in:\n{0}\nUse the full bundle (the launcher with the engine) or run the launcher from the repository.",
   "build.found": "Build: {0}",
-  "build.missing_short": "victory.exe is not next to the launcher. Use the full bundle.",
+  "build.missing_short": "The engine is missing: the engine release's victory.exe. Put it next to the launcher or choose it in More options.",
   "flags.title": "VICTORY FLAGS",
   "flags.hint": "The flags the build already uses are here. One per line, NAME=value: change a value, switch one off with # in front, or delete the line to take it out; add your own below. They win over the options above.",
   "flags.value": "value",
@@ -89,7 +89,8 @@
   "shaders.clear.confirm": "Confirm clearing",
   "shaders.cleared": "Cleared: {0} GB. The next Play makes them again.",
   "engine.title": "Engine (VIctory)",
-  "engine.builtin": "The one inside the launcher.",
-  "engine.choose": "Use another victory.exe",
-  "engine.use_builtin": "Use the launcher's"
+  "engine.builtin": "Looked for next to the launcher (the engine release's victory.exe).",
+  "engine.choose": "Choose victory.exe",
+  "engine.use_builtin": "Look next to the launcher",
+  "play.choose_engine": "Choose the engine"
 }

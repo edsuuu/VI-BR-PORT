@@ -1,8 +1,8 @@
-# Builds victory.exe and, unless -NoLauncher, the launcher with it, and packs them:
+# Builds and packs one of the two downloads, released apart, each one executable:
 #   scripts\build-bundle.ps1                 target\bundle\VI-BR-PORT-<version>-windows-x64.zip
-#                                            (vi-launcher.exe, victory\victory.exe)
+#                                            (vi-launcher.exe alone: the engine is its own download)
 #   scripts\build-bundle.ps1 -NoLauncher     target\bundle\VIctory-<version>-windows-x64.zip
-#                                            (victory.exe alone)
+#                                            (victory.exe alone: the engine, for the launcher or play.ps1)
 # -Channel   stable (the plain names: what a release of main ships) or dev (the default here:
 #            "dev-" before the file names, and the build calls itself dev in its titles)
 # -Version   the version in the file names (default: Cargo.toml's)

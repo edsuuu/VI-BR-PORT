@@ -57,10 +57,10 @@ pub fn repository_root(from: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// Where the build is looked for, in order: the path set in the options, the
-/// `victory` folder of an older two-file bundle, next to the launcher, in a
-/// repository checkout `target/<build>/victory.exe`, and last the launcher
-/// itself, which holds the engine (main.rs): a release is that one file.
+/// Where the engine is looked for, in order: the path set in the settings, a
+/// `victory` folder next to the launcher, next to the launcher, and in a
+/// repository checkout `target/<build>/victory.exe`. The engine is released
+/// apart from the launcher (its own victory.exe).
 pub fn victory_candidates(chosen: Option<&Path>, build: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Some(path) = chosen {
@@ -71,9 +71,6 @@ pub fn victory_candidates(chosen: Option<&Path>, build: &str) -> Vec<PathBuf> {
     out.push(here.join(VICTORY_EXE));
     if let Some(root) = repository_root(&here) {
         out.push(root.join("target").join(build).join(VICTORY_EXE));
-    }
-    if let Ok(me) = std::env::current_exe() {
-        out.push(me);
     }
     out
 }

@@ -12,7 +12,7 @@
   "game.problem.not_exe": "{0} não é um executável válido (cópia incompleta?).",
   "build.missing": "Não achei o victory.exe. Procurei em:\n{0}\nUse o pacote completo (launcher com a engine) ou rode o launcher de dentro do repositório.",
   "build.found": "Build: {0}",
-  "build.missing_short": "Não achei o victory.exe ao lado do launcher. Use o pacote completo.",
+  "build.missing_short": "Falta a engine: o victory.exe da release da engine. Ponha ao lado do launcher ou escolha em Mais opções.",
   "flags.title": "FLAGS DO VICTORY",
   "flags.hint": "As flags que o build já usa estão aqui. Uma por linha, NOME=valor: mude o valor, desligue com # na frente ou apague a linha para tirar; acrescente as suas embaixo. Valem mais que as opções acima.",
   "flags.value": "valor",
@@ -89,7 +89,8 @@
   "shaders.clear.confirm": "Confirmar limpeza",
   "shaders.cleared": "Limpo: {0} GB. Na próxima vez em JOGAR eles são feitos de novo.",
   "engine.title": "Engine (VIctory)",
-  "engine.builtin": "A que vem dentro do launcher.",
-  "engine.choose": "Usar outro victory.exe",
-  "engine.use_builtin": "Usar a do launcher"
+  "engine.builtin": "Procurada ao lado do launcher (o victory.exe da release da engine).",
+  "engine.choose": "Escolher o victory.exe",
+  "engine.use_builtin": "Procurar ao lado do launcher",
+  "play.choose_engine": "Escolher a engine"
 }

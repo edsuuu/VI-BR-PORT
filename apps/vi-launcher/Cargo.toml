@@ -24,8 +24,6 @@ self-replace.workspace = true
 directories.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-# The engine itself: on Windows one executable holds the launcher and VIctory (main.rs).
-victory.workspace = true
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Globalization", "Win32_Security", "Win32_System_Console", "Win32_System_Registry", "Win32_System_Threading"] }
 tray-icon.workspace = true
 
