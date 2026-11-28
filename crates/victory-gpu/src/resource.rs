@@ -152,9 +152,11 @@ pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
 
 /// A texture's layout in console memory, as the console's layout library
 /// gives it (`victory-hle`'s `xg` serves the same): the description's
-/// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick.
+/// layout field is `0x100 | swizzle mode`, 1 linear, 0 the library's pick,
+/// 2 and 3 reserved (the 64 KiB `_T` mode), a bank rotation in bits 12 to
+/// 15 (the layout is the same as without; the copies are not rotated).
 pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
-    use texture::{Dimension, Swizzle, TextureDesc};
+    use texture::{Dimension, LayoutField, TextureDesc};
     const TEXTURE_1D: u32 = 2;
     const TEXTURE_2D: u32 = 3;
     const RENDER_TARGET: u32 = 1;
@@ -165,15 +167,11 @@ pub(crate) fn texture_layout(desc: &ResourceDesc) -> Option<texture::Texture> {
         TEXTURE_3D => Dimension::Tex3d,
         _ => return None,
     };
-    let swizzle = match desc.layout {
-        0 if dimension == Dimension::Tex1d => Swizzle::LINEAR,
-        0 if desc.flags & DEPTH != 0 => Swizzle::SW_64KB_Z_X,
-        0 if desc.flags & RENDER_TARGET != 0 => Swizzle::SW_64KB_R_X,
-        0 => Swizzle::SW_4KB_S,
-        1 => Swizzle::LINEAR,
-        l if l & !0xff == 0x100 => Swizzle(l & 0xff),
-        _ => return None,
-    };
+    let swizzle = LayoutField::parse(desc.layout)?.resolve(
+        dimension,
+        desc.flags & DEPTH != 0,
+        desc.flags & RENDER_TARGET != 0,
+    )?;
     texture::Texture::new(&TextureDesc {
         dimension,
         width: u32::try_from(desc.width).ok()?,
@@ -3660,6 +3658,31 @@ mod tests {
         );
     }
 
+
+    /// Layout fields beyond 0, 1 and a mode: reserved layouts take the 64 KiB
+    /// `_T` mode, a bank rotation changes nothing, the rest is refused.
+    #[test]
+    fn layout_fields_of_the_library() {
+        let with = |layout| ResourceDesc {
+            layout,
+            ..texture(256, 256, 28, 1)
+        };
+        let mode = |layout| texture_layout(&with(layout)).map(|t| t.planes[0].layout.desc.swizzle.0);
+        assert_eq!((mode(2), mode(3)), (Some(17), Some(17)));
+        assert_eq!(mode(0x311b), mode(0x11b));
+        assert_eq!(mode(0x11b), Some(27));
+        for bad in [0x4, 0x120, 0x1ff, 0x1_0100, 0x1000, 0x3003] {
+            assert_eq!(mode(bad), None, "{bad:#x}");
+        }
+        // The size of a reserved texture: 64 KiB blocks, 64 KiB aligned.
+        assert_eq!(
+            footprint(&with(2)),
+            Some(AllocationInfo {
+                size: 256 << 10,
+                alignment: 1 << 16
+            })
+        );
+    }
     #[test]
     fn sizes_cover_every_mip() {
         let size = |d: &ResourceDesc| footprint(d).map(|i| i.size);
