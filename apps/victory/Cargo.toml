@@ -7,6 +7,15 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[lib]
+# Not "victory": the binary's name, and the two would share their debug files.
+name = "victory_app"
+path = "src/lib.rs"
+
+[[bin]]
+name = "victory"
+path = "src/main.rs"
+
 [dependencies]
 victory-core.workspace = true
 victory-pe.workspace = true
