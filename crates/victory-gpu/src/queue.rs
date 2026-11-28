@@ -1200,19 +1200,117 @@ pub(crate) struct PageBatch {
 /// Bytes per mapped page.
 const PAGE: u64 = 64 << 10;
 
+/// The page-mapping flags the console's headers define (GDK 261000,
+/// `d3d12_xs.h`): no hazard tracking against earlier work, and pages of
+/// 2 MiB instead of 64 KiB. No other bit is defined.
+const NO_HAZARD: u32 = 1;
+const PAGES_2MB: u32 = 2;
+
+/// Bytes per mapped page under the 2 MiB flag.
+const PAGE_2MB: u64 = 2 << 20;
+
+/// Whether the flags of the page-mapping calls are acted on
+/// (`VICTORY_PAGE_MAP_FLAGS=0`: ignored, every page taken as 64 KiB, as
+/// before). On by default: the kit's headers define the 2 MiB flag, and a
+/// call with it mapped 1/32 of what it asked for with no error, the rest of
+/// the destination keeping its old pages. The title's one call (at
+/// title+0xf2cc80) passes 0, so nothing changes for it.
+fn page_map_flags() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PAGE_MAP_FLAGS").is_none_or(|v| v != "0"))
+}
+
+/// Bytes per page the flags of a page-mapping call ask for. Under the
+/// 2 MiB flag the pool's start indices, the counts and the pool's size are
+/// all taken in 2 MiB pages (the headers name the flag only, not each
+/// field's unit: our reading). [`NO_HAZARD`] changes nothing here, since
+/// every mapping is made at once, after every earlier submission has run.
+fn page_bytes(flags: u32) -> u64 {
+    if page_map_flags() && flags & PAGES_2MB != 0 { PAGE_2MB } else { PAGE }
+}
+
+/// Logs each value of the flags the page-mapping calls bring the first
+/// time it comes (a warning for bits the headers do not define, which are
+/// otherwise ignored): no run's log said what they were.
+fn flags_seen(flags: u32) {
+    // The last value told of, so that the usual call takes no lock.
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    if LAST.swap(u64::from(flags), Ordering::Relaxed) == u64::from(flags) {
+        return;
+    }
+    static SEEN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&flags) {
+        return;
+    }
+    seen.push(flags);
+    let page = page_bytes(flags);
+    if flags & !(NO_HAZARD | PAGES_2MB) != 0 {
+        tracing::warn!(
+            flags = format_args!("{flags:#x}"),
+            page,
+            "CopyPageMappingsBatchX: flags the headers do not define; those bits are ignored"
+        );
+    } else {
+        tracing::info!(
+            flags = format_args!("{flags:#x}"),
+            page,
+            no_hazard = flags & NO_HAZARD != 0,
+            pages_2mb = flags & PAGES_2MB != 0,
+            "CopyPageMappingsBatchX: flags seen for the first time (VICTORY_PAGE_MAP_FLAGS=0: ignored)"
+        );
+    }
+}
+
+/// Maps the ranges of `batches` with pages of `page` bytes through `map(to,
+/// from, len)` (`from` 0: unmapped), pool pages checked against
+/// `pool_pages`; whether every range was known and inside the pool and
+/// every mapping made.
+fn map_batches(
+    batches: &[PageBatch],
+    pool: u64,
+    pool_pages: u32,
+    page: u64,
+    mut map: impl FnMut(u64, u64, u64) -> bool,
+) -> bool {
+    let mut ok = true;
+    for b in batches {
+        if b.ranges.is_null() {
+            continue;
+        }
+        // SAFETY: each batch holds `count` ranges.
+        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
+        let mut at = b.destination;
+        for r in ranges {
+            let len = u64::from(r.count) * page;
+            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
+            let source = pool + u64::from(r.start) * page;
+            ok &= match r.kind {
+                0 if inside(r.count) => map(at, source, len),
+                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * page, source, page)),
+                2 => map(at, 0, len),
+                3 => true,
+                _ => false,
+            };
+            at += len;
+        }
+    }
+    ok
+}
+
 /// `CopyPageMappingsBatchX(count, batches, pool, pool pages, flags)`: maps
 /// pages of a pool (memory the title mapped physical pages into) at the
 /// batches' addresses. The title streams textures into pool pages
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
 /// one constant page or of unmapped pages). Done at once: every earlier
-/// submission has run.
+/// submission has run. The flags as [`page_bytes`] says.
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
     pool_pages: u32,
-    _flags: u32,
+    flags: u32,
 ) -> HRESULT {
     #[cfg(windows)]
     let _timed = crate::titletime::begin(crate::titletime::Kind::Queue);
@@ -1223,47 +1321,31 @@ extern "system" fn copy_page_mappings(
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's CopyPageMappings");
-    let batches = (count > 0).then(|| {
+    flags_seen(flags);
+    let batches: &[PageBatch] = if count > 0 {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
-    });
-    let mut ok = true;
+    } else {
+        &[]
+    };
     let many = crate::resource::many_page_mapper();
     let mut gathered: Vec<(u64, u64, u64)> = Vec::new();
-    let mut map = |to: u64, from: u64, len: u64| match many {
+    let map = |to: u64, from: u64, len: u64| match many {
         Some(_) => {
             gathered.push((to, from, len));
             true
         }
         None => map(to, from, len),
     };
-    for b in batches.into_iter().flatten() {
-        if b.ranges.is_null() {
-            continue;
-        }
-        // SAFETY: each batch holds `count` ranges.
-        let ranges = unsafe { std::slice::from_raw_parts(b.ranges, b.count as usize) };
-        let mut at = b.destination;
-        for r in ranges {
-            let len = u64::from(r.count) * PAGE;
-            let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
-            let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
-            at += len;
-        }
-    }
+    let mut ok = map_batches(batches, pool, pool_pages, page_bytes(flags), map);
     if let Some(many) = many {
         ok &= many(&gathered);
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), flags = format_args!("{flags:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
@@ -1411,5 +1493,74 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    /// The mappings a batch asks for, with pages of `page` bytes.
+    fn mapped(ranges: &[PageRange], pool_pages: u32, page: u64) -> (bool, Vec<(u64, u64, u64)>) {
+        let batch = PageBatch { destination: 0x10_0000_0000, count: ranges.len() as u32, ranges: ranges.as_ptr() };
+        let mut out = Vec::new();
+        let ok = map_batches(std::slice::from_ref(&batch), 0x20_0000_0000, pool_pages, page, |to, from, len| {
+            out.push((to, from, len));
+            true
+        });
+        (ok, out)
+    }
+
+    #[test]
+    fn page_mappings_take_the_page_size_the_flags_ask_for() {
+        let ranges = [
+            PageRange { kind: 0, start: 2, count: 3 },
+            PageRange { kind: 1, start: 1, count: 2 },
+            PageRange { kind: 3, start: 0, count: 1 },
+            PageRange { kind: 2, start: 0, count: 2 },
+        ];
+        let (dst, pool) = (0x10_0000_0000u64, 0x20_0000_0000u64);
+        for page in [PAGE, PAGE_2MB] {
+            let (ok, out) = mapped(&ranges, 8, page);
+            assert!(ok);
+            assert_eq!(
+                out,
+                [
+                    (dst, pool + 2 * page, 3 * page),
+                    (dst + 3 * page, pool + page, page),
+                    (dst + 4 * page, pool + page, page),
+                    // The skipped page moves the address on all the same.
+                    (dst + 6 * page, 0, 2 * page),
+                ]
+            );
+        }
+        // Past the pool's end, in its pages: refused, the next range mapped.
+        let past = [PageRange { kind: 0, start: 7, count: 2 }, PageRange { kind: 2, start: 0, count: 1 }];
+        let (ok, out) = mapped(&past, 8, PAGE_2MB);
+        assert!(!ok);
+        assert_eq!(out, [(dst + 2 * PAGE_2MB, 0, PAGE_2MB)]);
+        // An unknown kind fails and maps nothing.
+        assert_eq!(mapped(&[PageRange { kind: 4, start: 0, count: 1 }], 8, PAGE), (false, vec![]));
+    }
+
+    #[test]
+    fn the_2mb_flag_makes_pages_of_2mb() {
+        if !page_map_flags() {
+            return;
+        }
+        assert_eq!(page_bytes(0), PAGE);
+        assert_eq!(page_bytes(NO_HAZARD), PAGE);
+        assert_eq!(page_bytes(PAGES_2MB), PAGE_2MB);
+        assert_eq!(page_bytes(PAGES_2MB | NO_HAZARD | 0x80), PAGE_2MB);
+        assert_eq!(page_bytes(0x80), PAGE);
+        // Logged once each, whatever the bits.
+        for flags in [0, 0, PAGES_2MB, 0x80, 0x80] {
+            flags_seen(flags);
+        }
+    }
+
+    /// The headers' queue table has the batch call at 0xf8 in the newer
+    /// layout, where the title calls it (title+0xf2cc80).
+    #[test]
+    fn the_batch_call_is_where_the_headers_put_it() {
+        let ours = copy_page_mappings as *const ();
+        let (slot, _) = METHODS.iter().copied().find(|&(_, f)| f == ours).expect("in the table");
+        assert_eq!(newer_slot(slot) * 8, 0xf8);
+        assert_eq!(slot * 8, 0xe8);
     }
 }
