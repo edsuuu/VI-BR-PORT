@@ -3642,6 +3642,14 @@ fn relay_wait(why: usize, done: impl Fn(&Line) -> bool) {
     stood(waiting);
     working(was_working);
     let us = waiting.elapsed().as_micros() as u64;
+    backmin::waited(
+        match why {
+            WHY_SYNC => backmin::k::WAIT_PRESENT,
+            WHY_FENCE => backmin::k::WAIT_FENCE,
+            _ => backmin::k::WAIT_SUBMIT,
+        },
+        us,
+    );
     LATE_STATS[12].fetch_add(us, Ordering::Relaxed);
     LATE_WAITED[why.min(10)].fetch_add(us, Ordering::Relaxed);
     SUBMISSION_US[1].fetch_add(us, Ordering::Relaxed);
@@ -3863,12 +3871,12 @@ impl RelayBack {
         crate::copystat::add(crate::copystat::C::BackScanUs, scanning.elapsed().as_micros() as u64);
     }
 
-    /// What differs goes into title memory.
-    fn merge(mut self) {
+    /// What differs goes into title memory; the bytes put.
+    fn merge(mut self) -> u64 {
         use crate::land;
         self.look(land::stat::SCAN);
         let Some(found) = self.found else {
-            return;
+            return 0;
         };
         let merging = std::time::Instant::now();
         let mut written: Vec<u64> = Vec::new();
@@ -3902,12 +3910,15 @@ impl RelayBack {
             }
         }
         land::spent(land::stat::BACK, merging);
+        let mut all = 0;
         for ((_, from, to), written) in self.work.iter().zip(written) {
             COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
+            all += written;
             #[cfg(feature = "diagnostics")]
             crate::copystat::compared(*from, to - from, written as usize);
             let _ = (from, to);
         }
+        all
     }
 }
 
@@ -4026,6 +4037,7 @@ fn late_line(frames: f64) {
 
 pub(crate) mod aside;
 pub(crate) mod awake;
+mod backmin;
 mod card_steps;
 mod heat;
 #[cfg(any(test, feature = "diagnostics"))]
@@ -5534,6 +5546,7 @@ impl Host {
                 .collect();
         }
         land::spent(land::stat::GATHER, gathering);
+        backmin::add(backmin::k::GATHER_US, backmin::us(gathering));
         if fetch.is_none() {
             *fetch = self.make_relay_fetch();
         }
@@ -5588,9 +5601,11 @@ impl Host {
             (|| -> windows::core::Result<u64> {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
-                for (shadow, lo, hi, at) in check.as_ref().map_or(&pieces, |c| &c.copies) {
+                let copies = check.as_ref().map_or(&pieces, |c| &c.copies);
+                for (shadow, lo, hi, at) in copies {
                     list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                 }
+                backmin::add(backmin::k::REGIONS, copies.len() as u64);
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
@@ -5626,6 +5641,10 @@ impl Host {
         };
         let us = waiting.elapsed().as_micros() as u64;
         RELAY_STATS[3].fetch_add(us, Ordering::Relaxed);
+        backmin::add(backmin::k::FETCHES, 1);
+        backmin::add(backmin::k::PIECES, pieces.len() as u64);
+        backmin::add(backmin::k::FETCHED, total);
+        backmin::add(backmin::k::FETCH_US, us);
         {
             use crate::shadow::CARD_STATS;
             CARD_STATS[3].fetch_add(pieces.len() as u64, Ordering::Relaxed);
@@ -5679,6 +5698,8 @@ impl Host {
             }
         }
         land::spent(land::stat::CARD, merging);
+        backmin::add(backmin::k::CARD_MERGE_US, backmin::us(merging));
+        backmin::add(backmin::k::CARD_PUT, written);
         COPY_BACK[1].fetch_add(written, Ordering::Relaxed);
         if let Some(f) = fetch.as_mut() {
             if let Some(check) = &check {
@@ -5752,7 +5773,9 @@ impl Host {
                     }
                 });
                 stage.next("landing: copies in the PC's memory");
-                hand_back.merge();
+                let pc = std::time::Instant::now();
+                backmin::add(backmin::k::PC_PUT, hand_back.merge());
+                backmin::add(backmin::k::PC_US, backmin::us(pc));
                 stage.next("landing: ranges done with");
                 let finishing = std::time::Instant::now();
                 // Only now, and flight by flight: a range another flight
@@ -5774,6 +5797,7 @@ impl Host {
         }
         // In the order given: what tells the title the card is done.
         stage.next("landing: read-backs, telling the title");
+        let told = std::time::Instant::now();
         let mut last = 0;
         let mut landed = Vec::new();
         let mut telling = std::time::Instant::now();
@@ -5810,6 +5834,13 @@ impl Host {
         if last > 0 {
             FINISHED.store(last, Ordering::Release);
             bury(last);
+        }
+        backmin::add(backmin::k::TELL_US, backmin::us(told));
+        {
+            let all = backmin::us(landing);
+            backmin::add(backmin::k::LANDINGS, 1);
+            backmin::add(backmin::k::LANDING_US, all);
+            backmin::most(backmin::k::LANDING_MAX_US, all);
         }
         stage.next("landing: the rest");
         self.log_messages();
@@ -10083,6 +10114,7 @@ impl Meter {
         }
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
+        backmin::tick(u64::from(self.frames));
         let fps = frames / elapsed.as_secs_f64();
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
