@@ -84,6 +84,7 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_WIDE_FOR",
             "VICTORY_WAVE_PAIRED",
             "VICTORY_WAVE_PAIRED_FOR",
+            "VICTORY_WAVE_PAIRED_EVEN",
             "VICTORY_WAVE_EARLY_OUTS",
             "VICTORY_WAVE_SELECTIVE_SKIPS",
             "VICTORY_WAVE_EARLY_OUTS_EXCHANGE",

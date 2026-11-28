@@ -518,6 +518,24 @@ pub fn paired_named(hash: &str) -> bool {
     named.iter().any(|h| hash.starts_with(h.as_str()) || hash.len() >= 16 && h.starts_with(hash.as_str()))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: [`paired_even`] as set here instead of from `VICTORY_WAVE_PAIRED_EVEN`.
+    pub(crate) static TEST_PAIRED_EVEN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// `VICTORY_WAVE_PAIRED_EVEN=1`: the programs named in `VICTORY_WAVE_PAIRED_FOR` try the paired
+/// form even when their plain translation already runs in 32-lane waves (see [`emit`]). Off
+/// unless set to 1.
+fn paired_even() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_PAIRED_EVEN.get() {
+        return on;
+    }
+    static EVEN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EVEN.get_or_init(|| std::env::var_os("VICTORY_WAVE_PAIRED_EVEN").is_some_and(|v| v == "1"))
+}
+
 /// Whether some program is named in `VICTORY_WAVE_PAIRED_FOR` ([`paired_named`]): a caller
 /// hashes containers only then.
 pub fn paired_names_any() -> bool {
@@ -634,6 +652,31 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    // A program named in `VICTORY_WAVE_PAIRED_FOR` tries the paired form only when its plain
+    // translation still wants 64 lanes or stops where not every lane runs (below). With
+    // `VICTORY_WAVE_PAIRED_EVEN=1` it tries it before the plain translation as well: a program
+    // whose plain translation already runs in 32-lane waves, its lanes 32..63 reached through
+    // exchanges between the two host waves, is then translated the way the console runs it
+    // too, so a frame can tell whether that form drew it right. Unset: as before.
+    if PAIRED_FIRST.get()
+        && paired_even()
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && lower::host_max_wave() == 32
+    {
+        let paired = emit_paired(c, native, p, st);
+        lower::take_needs();
+        lower::take_meets();
+        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
+            match &paired {
+                Ok((_, wave)) => eprintln!("WAVE64-RETRY paired, named, before the plain form: wave {wave:?}"),
+                Err(e) => eprintln!("WAVE64-RETRY paired, named, before the plain form: {e}"),
+            }
+        }
+        if matches!(&paired, Ok((_, wave)) if *wave != Some(64)) {
+            return paired.map(|(shader, _)| shader);
+        }
+    }
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
