@@ -250,6 +250,48 @@ fn a_piece_waits_for_a_change_of_mapping() {
     unsafe { VirtualFree(at as _, 0, MEM_RELEASE) };
 }
 
+/// With `VICTORY_LAND_ANYTIME=2` a piece of view memory that meets a change
+/// of mapping under way is put only once the change is done (through a view
+/// of ours, the lock held), or, if the change goes on too long, through the
+/// title's address; either way all of it arrives. With 1 it is put at once.
+#[test]
+fn a_piece_through_a_view_of_ours_waits_for_a_change_of_mapping() {
+    assert!(crate::safecopy::on());
+    let title = Title::new(BLOCK);
+    let at = title.at;
+    for (mode, hold_ms) in [(2u8, 5u64), (2, 3 * WAIT_MOST.as_millis() as u64), (1, 50)] {
+        let fill = 0x10 * mode + (hold_ms % 0x10) as u8;
+        let now = [fill; 256];
+        let mut held = [0u8; 256];
+        let changed = AtomicBool::new(false);
+        let (began, wait) = std::sync::mpsc::channel();
+        let landed = std::thread::scope(|s| {
+            s.spawn(|| {
+                let changing = crate::watch::title_memory_remapping();
+                began.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+                changed.store(true, Ordering::SeqCst);
+                drop(changing);
+            });
+            wait.recv().unwrap();
+            let started = std::time::Instant::now();
+            // SAFETY: arrays of 256 bytes, inside the view.
+            let put = unsafe {
+                piece_at(at + 64, now.as_ptr(), held.as_mut_ptr(), &[(0, 256)], true, &mut Notes::default(), true, mode, std::ptr::null())
+            };
+            (put, changed.load(Ordering::SeqCst), started.elapsed())
+        });
+        let (put, after_change, took) = landed;
+        assert_eq!((put, held), (256, now), "mode {mode}, {hold_ms} ms");
+        assert!(title.bytes()[64..320].iter().all(|&b| b == fill), "mode {mode}, {hold_ms} ms");
+        match (mode, hold_ms) {
+            (2, 5) => assert!(after_change, "put while the mapping changed"),
+            (2, _) => assert!(took >= WAIT_MOST, "gave up after {took:?}"),
+            _ => assert!(!after_change, "put at once"),
+        }
+    }
+}
+
 /// Landings on several threads beside title threads that write the same
 /// blocks (other dwords) and a thread that refreshes a copy, guarding what
 /// it takes: no write of the title's is lost or undone, all the card wrote
@@ -457,7 +499,7 @@ fn what_landing_costs() {
                             let mut notes = Notes::default();
                             for &(at, now, held) in &landing[jobs[j].clone()] {
                                 // SAFETY: each its own bytes.
-                                unsafe { piece_at(at, now as *const u8, held as *mut u8, &[(0, BLOCK)], true, &mut notes, beside, std::ptr::null()) };
+                                unsafe { piece_at(at, now as *const u8, held as *mut u8, &[(0, BLOCK)], true, &mut notes, beside, anytime(), std::ptr::null()) };
                             }
                             notes.flush();
                         });
