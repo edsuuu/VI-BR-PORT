@@ -10290,6 +10290,76 @@ fn record_compose(
     }
 }
 
+/// The size of the back buffer several planes are composed into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposeSize {
+    /// The largest plane's: the console display's own output size.
+    Largest,
+    /// The bottom plane's (the world's, on Series S 1920x1080).
+    First,
+    /// A fixed width and height.
+    Fixed(u32, u32),
+}
+
+/// `VICTORY_COMPOSE_SIZE`: `largest` (the default), `first`, or
+/// `WIDTHxHEIGHT`. A Series S title presents the world in a 1920x1080 plane
+/// and the interface in a 3840x2160 one, so by default the swap chain is
+/// 3840x2160: the world is stretched twice over with a bilinear filter, and
+/// the window (a 1080p screen's, smaller still) shrinks that to under half
+/// with no filter for it, which steps thin branches and wires and softens the
+/// rest. `first` composes at the world's own size instead (the interface is
+/// halved, a 2x2 average).
+fn compose_size_setting() -> ComposeSize {
+    static SETTING: OnceLock<ComposeSize> = OnceLock::new();
+    *SETTING.get_or_init(|| {
+        let Ok(text) = std::env::var("VICTORY_COMPOSE_SIZE") else {
+            return ComposeSize::Largest;
+        };
+        parse_compose_size(&text).unwrap_or_else(|| {
+            tracing::warn!(text, "VICTORY_COMPOSE_SIZE wants largest, first or WIDTHxHEIGHT; largest kept");
+            ComposeSize::Largest
+        })
+    })
+}
+
+fn parse_compose_size(text: &str) -> Option<ComposeSize> {
+    let text = text.trim();
+    match text {
+        "largest" | "" => Some(ComposeSize::Largest),
+        "first" => Some(ComposeSize::First),
+        _ => {
+            let (w, h) = text.split_once(['x', 'X'])?;
+            let (w, h) = (w.trim().parse().ok()?, h.trim().parse().ok()?);
+            // D3D12's largest 2D texture side.
+            let side = 1..=16384;
+            (side.contains(&w) && side.contains(&h)).then_some(ComposeSize::Fixed(w, h))
+        }
+    }
+}
+
+/// The back buffer's width and height for planes of `sizes`, bottom first.
+fn compose_size(setting: ComposeSize, sizes: &[(u32, u32)]) -> Option<(u32, u32)> {
+    match setting {
+        ComposeSize::Largest => sizes.iter().copied().max_by_key(|&(w, h)| u64::from(w) * u64::from(h)),
+        ComposeSize::First => sizes.first().copied(),
+        ComposeSize::Fixed(w, h) => Some((w, h)),
+    }
+}
+
+#[test]
+fn compose_size_is_the_largest_unless_asked() {
+    let planes = [(1920, 1080), (3840, 2160)];
+    assert_eq!(compose_size(ComposeSize::Largest, &planes), Some((3840, 2160)));
+    assert_eq!(compose_size(ComposeSize::First, &planes), Some((1920, 1080)));
+    assert_eq!(compose_size(ComposeSize::Fixed(2560, 1440), &planes), Some((2560, 1440)));
+    assert_eq!(compose_size(ComposeSize::First, &[]), None);
+    assert_eq!(parse_compose_size(" first "), Some(ComposeSize::First));
+    assert_eq!(parse_compose_size("largest"), Some(ComposeSize::Largest));
+    assert_eq!(parse_compose_size("2560x1440"), Some(ComposeSize::Fixed(2560, 1440)));
+    assert_eq!(parse_compose_size("0x1080"), None);
+    assert_eq!(parse_compose_size("big"), None);
+}
+
 /// Whether [`record_compose`] can draw into a back buffer of `format`.
 fn composes(format: DXGI_FORMAT) -> bool {
     plane_pass().is_some() && compose_pipeline(format).is_some()
@@ -10965,8 +11035,8 @@ impl Host {
         }
         // SAFETY: live resources.
         let descs: Vec<D3D12_RESOURCE_DESC> = planes.iter().map(|(t, ..)| unsafe { t.GetDesc() }).collect();
-        let largest = descs.iter().max_by_key(|d| d.Width * u64::from(d.Height))?;
-        let (width, height) = (largest.Width as u32, largest.Height);
+        let sizes: Vec<(u32, u32)> = descs.iter().map(|d| (d.Width as u32, d.Height)).collect();
+        let (width, height) = compose_size(compose_size_setting(), &sizes)?;
         let format = swap_format(descs[0].Format);
         let Some(format) = format.filter(|f| composes(*f)) else {
             return self.present(first, first_state, frame);
