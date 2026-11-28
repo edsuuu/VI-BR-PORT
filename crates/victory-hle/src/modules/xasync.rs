@@ -421,7 +421,7 @@ pub fn XTaskQueueSubmitDelayedCallback(
 /// done. Here the canceled callbacks and the terminated callback run on the
 /// calling thread before it returns, whatever `wait` says; callbacks
 /// already handed to the thread pool are neither canceled nor waited for.
-/// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueueterminate
+/// <https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueueterminate>
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
     wait: bool,
@@ -776,8 +776,8 @@ pub fn XAsyncCancel(block: *mut AsyncBlock) {
 /// right after the provider was asked, and the provider is cleaned up at
 /// once, even while work of its own is still under way (its later
 /// completion is dropped, or ends a call begun since on the same block).
-/// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasynccancel
-/// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/enums/xasyncop
+/// <https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasynccancel>
+/// <https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/enums/xasyncop>
 fn cancel_by_provider() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
