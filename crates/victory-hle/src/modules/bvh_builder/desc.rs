@@ -3,15 +3,18 @@
 //! Everything Direct3D 12 defines on every platform is laid out as the
 //! public headers say (`d3d12.h`: the build inputs and description, the
 //! geometry descriptions, the instance description, the prebuild sizes and
-//! the postbuild requests). Two are the console's own and not public:
+//! the postbuild requests). The console's own, which are not public, are
+//! read as the builder itself reads them (its decompiled code; addresses
+//! are those of the retail `XboxBvhBuilder.dll`, image base 0x180000000):
 //!
 //! - `D3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2`, read
-//!   here as [`Batched`]: a build description followed by a count and an
-//!   address of postbuild requests, 80 bytes in all. **Inferred**, not
-//!   confirmed: the trace dumps the bytes of the first calls in hex so that
-//!   a run can say whether the fields hold what they are taken for;
+//!   here as [`Batched`]: a build description, a count and an address of
+//!   postbuild requests, and the size and address of a list of extension
+//!   records ([`Stream`], [`Record`]), 80 bytes in all;
 //! - `D3D12XBOX_XDXR_STREAM_DESC`, which the prebuild call takes beside the
-//!   inputs: not decoded at all, only dumped.
+//!   inputs: its first 16 bytes are the same size and address of extension
+//!   records (the prebuild copies them to +0x40 of an entry it makes up,
+//!   `GetRaytracingAccelerationStructurePrebuildInfo` at 0x180021880).
 //!
 //! The readers take memory through [`Memory`], so the tests can hand them
 //! bytes of their own and a run hands them the title's (`super::Process`).
@@ -192,17 +195,19 @@ impl BuildDesc {
     }
 }
 
-/// One entry of a batched build (inferred, see the module): the build, then
-/// the postbuild requests the title wants answered for it.
+/// One entry of a batched build, as the builder reads it: entries are 80
+/// bytes apart (0x18000c750); the postbuild requests at +0x30/+0x38 are
+/// walked in `BuildRaytracingAccelerationStructureBatched2X` (0x1800216a0),
+/// the extension records at +0x40/+0x48 at 0x18000c780, 0x18000c820 and
+/// 0x18000cc00.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Batched {
     pub build: BuildDesc,
     pub postbuild_count: u32,
-    /// The dword after the count (taken for padding).
+    /// The dword after the count: padding (nothing in the builder reads it).
     pub word: u32,
     pub postbuild: u64,
-    /// The last 16 bytes (meaning unknown).
-    pub rest: [u64; 2],
+    pub extensions: Stream,
 }
 
 pub const BATCHED: usize = 80;
@@ -214,9 +219,315 @@ impl Batched {
             postbuild_count: u32_at(b, 48),
             word: u32_at(b, 52),
             postbuild: u64_at(b, 56),
-            rest: [u64_at(b, 64), u64_at(b, 72)],
+            extensions: Stream::parse(&b[64..80]),
         }
     }
+}
+
+/// Where a list of extension records is: its size in bytes, then its
+/// address (+0x40 and +0x48 of a batched entry; the first 16 bytes of the
+/// prebuild's stream description).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stream {
+    pub bytes: u64,
+    pub at: u64,
+}
+
+pub const STREAM: usize = 16;
+
+impl Stream {
+    pub fn parse(b: &[u8]) -> Stream {
+        Stream {
+            bytes: u64_at(b, 0),
+            at: u64_at(b, 8),
+        }
+    }
+
+    /// No list: the builder reads records only when both are set.
+    pub fn empty(&self) -> bool {
+        self.bytes == 0 || self.at == 0
+    }
+}
+
+/// One extension record: 16 bytes, the kind in the first dword. Every walk
+/// of the list in the builder skips the kinds it does not want among 0, 1
+/// and 2, takes the first record of the kind it wants, and stops at a
+/// record of any other kind. What each field does there (the builder's own
+/// switches, globals that nothing in its code writes, at zero):
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Record {
+    /// Kind 0, the build's quality. `quality` (+8, a float): below 0 the
+    /// build flags choose it (0.0 with PREFER_FAST_TRACE and not
+    /// MINIMIZE_MEMORY, 1.01 the other way round, 1.005 otherwise); above
+    /// 10.0 on a bottom level with MINIMIZE_MEMORY it turns on a build mode
+    /// bit (bit 9 of the build's flags word; the prebuild sizes with it).
+    /// Prebuild 0x180011b80, batched 0x18000cc00, which also keeps `factor`
+    /// (+4, a float, -1.0 without the record) and `bytes` (+0xc..+0xf) in the
+    /// build's record for the stages.
+    Quality {
+        factor: f32,
+        quality: f32,
+        bytes: [u8; 4],
+    },
+    /// Kind 1, sizes. `instances` (+8): a top level without ALLOW_UPDATE
+    /// and with 2 or more instances is built for this many instead of
+    /// `NumDescs`, if it is not 0 (0x18000c780). `bytes[1]` (+0xd): the
+    /// level n of a bottom level, at most 15, which adds n²·0x90 bytes to
+    /// the result (the same as a shipped header's `(h >> 20 & 0xf)²·0x90`;
+    /// prebuild 0x180011b80, batched 0x18000cc00, which keeps n in bits
+    /// 10..13 of the build's flags word); 0 leaves the builder's default.
+    /// `bytes[2]` (+0xe): not 0 on a top level clears bit 0x40 of that word
+    /// (0x18000cc00). `bytes[0]` and `bytes[3]` are not read.
+    Sizes { instances: u32, bytes: [u8; 4] },
+    /// Kind 2, the top level's extra instance slots. `extra` (+4): if not
+    /// 0xffffffff, the slots added to a top level without ALLOW_UPDATE and
+    /// with 2 or more instances; without it 35 % of the instances with
+    /// PREFER_FAST_TRACE and not MINIMIZE_MEMORY, else none (0x18000c820;
+    /// rebraid in GPURT's words [inf]). `words` (+8, +0xc): two values the
+    /// batched build keeps in the build's record (0x18000cc00; 0.2 and 0.75
+    /// without them). The prebuild skips this kind.
+    Slots { extra: u32, words: [u32; 2] },
+    /// Any other kind: the builder stops reading the list here.
+    Other { kind: u32, words: [u32; 3] },
+}
+
+pub const RECORD: usize = 16;
+/// Records read at most from one list.
+pub const RECORDS_READ: usize = 64;
+
+impl Record {
+    pub fn parse(b: &[u8]) -> Record {
+        let word = |at| u32_at(b, at);
+        let bytes = [b[12], b[13], b[14], b[15]];
+        match word(0) {
+            0 => Record::Quality {
+                factor: f32_at(b, 4),
+                quality: f32_at(b, 8),
+                bytes,
+            },
+            1 => Record::Sizes {
+                instances: word(8),
+                bytes,
+            },
+            2 => Record::Slots {
+                extra: word(4),
+                words: [word(8), word(12)],
+            },
+            kind => Record::Other {
+                kind,
+                words: [word(4), word(8), word(12)],
+            },
+        }
+    }
+
+    pub fn kind(&self) -> u32 {
+        match *self {
+            Record::Quality { .. } => 0,
+            Record::Sizes { .. } => 1,
+            Record::Slots { .. } => 2,
+            Record::Other { kind, .. } => kind,
+        }
+    }
+
+    pub fn describe(&self) -> String {
+        match *self {
+            Record::Quality {
+                factor,
+                quality,
+                bytes,
+            } => format!(
+                "kind 0 quality {quality} (+4 {factor}, +c {:02x} {:02x} {:02x} {:02x})",
+                bytes[0], bytes[1], bytes[2], bytes[3]
+            ),
+            Record::Sizes { instances, bytes } => format!(
+                "kind 1 instances {instances} level {} (+c {:02x} +e {:02x} +f {:02x})",
+                bytes[1], bytes[0], bytes[2], bytes[3]
+            ),
+            // Whether the builder takes +8 and +0xc as integers it converts
+            // or as floats is not clear from its decompiled code: both.
+            Record::Slots { extra, words } => format!(
+                "kind 2 extra slots {} (+8 {:#x}: {} or {}, +c {:#x}: {} or {})",
+                if extra == u32::MAX {
+                    "none".to_string()
+                } else {
+                    extra.to_string()
+                },
+                words[0],
+                words[0] as i32,
+                f32::from_bits(words[0]),
+                words[1],
+                words[1] as i32,
+                f32::from_bits(words[1])
+            ),
+            Record::Other { kind, words } => format!(
+                "KIND {kind} (+4 {:#x} +8 {:#x} +c {:#x}): the builder stops reading here",
+                words[0], words[1], words[2]
+            ),
+        }
+    }
+}
+
+/// The records of a list as the builder walks them: up to the first of a
+/// kind it does not know (kept, last), at most [`RECORDS_READ`]. A size
+/// that is not a multiple of 16 still has its last part record read (the
+/// walks go while a record starts before the end). `None`: not readable.
+pub fn records(memory: &dyn Memory, stream: &Stream) -> Option<Vec<Record>> {
+    if stream.empty() {
+        return Some(Vec::new());
+    }
+    let n = (stream.bytes.div_ceil(RECORD as u64) as usize).min(RECORDS_READ);
+    let b = memory.bytes(stream.at, n * RECORD)?;
+    let mut out = Vec::with_capacity(n);
+    for one in b.chunks_exact(RECORD) {
+        let r = Record::parse(one);
+        out.push(r);
+        if r.kind() > 2 {
+            break;
+        }
+    }
+    Some(out)
+}
+
+/// The first record of `kind` in a walk that passes over the other two
+/// kinds the builder knows and stops at any other.
+fn first(records: &[Record], kind: u32) -> Option<&Record> {
+    records
+        .iter()
+        .take_while(|r| r.kind() <= 2)
+        .find(|r| r.kind() == kind)
+}
+
+/// What the builder makes of a build's inputs and its extension records:
+/// the sizes and modes it builds with (its own switches at zero).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Taken {
+    /// Top level: the instances it builds for, `NumDescs` or kind 1's.
+    pub instances: Option<u32>,
+    /// Top level: the extra instance slots.
+    pub extra: Option<u32>,
+    /// Bottom level: the level n (`None`: the builder's default, which
+    /// nothing in its code sets).
+    pub level: Option<u32>,
+    pub quality: f32,
+    /// Bottom level: the build mode bit kind 0 turns on.
+    pub mode: bool,
+}
+
+/// The quality a build without a kind-0 record (or with one below 0) gets
+/// from its flags (0x180011b80, 0x18000cc00).
+fn default_quality(flags: u32) -> f32 {
+    match (flags & PREFER_FAST_TRACE != 0, flags & MINIMIZE_MEMORY != 0) {
+        (true, false) => 0.0,
+        (false, true) => 1.01,
+        _ => 1.005,
+    }
+}
+
+pub fn taken(inputs: &Inputs, records: &[Record]) -> Taken {
+    let fixed = inputs.flags & ALLOW_UPDATE == 0 && inputs.count >= 2;
+    let (mut instances, mut extra, mut level) = (None, None, None);
+    if inputs.top() {
+        // 0x18000c780: the walk ends at the first kind-1 record.
+        instances = Some(match first(records, 1) {
+            Some(&Record::Sizes { instances: n, .. }) if n != 0 && fixed => n,
+            _ => inputs.count,
+        });
+        // 0x18000c820.
+        extra = Some(if !fixed {
+            0
+        } else {
+            match first(records, 2) {
+                Some(&Record::Slots { extra: n, .. }) if n != u32::MAX => n,
+                _ if inputs.flags & (PREFER_FAST_TRACE | MINIMIZE_MEMORY) == PREFER_FAST_TRACE => {
+                    (inputs.count as f32 * 0.35) as u32
+                }
+                _ => 0,
+            }
+        });
+    } else if let Some(&Record::Sizes { bytes, .. }) = first(records, 1)
+        && bytes[1] != 0
+    {
+        level = Some(u32::from(bytes[1]).min(15));
+    }
+    // Only a value below 0 falls back (a NaN is kept, as the builder's
+    // comparison has it).
+    let quality = match first(records, 0) {
+        Some(&Record::Quality { quality, .. })
+            if quality.partial_cmp(&0.0) != Some(std::cmp::Ordering::Less) =>
+        {
+            quality
+        }
+        _ => default_quality(inputs.flags),
+    };
+    Taken {
+        instances,
+        extra,
+        level,
+        quality,
+        mode: !inputs.top() && inputs.flags & MINIMIZE_MEMORY != 0 && quality > 10.0,
+    }
+}
+
+impl Taken {
+    pub fn describe(&self) -> String {
+        let mut text = format!("quality {}", self.quality);
+        if let Some(n) = self.instances {
+            let _ = write!(text, ", {n} instances");
+        }
+        if let Some(n) = self.extra {
+            let _ = write!(text, " + {n} extra slots");
+        }
+        match self.level {
+            Some(n) => {
+                let _ = write!(text, ", level {n} (+{} bytes)", n * n * 0x90);
+            }
+            None if self.instances.is_none() => text.push_str(", the default level"),
+            None => {}
+        }
+        if self.mode {
+            text.push_str(", MODE BIT ON");
+        }
+        text
+    }
+}
+
+/// The extension records of a list in one line of the trace: each record,
+/// what the builder takes from them for these inputs, and what does not fit
+/// the layout (a size not a multiple of 16, a kind it does not know, a list
+/// it cannot read).
+pub fn extensions(memory: &dyn Memory, stream: &Stream, inputs: &Inputs) -> String {
+    describe_extensions(stream, records(memory, stream).as_deref(), inputs)
+}
+
+/// [`extensions`] with the records already read ([`records`]).
+pub fn describe_extensions(stream: &Stream, records: Option<&[Record]>, inputs: &Inputs) -> String {
+    if stream.empty() {
+        return if stream.bytes == 0 && stream.at == 0 {
+            "no extension records".to_string()
+        } else {
+            format!(
+                "NO LIST: extension bytes {} at {:#x}",
+                stream.bytes, stream.at
+            )
+        };
+    }
+    let mut text = format!(
+        "{} bytes of extension records at {:#x}",
+        stream.bytes, stream.at
+    );
+    if stream.bytes % RECORD as u64 != 0 {
+        text.push_str(" (SIZE NOT A MULTIPLE OF 16)");
+    }
+    match records {
+        Some(r) => {
+            for one in r {
+                let _ = write!(text, "; {}", one.describe());
+            }
+            let _ = write!(text, "; the builder takes {}", taken(inputs, r).describe());
+        }
+        None => text.push_str(": NOT READABLE"),
+    }
+    text
 }
 
 /// `D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC` (16 bytes):
@@ -710,8 +1021,9 @@ mod tests {
         put32(&mut b, 1);
         put32(&mut b, 0);
         put64(&mut b, 0x7ff0_0000);
-        put64(&mut b, 0);
-        put64(&mut b, 0x55);
+        // +0x40 the records' size in bytes, +0x48 their address.
+        put64(&mut b, 32);
+        put64(&mut b, 0x55_0000);
         assert_eq!(b.len(), BATCHED);
         let e = Batched::parse(&b);
         assert!(e.build.inputs.top() && e.build.inputs.update());
@@ -720,7 +1032,15 @@ mod tests {
             (e.postbuild_count, e.word, e.postbuild),
             (1, 0, 0x7ff0_0000)
         );
-        assert_eq!(e.rest, [0, 0x55]);
+        assert_eq!(
+            e.extensions,
+            Stream {
+                bytes: 32,
+                at: 0x55_0000
+            }
+        );
+        assert!(!e.extensions.empty());
+        assert!(Stream { bytes: 16, at: 0 }.empty());
 
         let mut p = Vec::new();
         put64(&mut p, 0x4000);
@@ -728,6 +1048,172 @@ mod tests {
         put32(&mut p, 0);
         let p = Postbuild::parse(&p);
         assert_eq!((p.dest, p.what()), (0x4000, "compacted size"));
+    }
+
+    /// A 16-byte extension record: the kind, then three dwords.
+    fn record(kind: u32, a: u32, b: u32, c: u32) -> Vec<u8> {
+        let mut r = Vec::new();
+        for w in [kind, a, b, c] {
+            put32(&mut r, w);
+        }
+        r
+    }
+
+    #[test]
+    fn extension_records_read_as_the_builder_reads_them() {
+        // Kind 0: a float at +4 and at +8, four bytes at +0xc.
+        let q = Record::parse(&record(
+            0,
+            (-1.0f32).to_bits(),
+            12.5f32.to_bits(),
+            0x0403_0201,
+        ));
+        assert_eq!(
+            q,
+            Record::Quality {
+                factor: -1.0,
+                quality: 12.5,
+                bytes: [1, 2, 3, 4]
+            }
+        );
+        // Kind 1: the instances at +8, the level in the byte at +0xd.
+        let s = Record::parse(&record(1, 0xdead, 700, 0x0000_0900));
+        assert_eq!(
+            s,
+            Record::Sizes {
+                instances: 700,
+                bytes: [0, 9, 0, 0]
+            }
+        );
+        assert!(
+            s.describe().contains("instances 700 level 9"),
+            "{}",
+            s.describe()
+        );
+        // Kind 2: the extra slots at +4 (0xffffffff: none).
+        let x = Record::parse(&record(2, u32::MAX, 0x3e4c_cccd, 0x3f40_0000));
+        assert_eq!(
+            x,
+            Record::Slots {
+                extra: u32::MAX,
+                words: [0x3e4c_cccd, 0x3f40_0000]
+            }
+        );
+        assert!(
+            x.describe().contains("extra slots none"),
+            "{}",
+            x.describe()
+        );
+        assert_eq!(Record::parse(&record(7, 1, 2, 3)).kind(), 7);
+
+        // The walk stops after the first record of a kind it does not know;
+        // a size that is not a multiple of 16 has its last part record read.
+        let mut list = record(2, 5, 0, 0);
+        list.extend(record(9, 0, 0, 0));
+        list.extend(record(1, 0, 40, 0));
+        let mut memory = Fake::default();
+        memory.0.insert(0x8000, list);
+        let r = records(
+            &memory,
+            &Stream {
+                bytes: 40,
+                at: 0x8000,
+            },
+        )
+        .unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[1].kind(), 9);
+        assert_eq!(
+            records(
+                &memory,
+                &Stream {
+                    bytes: 0,
+                    at: 0x8000
+                }
+            ),
+            Some(vec![])
+        );
+        assert_eq!(
+            records(
+                &memory,
+                &Stream {
+                    bytes: 64,
+                    at: 0x8000
+                }
+            ),
+            None
+        );
+        let text = extensions(
+            &memory,
+            &Stream {
+                bytes: 40,
+                at: 0x8000,
+            },
+            &Inputs::parse(&inputs(TOP_LEVEL, 0, 10, ARRAY, 0)),
+        );
+        assert!(text.contains("SIZE NOT A MULTIPLE OF 16"), "{text}");
+        assert!(text.contains("KIND 9"), "{text}");
+        // Kind 1 lies after the unknown kind: the builder never sees it.
+        assert!(text.contains("10 instances + 5 extra slots"), "{text}");
+        assert_eq!(
+            extensions(&memory, &Stream::default(), &Inputs::default()),
+            "no extension records"
+        );
+    }
+
+    #[test]
+    fn what_the_builder_takes_from_the_records() {
+        let top = |flags, count| Inputs::parse(&inputs(TOP_LEVEL, flags, count, ARRAY, 0));
+        let bottom = |flags| Inputs::parse(&inputs(BOTTOM_LEVEL, flags, 4, ARRAY, 0));
+        let sizes = Record::parse(&record(1, 0, 300, 0x0001_1400));
+        // Kind 1's instances replace NumDescs on a top level that cannot be
+        // updated and has two or more (0x18000c780) ...
+        let t = taken(&top(PREFER_FAST_TRACE, 100), &[sizes]);
+        assert_eq!(t.instances, Some(300));
+        // ... with 35 % more slots for fast trace (0x18000c820) ...
+        assert_eq!(t.extra, Some(35));
+        assert_eq!(t.level, None);
+        assert_eq!(t.quality, 0.0);
+        // ... but not with ALLOW_UPDATE, nor with fewer than two.
+        let u = taken(&top(ALLOW_UPDATE | PREFER_FAST_TRACE, 100), &[sizes]);
+        assert_eq!((u.instances, u.extra), (Some(100), Some(0)));
+        assert_eq!(taken(&top(0, 1), &[sizes]).instances, Some(1));
+        // Kind 2's slots win over the 35 %, unless 0xffffffff.
+        let slots = Record::parse(&record(2, 7, 0, 0));
+        assert_eq!(taken(&top(PREFER_FAST_TRACE, 100), &[slots]).extra, Some(7));
+        let none = Record::parse(&record(2, u32::MAX, 0, 0));
+        assert_eq!(taken(&top(PREFER_FAST_TRACE, 100), &[none]).extra, Some(35));
+        assert_eq!(taken(&top(0, 100), &[none]).extra, Some(0));
+
+        // A bottom level takes the level at +0xd, at most 15 (0x180011b80).
+        assert_eq!(taken(&bottom(0), &[sizes]).level, Some(15));
+        let three = Record::parse(&record(1, 0, 0, 0x0300));
+        assert_eq!(taken(&bottom(0), &[three]).level, Some(3));
+        assert!(
+            taken(&bottom(0), &[three])
+                .describe()
+                .contains("level 3 (+1296 bytes)")
+        );
+        assert_eq!(taken(&bottom(0), &[]).level, None);
+        assert_eq!(taken(&bottom(0), &[]).instances, None);
+
+        // Kind 0's quality, its defaults by flags, and the mode bit.
+        assert_eq!(taken(&bottom(0), &[]).quality, 1.005);
+        assert_eq!(taken(&bottom(MINIMIZE_MEMORY), &[]).quality, 1.01);
+        assert_eq!(
+            taken(&bottom(MINIMIZE_MEMORY | PREFER_FAST_TRACE), &[]).quality,
+            1.005
+        );
+        let low = Record::parse(&record(0, 0, (-2.0f32).to_bits(), 0));
+        assert_eq!(taken(&bottom(PREFER_FAST_TRACE), &[low]).quality, 0.0);
+        let high = Record::parse(&record(0, 0, 11.0f32.to_bits(), 0));
+        assert!(taken(&bottom(MINIMIZE_MEMORY), &[high]).mode);
+        assert!(!taken(&bottom(0), &[high]).mode);
+        assert!(!taken(&top(MINIMIZE_MEMORY, 4), &[high]).mode);
+        let ten = Record::parse(&record(0, 0, 10.0f32.to_bits(), 0));
+        assert!(!taken(&bottom(MINIMIZE_MEMORY), &[ten]).mode);
+        // The first record of a kind is the one taken.
+        assert_eq!(taken(&bottom(0), &[ten, high]).quality, 10.0);
     }
 
     #[test]

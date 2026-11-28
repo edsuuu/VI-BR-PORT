@@ -15,8 +15,11 @@
 //! the five-second report (`victory_gpu::rtcalls`). Nothing the title or
 //! its builder sees changes.
 //!
-//! The descriptions are decoded in [`desc`]; the console's own batched
-//! layout is inferred and its first calls are dumped in hex to confirm it.
+//! The descriptions are decoded in [`desc`], the console's own layouts as
+//! the builder's decompiled code reads them; the first calls are dumped in
+//! hex all the same. Beside the call lines, a line at most every five
+//! seconds says what was seen since the start ([`Seen`]): the extension
+//! records of the builds.
 // The exported names are the title's.
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
@@ -29,7 +32,7 @@ use std::ffi::c_void;
 use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use victory_gpu::rtcalls::{self, Count, Trace};
 use victory_loader::{ImportResolver, Provenance, Resolution};
@@ -37,7 +40,7 @@ use victory_pe::ImportSymbol;
 
 use desc::{
     BATCHED, BUILD_DESC, Batched, BuildDesc, INPUTS, INSTANCE, Inputs, Instance, Memory, POSTBUILD,
-    Postbuild, PrebuildInfo,
+    Postbuild, PrebuildInfo, Record, STREAM, Stream,
 };
 
 /// The DLL the title imports the builder from.
@@ -257,6 +260,116 @@ fn dump(what: &str, at: u64, len: usize) -> String {
     }
 }
 
+/// What the trace saw since the start, said at most every [`SAY_EVERY`]
+/// (on the first call of the builder after that): it counts every call,
+/// past the budget of call lines too.
+#[derive(Default)]
+struct Seen {
+    /// Batched entries, and those with a list of extension records.
+    entries: u64,
+    listed: u64,
+    /// Prebuild asks with a list of extension records.
+    prebuilds_listed: u64,
+    /// Records by kind (0, 1, 2, any other), in builds and prebuilds.
+    kinds: [u64; 4],
+    /// Lists whose size is not a multiple of 16, or not readable.
+    odd: u64,
+    unread: u64,
+    /// Builds for which the builder takes kind 1's instance count (top
+    /// levels), a level (bottom levels), the mode bit of kind 0.
+    instances: u64,
+    levels: u64,
+    modes: u64,
+}
+
+/// The summary's period.
+const SAY_EVERY: Duration = Duration::from_secs(5);
+
+static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
+static SAID: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn seen(f: impl FnOnce(&mut Seen)) {
+    let mut s = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    f(s.get_or_insert_with(Seen::default));
+}
+
+impl Seen {
+    fn records(&mut self, stream: &Stream, records: Option<&[Record]>) {
+        if stream.empty() {
+            return;
+        }
+        if stream.bytes % desc::RECORD as u64 != 0 {
+            self.odd += 1;
+        }
+        match records {
+            Some(r) => {
+                for one in r {
+                    self.kinds[(one.kind() as usize).min(3)] += 1;
+                }
+            }
+            None => self.unread += 1,
+        }
+    }
+
+    fn entry(&mut self, e: &Batched, records: Option<&[Record]>) {
+        self.entries += 1;
+        if e.extensions.empty() {
+            return;
+        }
+        self.listed += 1;
+        self.records(&e.extensions, records);
+        let Some(r) = records else { return };
+        let i = &e.build.inputs;
+        let t = desc::taken(i, r);
+        self.instances += u64::from(t.instances.is_some_and(|n| n != i.count));
+        self.levels += u64::from(t.level.is_some());
+        self.modes += u64::from(t.mode);
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "dxr trace: since the start (VICTORY_DXR_TRACE): {} batched entries, {} with extension records, and {} prebuild \
+             asks with them; records of kind 0 {}, kind 1 {}, kind 2 {}, other kinds {}; lists not a multiple of 16 {}, not \
+             readable {}; the builder takes kind 1's instance count on {} top levels, a level on {} bottom levels, the mode \
+             bit on {}",
+            self.entries,
+            self.listed,
+            self.prebuilds_listed,
+            self.kinds[0],
+            self.kinds[1],
+            self.kinds[2],
+            self.kinds[3],
+            self.odd,
+            self.unread,
+            self.instances,
+            self.levels,
+            self.modes,
+        )
+    }
+}
+
+/// Says [`Seen`] if the last time was [`SAY_EVERY`] ago (or never).
+fn say_seen() {
+    let now = Instant::now();
+    {
+        let Ok(mut said) = SAID.try_lock() else {
+            return;
+        };
+        if said.is_some_and(|t| now.duration_since(t) < SAY_EVERY) {
+            return;
+        }
+        *said = Some(now);
+    }
+    let text = {
+        let s = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        match s.as_ref() {
+            Some(s) => s.describe(),
+            None => return,
+        }
+    };
+    tracing::info!("{text}");
+}
+
 /// Counts one build and, when it is to be logged, says it: the level and
 /// flags, its geometries or instances, where it goes, and its scratch.
 fn note_build(call: u64, entry: u32, of: u32, d: &BuildDesc, tail: &str) {
@@ -432,7 +545,7 @@ unsafe extern "system" fn build_batched(
         tracing::info!(
             "dxr trace: batched build call {call}, {count} entries, list {list:p}; {}",
             dump(
-                "the entries (80 bytes each, inferred)",
+                "the entries (80 bytes each)",
                 descs as u64,
                 n.min(4) as usize * BATCHED
             )
@@ -455,11 +568,19 @@ unsafe extern "system" fn build_batched(
                     }
                 }
             }
-            if e.word != 0 || e.rest != [0, 0] {
+            // What fits the layout the builder reads: the padding after the
+            // count at 0, the extension list empty or of 16-byte records of
+            // kinds 0, 1 and 2 (the line says otherwise in capitals).
+            if e.word != 0 {
+                let _ = write!(tail, "; PADDING WORD {:#x} NOT 0", e.word);
+            }
+            let records = desc::records(&Process, &e.extensions);
+            seen(|s| s.entry(&e, records.as_deref()));
+            if e.extensions != Stream::default() {
                 let _ = write!(
                     tail,
-                    "; unknown fields {:#x} {:#x} {:#x}",
-                    e.word, e.rest[0], e.rest[1]
+                    "; {}",
+                    desc::describe_extensions(&e.extensions, records.as_deref(), &e.build.inputs)
                 );
             }
             note_build(call, k as u32, count, &e.build, &tail);
@@ -473,6 +594,7 @@ unsafe extern "system" fn build_batched(
     // SAFETY: as above.
     unsafe { std::mem::transmute::<*const (), Build>(original(BUILD))(this, list, count, descs) };
     took(since);
+    say_seen();
 }
 
 unsafe extern "system" fn copy_structure(
@@ -509,6 +631,7 @@ unsafe extern "system" fn copy_structure(
         std::mem::transmute::<*const (), Copy>(original(COPY))(this, list, dest, source, mode)
     };
     took(since);
+    say_seen();
 }
 
 unsafe extern "system" fn prebuild_info(
@@ -534,6 +657,22 @@ unsafe extern "system" fn prebuild_info(
     if let Some(a) = answer {
         prebuilt(key(&i), Some(a));
     }
+    // The stream description's first 16 bytes: the same list of extension
+    // records a batched entry has at +0x40 (0x180021880 copies them there).
+    let list = (!stream.is_null())
+        .then(|| Process.bytes(stream as u64, STREAM))
+        .flatten()
+        .map(|b| Stream::parse(&b));
+    let records = list.as_ref().map(|s| (s, desc::records(&Process, s)));
+    if let Some((s, r)) = &records
+        && !s.empty()
+    {
+        seen(|seen| {
+            seen.prebuilds_listed += 1;
+            seen.records(s, r.as_deref());
+        });
+    }
+    say_seen();
     let logged = LOGGED.fetch_add(1, Relaxed);
     if rtcalls::trace() != Trace::All && logged >= BUDGET {
         return;
@@ -561,16 +700,23 @@ unsafe extern "system" fn prebuild_info(
             );
         }
     }
-    if call < DUMPED {
-        if stream.is_null() {
-            text.push_str("; no stream description");
-        } else {
+    match &records {
+        None if stream.is_null() => text.push_str("; no stream description"),
+        None => text.push_str("; the stream description is not readable"),
+        Some((s, r)) => {
             let _ = write!(
                 text,
-                "; {}",
-                dump("the stream description", stream as u64, 64)
+                "; stream description: {}",
+                desc::describe_extensions(s, r.as_deref(), &i)
             );
         }
+    }
+    if call < DUMPED && !stream.is_null() {
+        let _ = write!(
+            text,
+            "; {}",
+            dump("the stream description", stream as u64, STREAM)
+        );
     }
     tracing::info!("{text}");
 }
@@ -646,6 +792,7 @@ unsafe extern "system" fn rehydrate_batched(
         let _ = write!(text, "\n  -> {code:#x}");
         tracing::info!("{text}");
     }
+    say_seen();
     code
 }
 
@@ -697,6 +844,30 @@ mod tests {
         );
         assert_eq!(Process.bytes(0, 16), None);
         assert_eq!(Process.bytes(8, 16), None);
+    }
+
+    #[test]
+    fn the_summary_counts_extension_records() {
+        let mut s = Seen::default();
+        // A top level whose kind-1 record changes its instance count.
+        let e = Batched {
+            build: BuildDesc {
+                inputs: Inputs {
+                    kind: desc::TOP_LEVEL,
+                    count: 10,
+                    ..Inputs::default()
+                },
+                ..BuildDesc::default()
+            },
+            extensions: Stream { bytes: 16, at: 1 },
+            ..Batched::default()
+        };
+        let mut r = vec![1u8, 0, 0, 0, 0, 0, 0, 0];
+        r.extend_from_slice(&12u32.to_le_bytes());
+        r.extend_from_slice(&[0; 4]);
+        s.entry(&e, Some(&[Record::parse(&r)]));
+        s.entry(&Batched::default(), None);
+        assert_eq!((s.entries, s.listed, s.instances, s.kinds[1]), (2, 1, 1, 1));
     }
 
     #[test]
