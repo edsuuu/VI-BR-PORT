@@ -23,6 +23,12 @@
 //!   their memory now against what was last detiled, 64 KiB at a time.
 //! - P4: landings (shader writes going into title memory) on a page that a
 //!   batch remapped after the submission they came from had begun.
+//!
+//! `VICTORY_CLAMP_RESIDENT=1` (off by default) is the remedy P2 points to,
+//! the idea of upstream pull request 3647 (`VICTORY_PARTIAL_MIP_CLAMP`)
+//! with the title's table for "there" in place of "mapped": shader views of
+//! such a texture start at its first fully resident level, and are made
+//! again when that changes. It turns the P2 bookkeeping on by itself.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -38,9 +44,15 @@ pub fn on() -> bool {
     *ON.get_or_init(|| crate::switch::on("VICTORY_TEX_TRUTH"))
 }
 
+/// Whether views are kept to resident levels (`VICTORY_CLAMP_RESIDENT=1`).
+pub(crate) fn clamp() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CLAMP_RESIDENT"))
+}
+
 /// Whether pages are followed at all.
 pub(crate) fn wanted() -> bool {
-    on()
+    on() || clamp()
 }
 
 /// What the runtime's own pool view showed at a pool page, against the
@@ -190,8 +202,7 @@ struct Counts {
     textures: [AtomicU64; 2],
     page: [AtomicU64; 5],
     /// Views made of a looked-at texture, reaching a level let go, of those
-    /// kept off it by the title's clamp, that a clamp to resident levels
-    /// would move.
+    /// kept off it by the title's clamp, moved by the clamp.
     views: [AtomicU64; 4],
     /// P3: same and let go, changed, same and resident.
     audit: [AtomicU64; 3],
@@ -407,8 +418,8 @@ fn textures<R>(f: impl FnOnce(&mut HashMap<u64, Texture>) -> R) -> R {
 const EVERY: u64 = 8;
 
 /// A texture at `[at, at + len)` is refreshed: its pages are looked at
-/// (every [`EVERY`] frames at most), and its first resident level kept for
-/// the views made of it.
+/// (every [`EVERY`] frames at most). If its first resident level moved and
+/// views are clamped, its views are made again.
 pub(crate) fn refreshed(at: u64, len: u64, layout: &victory_formats::texture::Layout) {
     let frame = crate::frame::current();
     let due = textures(|t| {
@@ -458,18 +469,16 @@ pub(crate) fn refreshed(at: u64, len: u64, layout: &victory_formats::texture::La
             );
         }
     }
-    textures(|t| {
-        if let Some(tex) = t.get_mut(&at) {
-            tex.first = first;
-        }
-    });
+    let moved = textures(|t| t.get_mut(&at).is_some_and(|tex| std::mem::replace(&mut tex.first, first) != first));
+    if moved && clamp() {
+        crate::descriptor::host::levels_changed(at);
+    }
 }
 
 /// A shader view of title texture `resource` is made, starting at level
 /// `most` with the title's clamp `min_lod`: counted against its first
-/// resident level. Returns the level a view kept to resident levels would
-/// start at, if the view starts finer and the title's clamp does not keep
-/// it off them.
+/// resident level. Returns the level the view is to start at (clamp on,
+/// and the view started finer and the title's clamp did not keep it off).
 pub(crate) fn view_made(resource: crate::object::This, most: u32, min_lod: f32) -> Option<u32> {
     let (at, _) = crate::texture::staged_memory(resource)?;
     let first = textures(|t| t.get(&at).map(|tex| tex.first))?;
@@ -494,7 +503,7 @@ pub(crate) fn view_made(resource: crate::object::This, most: u32, min_lod: f32) 
         );
     }
     c.views[3].fetch_add(1, Relaxed);
-    Some(first)
+    clamp().then_some(first)
 }
 
 /// A fast digest of 64 KiB of memory (P3 compares them, nothing more).
@@ -665,7 +674,7 @@ pub(crate) fn status() {
         "texture truth: table read {} (scatter vs table: at the address {} same {} not, behind its pointer {} same {} not); \
          pool pages: agree {}, another page {}, the title says free {}, hole {}, a number not ours {}; GPU address after the mapping not the pool's page {}; \
          textures looked at {}, with levels the title let go {} (pages resident {}, free {}, reused {}, hole {}, untracked {}); \
-         views made {}, reaching levels the title let go {}, the title's own clamp covered {}, a clamp to resident levels would move {}; \
+         views made {}, reaching levels the title let go {}, the title's own clamp covered {}, the resident clamp would move {} (clamp on: {}); \
          landings on pages remapped after their submission began: likely {} ({} pages), certain {}; audit now: as detiled and let go {a}, changed {b}, as detiled and resident {cc} (since the start {}, {}, {})",
         if reading() == 1 { "behind its pointer" } else { "at the address" },
         l(&c.checked[0][0]),
@@ -689,6 +698,7 @@ pub(crate) fn status() {
         l(&c.views[1]),
         l(&c.views[2]),
         l(&c.views[3]),
+        clamp(),
         l(&c.late[0]),
         l(&c.late[1]),
         l(&c.late[2]),
