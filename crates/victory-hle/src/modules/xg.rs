@@ -6,14 +6,21 @@
 //! The title imports `XGCreateTextureComputer` and
 //! `XGSuggestSwizzleMode` and calls these computer methods: Release (0x08),
 //! the layout (0x10), copies into (0x40) and out of (0x48) a subresource,
-//! and the 64 KiB tiling (0x50). The other slots log and fail.
+//! and the 64 KiB tiling (0x50). Size (0x18), alignment (0x20), mip offset
+//! (0x28), texel offset (0x30) and "is tiled" (0x60) answer from the layout;
+//! the others (texel coordinate, view descriptor, swizzle pattern) log and
+//! fail. A layout field of 2 or 3 makes a reserved texture in the 64 KiB
+//! `_T` mode, whose sizes and offsets are served but whose copies are not
+//! (the XOR modes have no addressing here).
 #![allow(non_snake_case)]
 // Title code passes pointers the real library would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use victory_formats::texture::{Dimension, Error, Layout, Swizzle, Texture, TextureDesc};
+use victory_formats::texture::{
+    Dimension, Error, Layout, LayoutField, LayoutKind, Swizzle, Texture, TextureDesc,
+};
 
 use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
@@ -22,7 +29,8 @@ use crate::{HleModule, hle_export};
 const E_FAIL: HRESULT = 0x8000_4005_u32 as i32;
 
 /// `D3D12_RESOURCE_DESC`, whose layout field carries `0x100 | swizzle
-/// mode` on the console (1 row major, 0 "pick one").
+/// mode` on the console (1 row major, 0 "pick one", 2 and 3 reserved, a bank
+/// rotation index in bits 12 to 15).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct ResourceDesc {
@@ -41,30 +49,47 @@ pub struct ResourceDesc {
 const _: () = assert!(size_of::<ResourceDesc>() == 0x38);
 
 const SWIZZLED: u32 = 0x100;
-const ROW_MAJOR: u32 = 1;
 const ALLOW_RENDER_TARGET: u32 = 1;
 const ALLOW_DEPTH_STENCIL: u32 = 2;
 const TEXTURE_1D: u32 = 2;
+const TEXTURE_2D: u32 = 3;
 const TEXTURE_3D: u32 = 4;
+
+fn dimension_of(raw: u32) -> Option<Dimension> {
+    match raw {
+        TEXTURE_1D => Some(Dimension::Tex1d),
+        TEXTURE_2D => Some(Dimension::Tex2d),
+        TEXTURE_3D => Some(Dimension::Tex3d),
+        _ => None,
+    }
+}
 
 /// The mode the console's library picks for a description: linear for 1D,
 /// the XOR render and depth modes for targets, else 4 KiB standard
-/// (`.ttpf` textures without a mode of their own use it).
+/// (`.ttpf` textures without a mode of their own use it); for a reserved
+/// layout (2 or 3 in the description's layout field) the 64 KiB `_T` mode,
+/// which GFX10 has in its standard kind only. See
+/// [`LayoutField::suggest`].
 ///
 /// shortcut: the rule of the library's older optimal-mode function (any
 /// size, 2D, 3D and cubes alike); `XGSuggestSwizzleMode` itself is newer
-/// than every copy we could check. Revisit if streamed textures come out
+/// than every copy we could check, and its flags (performance, memory
+/// footprint) are not read. Revisit if streamed textures come out
 /// scrambled.
-fn suggested(desc: &ResourceDesc) -> Swizzle {
-    if desc.dimension == TEXTURE_1D {
-        Swizzle::LINEAR
-    } else if desc.flags & ALLOW_DEPTH_STENCIL != 0 {
-        Swizzle::SW_64KB_Z_X
-    } else if desc.flags & ALLOW_RENDER_TARGET != 0 {
-        Swizzle::SW_64KB_R_X
-    } else {
-        Swizzle::SW_4KB_S
-    }
+fn suggested(desc: &ResourceDesc) -> Option<Swizzle> {
+    // A field the library would reject still gets a suggestion by use, as
+    // before layouts were read here.
+    let field = LayoutField::parse(desc.layout).unwrap_or(LayoutField {
+        kind: LayoutKind::Pick,
+        bank_rotation: 0,
+    });
+    // Any dimension the library does not know is treated as 2D, as before.
+    let dimension = dimension_of(desc.dimension).unwrap_or(Dimension::Tex2d);
+    field.suggest(
+        dimension,
+        desc.flags & ALLOW_DEPTH_STENCIL != 0,
+        desc.flags & ALLOW_RENDER_TARGET != 0,
+    )
 }
 
 /// `(desc, flags, out layout)`; the title passes flags 0 and puts the
@@ -77,10 +102,14 @@ pub extern "system" fn XGSuggestSwizzleMode(
     // SAFETY: the title passes a description and room for the layout
     // (either may be null).
     match unsafe { (desc.as_ref(), out.as_mut()) } {
-        (Some(desc), Some(out)) => {
-            *out = SWIZZLED | suggested(desc).0;
-            S_OK
-        }
+        (Some(desc), Some(out)) => match suggested(desc) {
+            Some(mode) => {
+                *out = SWIZZLED | mode.0;
+                S_OK
+            }
+            // No texture of this kind (a reserved 1D one).
+            None => E_INVALIDARG,
+        },
         _ => E_INVALIDARG,
     }
 }
@@ -91,6 +120,8 @@ pub struct Computer {
     refs: AtomicU32,
     desc: ResourceDesc,
     mips: u32,
+    /// Made from a reserved layout (2 or 3 in the layout field).
+    reserved: bool,
     texture: Texture,
 }
 
@@ -101,6 +132,17 @@ fn computer<'a>(this: This) -> &'a Computer {
     unsafe { &*this }
 }
 
+/// Says once per kind what this library cannot do for a description, so a
+/// log shows when the title asked for it.
+fn say_once(kind: &AtomicBool, desc: &ResourceDesc, what: &str) {
+    if !kind.swap(true, Ordering::Relaxed) {
+        tracing::warn!(?desc, "{what}");
+    }
+}
+
+static ROTATED: AtomicBool = AtomicBool::new(false);
+static NOT_DRAWN: AtomicBool = AtomicBool::new(false);
+
 pub extern "system" fn XGCreateTextureComputer(
     desc: *const ResourceDesc,
     out: *mut This,
@@ -109,7 +151,7 @@ pub extern "system" fn XGCreateTextureComputer(
     let (Some(&desc), false) = (unsafe { desc.as_ref() }, out.is_null()) else {
         return E_INVALIDARG;
     };
-    let Some(texture) = texture(&desc) else {
+    let Some((texture, field)) = texture(&desc) else {
         tracing::warn!(?desc, "no texture layout");
         return E_INVALIDARG;
     };
@@ -121,12 +163,30 @@ pub extern "system" fn XGCreateTextureComputer(
         size = texture.size,
         "texture computer"
     );
+    // The layout is the same with a bank rotation; the rotation's own
+    // fields (address mask and bytes per slice) stay 0, which the kit's
+    // helper reads as "this mip does not rotate".
+    if field.bank_rotation != 0 {
+        say_once(
+            &ROTATED,
+            &desc,
+            "texture layout with a bank rotation: laid out as without",
+        );
+    }
+    if texture.planes[0].layout.desc.swizzle.xor() {
+        say_once(
+            &NOT_DRAWN,
+            &desc,
+            "texture layout in an XOR mode: sizes and offsets only, copies and texel offsets fail",
+        );
+    }
     let mips = texture.planes[0].layout.mips.len() as u32;
     let computer = Box::new(Computer {
         vtable: &VTABLE,
         refs: AtomicU32::new(1),
         desc,
         mips,
+        reserved: field.reserved(),
         texture,
     });
     // SAFETY: checked non-null.
@@ -134,19 +194,14 @@ pub extern "system" fn XGCreateTextureComputer(
     S_OK
 }
 
-fn texture(desc: &ResourceDesc) -> Option<Texture> {
-    let dimension = match desc.dimension {
-        TEXTURE_1D => Dimension::Tex1d,
-        3 => Dimension::Tex2d,
-        TEXTURE_3D => Dimension::Tex3d,
-        _ => return None,
-    };
-    let swizzle = match desc.layout {
-        0 => suggested(desc),
-        ROW_MAJOR => Swizzle::LINEAR,
-        l if l & !0xff == SWIZZLED => Swizzle(l & 0xff),
-        _ => return None,
-    };
+fn texture(desc: &ResourceDesc) -> Option<(Texture, LayoutField)> {
+    let dimension = dimension_of(desc.dimension)?;
+    let field = LayoutField::parse(desc.layout)?;
+    let swizzle = field.resolve(
+        dimension,
+        desc.flags & ALLOW_DEPTH_STENCIL != 0,
+        desc.flags & ALLOW_RENDER_TARGET != 0,
+    )?;
     let texture = Texture::new(&TextureDesc {
         dimension,
         width: u32::try_from(desc.width).ok()?,
@@ -159,7 +214,7 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
     })
     .ok()?;
     // The layout struct has room for 15 mips.
-    (texture.planes[0].layout.mips.len() <= MIPS).then_some(texture)
+    (texture.planes[0].layout.mips.len() <= MIPS).then_some((texture, field))
 }
 
 const MIPS: usize = 15;
@@ -569,32 +624,62 @@ extern "system" fn element_offset(
     }
 }
 
-/// Slots the title does not call: size, alignment, offsets, coordinates,
-/// view descriptor, tiled-resource query.
+/// Slot 0x18: the texture's size in bytes.
+extern "system" fn size_bytes(this: This) -> u64 {
+    computer(this).texture.size
+}
+
+/// Slot 0x20: the texture's base alignment in bytes.
+extern "system" fn alignment_bytes(this: This) -> u64 {
+    computer(this).texture.alignment
+}
+
+/// Slot 0x28 `(plane, mip)`: a mip's byte offset from the texture's start,
+/// as the layout reports it (0 for a mip placed by position in a 3D tail,
+/// and for a mip or plane that does not exist).
+extern "system" fn mip_offset(this: This, plane: u32, mip: u32) -> u64 {
+    let c = computer(this);
+    let Some(p) = c.texture.planes.get(plane as usize) else {
+        return 0;
+    };
+    if mip as usize >= p.layout.mips.len() {
+        return 0;
+    }
+    p.offset + mip_out(&c.desc, &p.layout, mip as usize).offset
+}
+
+/// Slot 0x60: whether the texture was made from a reserved layout.
+extern "system" fn is_tiled(this: This) -> bool {
+    computer(this).reserved
+}
+
+/// Slots that return a status and that the title does not call (offset to
+/// coordinate, view descriptor, swizzle pattern): they log and fail.
 extern "system" fn unused(this: This) -> HRESULT {
     tracing::warn!(desc = ?computer(this).desc, "unimplemented texture computer method");
     E_NOTIMPL
 }
 
 #[repr(C)]
-struct Vtable([*const (); 13]);
+struct Vtable([*const (); 14]);
 // SAFETY: function addresses only.
 unsafe impl Sync for Vtable {}
 
 static VTABLE: Vtable = Vtable([
-    add_ref as *const (),   // 0x00
-    release as *const (),   // 0x08
-    layout as *const (),    // 0x10
-    unused as *const (),    // 0x18 size
-    unused as *const (),    // 0x20 alignment
-    unused as *const (),    // 0x28 mip offset
-    element_offset as *const (), // 0x30
-    unused as *const (),    // 0x38 element coordinate
-    copy_into as *const (), // 0x40
-    copy_from as *const (), // 0x48
-    tiling as *const (),    // 0x50
-    unused as *const (),    // 0x58 view descriptor
-    unused as *const (),    // 0x60 tiled resource?
+    add_ref as *const (),         // 0x00
+    release as *const (),         // 0x08
+    layout as *const (),          // 0x10
+    size_bytes as *const (),      // 0x18 size
+    alignment_bytes as *const (), // 0x20 alignment
+    mip_offset as *const (),      // 0x28 mip offset
+    element_offset as *const (),  // 0x30
+    unused as *const (),          // 0x38 element coordinate
+    copy_into as *const (),       // 0x40
+    copy_from as *const (),       // 0x48
+    tiling as *const (),          // 0x50
+    unused as *const (),          // 0x58 view descriptor
+    is_tiled as *const (),        // 0x60 tiled resource?
+    unused as *const (),          // 0x68 swizzle pattern
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -780,5 +865,162 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    fn size_of_layout(d: &ResourceDesc) -> (u64, u64) {
+        let c = create(d);
+        let size: extern "system" fn(This) -> u64 = slot(c, 3);
+        let alignment: extern "system" fn(This) -> u64 = slot(c, 4);
+        let r = (size(c), alignment(c));
+        assert_eq!(release(c), 0);
+        r
+    }
+
+    /// Size and alignment for each layout kind, mode family and a few
+    /// dimensions (format 28 is 4 bytes an element, 98 is BC7: 16 per 4x4).
+    #[test]
+    fn sizes_per_layout() {
+        let cases = [
+            // (layout, width, height, format, size, alignment)
+            (0x100, 64, 64, 28, 64 * 64 * 4, 256),
+            (1, 64, 64, 28, 64 * 64 * 4, 256),
+            (0x101, 64, 64, 28, 64 * 64 * 4, 256),
+            (0x105, 64, 64, 28, 16 << 10, 4096),
+            (0x105, 33, 33, 28, 16 << 10, 4096),
+            (0x105, 65, 33, 28, 24 << 10, 4096),
+            (0x10a, 128, 128, 28, 64 << 10, 65536),
+            (0x10a, 129, 128, 28, 128 << 10, 65536),
+            (0x119, 256, 256, 28, 256 << 10, 65536),
+            (0x11b, 256, 256, 28, 256 << 10, 65536),
+            // A reserved texture: 64 KiB blocks (S_T).
+            (2, 256, 256, 28, 256 << 10, 65536),
+            (3, 256, 256, 28, 256 << 10, 65536),
+            (2, 128, 128, 28, 64 << 10, 65536),
+            (2, 512, 256, 98, 128 << 10, 65536),
+            // The same modes with a bank rotation index.
+            (0x311b, 256, 256, 28, 256 << 10, 65536),
+            (0xf119, 256, 256, 28, 256 << 10, 65536),
+            (0x1105, 64, 64, 28, 16 << 10, 4096),
+        ];
+        for (layout, w, h, format, size, alignment) in cases {
+            let d = desc(w, h, 1, format, layout);
+            assert_eq!(size_of_layout(&d), (size, alignment), "{layout:#x} {w}x{h}");
+        }
+        // A rotation does not move sizes or offsets.
+        let plain = desc(256, 256, 0, 28, 0x11b);
+        let rotated = desc(256, 256, 0, 28, 0x911b);
+        assert_eq!(size_of_layout(&plain), size_of_layout(&rotated));
+        // A 3D reserved texture.
+        let mut volume = desc(64, 64, 1, 28, 2);
+        volume.dimension = TEXTURE_3D;
+        volume.depth_or_array = 16;
+        let (size, alignment) = size_of_layout(&volume);
+        assert_eq!(alignment, 65536);
+        assert!(size >= 64 * 64 * 16 * 4 && size % 65536 == 0);
+    }
+
+    #[test]
+    fn layout_fields_outside_the_library_fail() {
+        let mut c = std::ptr::null_mut();
+        // Past the mode mask 0x11f, unknown low values, bits above the
+        // rotation, a rotation without a mode.
+        for layout in [
+            0x120, 0x13f, 0x1ff, 0x4, 0x7, 0x200, 0x1_0100, 0x1000, 0x2002, 0x3003,
+        ] {
+            let bad = desc(64, 64, 1, 28, layout);
+            assert_eq!(
+                XGCreateTextureComputer(&bad, &mut c),
+                E_INVALIDARG,
+                "{layout:#x}"
+            );
+        }
+        // A reserved 1D texture and a mode no GFX10 part has.
+        let mut line = desc(64, 1, 1, 28, 2);
+        line.dimension = TEXTURE_1D;
+        assert_eq!(XGCreateTextureComputer(&line, &mut c), E_INVALIDARG);
+        assert_eq!(
+            XGCreateTextureComputer(&desc(64, 64, 1, 28, 0x110), &mut c),
+            E_INVALIDARG
+        );
+    }
+
+    #[test]
+    fn reserved_layouts_report_a_tiled_resource() {
+        let c = create(&desc(256, 256, 0, 28, 2));
+        let tiled: extern "system" fn(This) -> bool = slot(c, 12);
+        assert!(tiled(c));
+        // Layout and the tail of a reserved chain come out; copies do not.
+        let mut l: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
+        let get: extern "system" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
+        assert_eq!(get(c, &mut *l), S_OK);
+        assert_eq!((l.alignment, l.planes), (65536, 1));
+        assert!(l.plane[0].tail_mips > 0);
+        type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        let into: Into = slot(c, 8);
+        let (mut tiled_bytes, linear) = (vec![0u8; l.size as usize], vec![0u8; 1024]);
+        assert_eq!(
+            into(c, tiled_bytes.as_mut_ptr(), 0, 0, linear.as_ptr(), 1024, 0),
+            E_NOTIMPL
+        );
+        assert_eq!(release(c), 0);
+        let c = create(&desc(256, 256, 0, 28, 0x119));
+        let tiled: extern "system" fn(This) -> bool = slot(c, 12);
+        assert!(!tiled(c));
+        assert_eq!(release(c), 0);
+    }
+
+    /// The slots of size, alignment and mip offset agree with the layout.
+    #[test]
+    fn size_alignment_and_mip_offsets_come_from_the_layout() {
+        let c = create(&desc(256, 256, 0, 98, 0x10a));
+        let mut l: Box<LayoutOut> = Box::new(unsafe { std::mem::zeroed() });
+        let get: extern "system" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
+        assert_eq!(get(c, &mut *l), S_OK);
+        let offset: extern "system" fn(This, u32, u32) -> u64 = slot(c, 5);
+        for mip in 0..l.mips {
+            assert_eq!(
+                offset(c, 0, mip),
+                l.plane[0].mips[mip as usize].offset,
+                "{mip}"
+            );
+        }
+        assert_eq!(offset(c, 0, l.mips), 0);
+        assert_eq!(offset(c, 3, 0), 0);
+        let size: extern "system" fn(This) -> u64 = slot(c, 3);
+        assert_eq!(size(c), l.size);
+        // The coordinate and view descriptor slots still fail, as statuses.
+        let coordinate: extern "system" fn(This) -> HRESULT = slot(c, 7);
+        assert_eq!(coordinate(c), E_NOTIMPL);
+        assert_eq!(release(c), 0);
+    }
+
+    #[test]
+    fn suggestions_for_reserved_layouts_and_rotations() {
+        let mut out = 0;
+        for layout in [2, 3] {
+            let mut d = desc(256, 256, 1, 98, layout);
+            assert_eq!(XGSuggestSwizzleMode(&d, 0, &mut out), S_OK);
+            assert_eq!(out, 0x111, "layout {layout}");
+            // The use does not change the reserved answer.
+            d.flags = ALLOW_RENDER_TARGET;
+            XGSuggestSwizzleMode(&d, 0, &mut out);
+            assert_eq!(out, 0x111);
+            d.dimension = TEXTURE_3D;
+            XGSuggestSwizzleMode(&d, 0, &mut out);
+            assert_eq!(out, 0x111);
+            // No reserved 1D texture.
+            d.dimension = TEXTURE_1D;
+            assert_eq!(XGSuggestSwizzleMode(&d, 0, &mut out), E_INVALIDARG);
+        }
+        // A mode in the field is ignored, rotation or not; flags 1 and 2.
+        let d = desc(256, 256, 1, 98, 0x311b);
+        for flags in [0, 1, 2] {
+            assert_eq!(XGSuggestSwizzleMode(&d, flags, &mut out), S_OK);
+            assert_eq!(out, 0x105);
+        }
+        assert_eq!(
+            XGSuggestSwizzleMode(std::ptr::null(), 0, &mut out),
+            E_INVALIDARG
+        );
     }
 }
