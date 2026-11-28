@@ -581,23 +581,31 @@ impl App {
     fn options_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.spacing_mut().item_spacing.y = 18.0;
         ui.label(theme::title(&self.t("panel.title"), theme::type_size("titleSmall")));
-        let mut toggles = Vec::new();
-        for opt in options::catalog().options.iter().filter(|o| o.main) {
-            match opt.kind {
-                Kind::Choice => self.segmented(ui, opt),
-                Kind::Toggle => toggles.push(opt),
-            }
-        }
-        if !toggles.is_empty() {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
-                for opt in toggles {
-                    self.switch(ui, opt, num("layout", "switchRowHeight"));
+        // The buttons at the foot keep their room (measured the frame before):
+        // the options above scroll when the window is too short for them all.
+        let foot_id = ui.scope_id().with("options-foot");
+        let foot_h: f32 = ui.ctx().data(|d| d.get_temp(foot_id)).unwrap_or(200.0);
+        let options_h = (ui.available_height() - foot_h - 18.0).max(60.0);
+        egui::ScrollArea::vertical().id_salt("options-list").max_height(options_h).auto_shrink([false, true]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 18.0;
+            let mut toggles = Vec::new();
+            for opt in options::catalog().options.iter().filter(|o| o.main) {
+                match opt.kind {
+                    Kind::Choice => self.segmented(ui, opt),
+                    Kind::Toggle => toggles.push(opt),
                 }
-                self.mouse_keyboard_switch(ui);
-            });
-        }
-        ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
+            }
+            if !toggles.is_empty() {
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    for opt in toggles {
+                        self.switch(ui, opt, num("layout", "switchRowHeight"));
+                    }
+                    self.mouse_keyboard_switch(ui);
+                });
+            }
+        });
+        let foot = ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
             ui.horizontal(|ui| {
                 ui.set_min_height(num("layout", "linkRowHeight"));
@@ -625,6 +633,11 @@ impl App {
                 self.go(View::Settings);
             }
         });
+        let h = foot.response.rect.height();
+        if (h - foot_h).abs() > 0.5 {
+            ui.ctx().data_mut(|d| d.insert_temp(foot_id, h));
+            ui.ctx().request_repaint();
+        }
     }
 
     /// A choice as segments, two to a row, under its caption.
@@ -852,6 +865,7 @@ impl App {
         let Some(prep) = &self.prep else { return };
         let mut back = false;
         let mut cancel = false;
+        let mut copy: Option<String> = None;
         {
             {
                 theme::panel().inner_margin(num("layout", "cardPadding")).show(ui, |ui| {
@@ -897,16 +911,22 @@ impl App {
                                 .show(ui, |ui| {
                                     let tail = run::tail(&run::log_path(id), 24 * 1024);
                                     let mut shown = mask_user(&strip_ansi(&tail));
-                                    egui::ScrollArea::vertical().max_height(260.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
+                                    // What the panel has left once the buttons' row has its room.
+                                    let room = ui.available_height() - num("size", "controlHeight") - if prep.finished { 40.0 } else { 72.0 };
+                                    egui::ScrollArea::vertical().max_height(room.clamp(60.0, 260.0)).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
                                         ui.add(egui::TextEdit::multiline(&mut shown).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).interactive(false));
                                     });
-                                    if theme::outline_button(ui, &text::get(lang, "logs.copy"), None, false).clicked() {
-                                        ui.ctx().copy_text(shown.clone());
-                                    }
+                                    copy = Some(shown);
                                 });
                             ui.ctx().request_repaint_after(Duration::from_millis(300));
                         }
+                        // Copy and Back / Cancel on one row, under the log.
                         ui.horizontal(|ui| {
+                            if let Some(shown) = copy.take()
+                                && theme::outline_button(ui, &text::get(lang, "logs.copy"), None, false).clicked()
+                            {
+                                ui.ctx().copy_text(shown);
+                            }
                             ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                                 if prep.finished {
                                     back = theme::outline_button(ui, &text::get(lang, "prep.back"), None, false).clicked();
