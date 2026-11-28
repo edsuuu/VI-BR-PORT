@@ -2826,7 +2826,12 @@ impl State {
                 (Some(_), Some(View::Placed(_, _, desc))) => crate::resource::first_mip(desc),
                 _ => 0,
             };
-            let same = !tabled && crate::texture::unchanged(resource, first);
+            // A texture the bake ahead samples is uploaded in this list
+            // whatever its host copy holds now (`VICTORY_BAKE_FRESH=1`,
+            // `crate::bake::fresh_on`): the upload takes its memory as the
+            // list's submission finds it.
+            let fresh = source && crate::bake::fresh_on();
+            let same = !tabled && !fresh && crate::texture::unchanged(resource, first);
             if same {
                 if source {
                     tally.same += 1;
@@ -2878,12 +2883,14 @@ impl State {
                 // (What was found mapped of it a moment ago is not asked
                 // again, unless the host copy may need more.)
                 crate::texture::PICKING.set(Some(there.filter(|_| partly.is_none()).unwrap_or(u64::MAX)));
+                crate::texture::FRESH.set(fresh);
                 let asked = std::time::Instant::now();
                 readable(list, sampled.kind, view);
                 if on_its_way {
                     tally.on_their_way += 1;
                     tally.waited_us += asked.elapsed().as_micros() as u64;
                 }
+                crate::texture::FRESH.set(false);
                 crate::texture::PICKING.set(None);
             }
             if shows_other && let Some(handle) = heap.handle(index) {

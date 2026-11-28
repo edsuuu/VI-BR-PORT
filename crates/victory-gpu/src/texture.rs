@@ -658,6 +658,10 @@ thread_local! {
     /// The thread records the upload of a texture picked by index, of which
     /// that many bytes were found mapped just now (`u64::MAX`: not asked).
     pub(crate) static PICKING: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    /// The thread records the upload of a texture a decoration bake samples
+    /// that is to be made in this list even if the host copy holds its
+    /// staging buffer's bytes (`VICTORY_BAKE_FRESH=1`, `crate::bake::fresh_on`).
+    pub(crate) static FRESH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Whether a staging buffer made for one upload of a texture picked by index
@@ -810,7 +814,9 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // at submission is left, and what it finds changed the next list that
     // samples the texture uploads (a frame late where every list of the
     // frame was recorded before that check).
-    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    // (Not for a decoration bake's source with `VICTORY_BAKE_FRESH=1`: its
+    // upload is recorded here, and takes what the check at submission finds.)
+    if staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) && !FRESH.get() {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);

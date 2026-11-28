@@ -48,6 +48,26 @@ pub(crate) fn admit_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_ADMIT").is_some_and(|v| v == "1"))
 }
 
+/// Whether a bake draw's sources are uploaded into the bake's own list
+/// whatever their host copy holds when the draw is recorded
+/// (`VICTORY_BAKE_FRESH=1`; off by default; it needs [`admit_on`], which
+/// finds them). Such an upload takes title memory as it is when the list is
+/// submitted (`crate::texture` `Staging::refresh`), so a copy of the title's
+/// into a source's memory recorded before the bake (done at submission,
+/// `crate::host` `place`) and bytes that arrive between the recording and
+/// the submission are in what the bake draws. Off: a source whose memory
+/// matched its host copy at the recording (`crate::texture::unchanged`) is
+/// not uploaded, and the bake draws what the host copy had. A decal of
+/// 176 KB changed six times between the first three bakes of the diner scene
+/// (run barco-g-confete2) and was found changed 3 to 17 frames after its
+/// upload with nothing to tell of it, in the launch whose faces were baked in
+/// coloured noise. (Bytes written after the bake's submission are not helped
+/// by this.)
+pub(crate) fn fresh_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BAKE_FRESH").is_some_and(|v| v == "1"))
+}
+
 /// The largest texture taken as a source: the decorations met as sources in
 /// the runs of 27 Nov were 4 KiB to 384 KiB in the prison and up to 1.4 MiB on
 /// the boat (512x512 BC3 with its levels: 352 KiB); the 22 MB textures met
