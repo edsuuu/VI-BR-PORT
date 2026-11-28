@@ -2035,7 +2035,7 @@ static MERGED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
 /// copy took the page is as the copy took it, so it holds no changed byte,
 /// and the refresh already takes only the written parts the same way
 /// (`copy_stale`, `by_parts`). Only pages found by the walk over the
-/// journal's notes ([`stale_walk`]) are read so; a page of an answer from the
+/// journal's notes ([`stale_walk`], `VICTORY_STALE_WALK=1`) are read so; a page of an answer from the
 /// kernel or the guards, a page never taken, and a page whose parts the
 /// journal does not know are read whole. Ported from Kemerd/VIctory-NVIDIA-RT
 /// e994b9005 and its review fix cdef33923 (the runs of all parts are planned
@@ -2848,8 +2848,8 @@ fn stale_pages_searched(base: usize, copied: &[u64], a: usize, e: usize, written
 }
 
 /// Whether [`stale_pages_in`] walks the pages and the journal's notes side by
-/// side, once (`VICTORY_STALE_WALK=0`: a binary search of the notes for each
-/// page, as before; on by default), and [`Shadow::merge_under_writes`] walks
+/// side, once (`VICTORY_STALE_WALK=1`; off by default until measured in the game: a
+/// binary search of the notes for each page, as before), and [`Shadow::merge_under_writes`] walks
 /// the journal's notes where they lie instead of a list of them made for it.
 /// The same pages either way, by construction: the notes come in page order,
 /// each page once.
@@ -2861,7 +2861,7 @@ fn stale_pages_searched(base: usize, copied: &[u64], a: usize, e: usize, written
 /// filtered pages), the list of notes and its growth more beside it.
 fn stale_walk() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_STALE_WALK").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_STALE_WALK"))
 }
 
 /// [`stale_pages_in`] by one walk: the notes of the range (page, asking that

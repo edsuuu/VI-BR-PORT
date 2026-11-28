@@ -115,8 +115,8 @@ const MOST: usize = 12288;
 
 /// Whether the buffer of each list of ours ([`Own`]) is kept for the run
 /// once made, so that the slots its steps make constant views of in title
-/// heaps need not hold it (`VICTORY_STEP_BUFFERS_KEPT=0`: each slot holds the
-/// buffer it shows, as before; on by default).
+/// heaps need not hold it (`VICTORY_STEP_BUFFERS_KEPT=1`; off by default until measured in the game:
+/// each slot holds the buffer it shows, as before).
 ///
 /// The lists and their buffers go back to [`POOL`] when they land and are
 /// never let go there, so a slot never shows freed memory either way. But
@@ -130,7 +130,7 @@ const MOST: usize = 12288;
 /// reference of its own that is never given back, made with it.
 fn buffers_kept() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_STEP_BUFFERS_KEPT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_STEP_BUFFERS_KEPT"))
 }
 
 /// How a fill's bytes get where its list reads them, if the card brings

@@ -1108,8 +1108,8 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 }
 
 /// Whether [`writes_with`] gives the journal's notes in a list each thread
-/// keeps for it (`VICTORY_NOTES_KEPT=0`: a list made for each call, as
-/// [`writes`] makes it; on by default). The same notes either way.
+/// keeps for it (`VICTORY_NOTES_KEPT=1`; off by default until measured in the game: a list
+/// made for each call, as [`writes`] makes it). The same notes either way.
 ///
 /// Every refresh of a copy asks this (`Shadow::update`), thousands a frame,
 /// and the list of a range of many pages grew by doubling at each: with the
@@ -1118,7 +1118,7 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// what is asked most.
 fn notes_kept() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_NOTES_KEPT").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_NOTES_KEPT"))
 }
 
 thread_local! {
