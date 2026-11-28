@@ -412,8 +412,13 @@ fn elsewhere(does: &[Does], shadow: usize, from: usize, to: usize) -> bool {
 /// write is there: the one they all write it through, or without any the
 /// one shaders would be given.
 fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
+    holder_of(writers.iter().filter(|w| meet((w.from, w.to), (from, to))), from, to)
+}
+
+/// [`holder`], given the writers that meet `[from, to)`.
+fn holder_of<'a>(meeting: impl Iterator<Item = &'a Writer>, from: usize, to: usize) -> Result<Arc<Shadow>, &'static str> {
     let mut found: Option<&Arc<Shadow>> = None;
-    for w in writers.iter().filter(|w| meet((w.from, w.to), (from, to))) {
+    for w in meeting {
         match (&w.shadow, found) {
             (None, _) => return Err("a read-back or a value behind a flight is written there"),
             (Some(s), Some(f)) if !Arc::ptr_eq(s, f) => return Err("flights write it through two host copies"),
@@ -429,6 +434,67 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
         return Err("no host copy holds all of it");
     }
     Ok(shadow)
+}
+
+/// Whether the writers [`holder`] looks at are found through [`WriterIndex`]
+/// (`VICTORY_CARD_STEPS_INDEX=1`; off by default: each look goes over all of
+/// them).
+///
+/// A submission's steps on the card look for the holder of each place they
+/// read, and the fills of the title's ring of constants each read a place of
+/// their own: in the prison's window view (run prisao-pfC1, 28 Nov) 7,500 to
+/// 8,600 fills a frame were done on the card against 1,000-1,600 with Lucia
+/// facing the cell, and the submitting thread's time ahead of its preparing
+/// (where they are planned) went from 1.6 to 6.0 ms a frame. Every look went
+/// over the ranges all flights in the air write.
+fn writer_index() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_CARD_STEPS_INDEX"))
+}
+
+/// The writers of a plan sorted by where they begin, each with the furthest
+/// end among it and those before it: the ones that meet a range are found
+/// from the last that begins before its end back to the first whose
+/// furthest end is past its start. Writers added after it was made are not
+/// in it ([`WriterIndex::meeting`] takes them apart).
+struct WriterIndex {
+    /// Places in the writers, by `from`.
+    order: Vec<u32>,
+    /// The furthest `to` of `order[..=k]`.
+    reach: Vec<usize>,
+    /// How many writers it was made of.
+    len: usize,
+}
+
+impl WriterIndex {
+    fn new(writers: &[Writer]) -> WriterIndex {
+        let mut order: Vec<u32> = (0..writers.len() as u32).collect();
+        order.sort_unstable_by_key(|&i| writers[i as usize].from);
+        let mut reach = Vec::with_capacity(order.len());
+        let mut most = 0;
+        for &i in &order {
+            most = writers[i as usize].to.max(most);
+            reach.push(most);
+        }
+        WriterIndex {
+            order,
+            reach,
+            len: writers.len(),
+        }
+    }
+
+    /// The writers of `writers` (the ones it was made of, and any added
+    /// since) that meet `[from, to)`.
+    fn meeting<'a>(&'a self, writers: &'a [Writer], from: usize, to: usize) -> impl Iterator<Item = &'a Writer> + 'a {
+        let end = self.order.partition_point(|&i| writers[i as usize].from < to);
+        let indexed = (0..end)
+            .rev()
+            .take_while(move |&k| self.reach[k] > from)
+            .map(move |k| &writers[self.order[k] as usize])
+            .filter(move |w| w.to > from);
+        let added = writers[self.len.min(writers.len())..].iter().filter(move |w| meet((w.from, w.to), (from, to)));
+        indexed.chain(added)
+    }
 }
 
 /// What the steps of `runs` do, and which step each is (its list by address,
@@ -723,6 +789,11 @@ impl Host {
             }));
             all
         };
+        let index = writer_index().then(|| WriterIndex::new(&writers));
+        let holder = |writers: &[Writer], from: usize, to: usize| match &index {
+            Some(index) => holder_of(index.meeting(writers, from, to), from, to),
+            None => holder(writers, from, to),
+        };
         let mut ops: Vec<Op> = Vec::with_capacity(chosen.len());
         // The places read (host copy, address, bytes, level): where in the
         // buffer between their bytes are.
@@ -963,6 +1034,99 @@ pub(super) fn log(frames: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writers of ranges in 64 MiB of address space, up to 64 KiB long, and
+    /// asks of 256 bytes to 4 KiB: as the flights' declared ranges and the
+    /// fills of the title's constants are.
+    fn writers_and_asks(writers: usize, asks: usize, seed: u64) -> (Vec<Writer>, Vec<(usize, usize)>) {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as usize
+        };
+        let base = 0x9_0000_0000usize;
+        let all = (0..writers)
+            .map(|_| {
+                let from = base + next() % (64 << 20);
+                Writer {
+                    shadow: None,
+                    from,
+                    to: from + 1 + next() % (64 << 10),
+                    copy: false,
+                }
+            })
+            .collect();
+        let asks = (0..asks)
+            .map(|_| {
+                let from = base + next() % (64 << 20);
+                (from, from + 256 + next() % 4096)
+            })
+            .collect();
+        (all, asks)
+    }
+
+    /// The index gives the writers a look at all of them gives, those added
+    /// after it was made among them (`VICTORY_CARD_STEPS_INDEX`).
+    #[test]
+    fn the_writer_index_finds_what_a_look_at_all_finds() {
+        for (n, seed) in [(0, 1), (1, 2), (7, 3), (400, 4), (2000, 5)] {
+            let (mut writers, asks) = writers_and_asks(n, 3000, seed);
+            let index = WriterIndex::new(&writers);
+            // Some added after, as a copy done on the card adds its own.
+            writers.extend(writers_and_asks(3, 0, seed + 100).0);
+            let mut met = 0;
+            for &(from, to) in asks.iter().chain([(0x9_0000_0000, 0x9_0000_0000), (0, usize::MAX)].iter()) {
+                let mut all: Vec<*const Writer> =
+                    writers.iter().filter(|w| meet((w.from, w.to), (from, to))).map(std::ptr::from_ref).collect();
+                let mut found: Vec<*const Writer> = index.meeting(&writers, from, to).map(std::ptr::from_ref).collect();
+                all.sort_unstable();
+                found.sort_unstable();
+                assert_eq!(all, found, "{n} writers, ask {from:#x}..{to:#x}");
+                met += all.len();
+            }
+            assert!(n < 400 || met > 0);
+        }
+    }
+
+    /// Offline measure of the looks of a plan's holders, with and without the
+    /// index: `cargo test -p victory-gpu --lib --release writer_index_time --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measure, not a check"]
+    fn writer_index_time() {
+        for writers in [100, 400, 1000, 2000] {
+            let (all, asks) = writers_and_asks(writers, 500, 9);
+            let rounds = 200;
+            let started = std::time::Instant::now();
+            let mut a = 0usize;
+            for _ in 0..rounds {
+                for &(from, to) in &asks {
+                    a += all.iter().filter(|w| meet((w.from, w.to), (from, to))).count();
+                }
+            }
+            let linear = started.elapsed();
+            let started = std::time::Instant::now();
+            let mut b = 0usize;
+            for _ in 0..rounds {
+                let index = WriterIndex::new(&all);
+                for &(from, to) in &asks {
+                    b += index.meeting(&all, from, to).count();
+                }
+            }
+            let indexed = started.elapsed();
+            assert_eq!(a, b);
+            let per = |d: std::time::Duration| d.as_nanos() as f64 / (rounds * asks.len()) as f64;
+            println!(
+                "{writers} writers, 500 asks a plan: {:.0} ns an ask over all, {:.0} ns with the index (made once a plan); {:.3} ms against {:.3} ms a plan",
+                per(linear),
+                per(indexed),
+                linear.as_secs_f64() * 1e3 / rounds as f64,
+                indexed.as_secs_f64() * 1e3 / rounds as f64
+            );
+        }
+    }
 
     fn copy(dst: usize, src: usize, len: usize, asked: bool) -> Does {
         Does::Copy { dst, src, len, asked }
