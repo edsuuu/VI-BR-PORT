@@ -143,6 +143,13 @@ pub(super) enum C {
     /// Barriers recorded for builds to take the scratch memory of builds
     /// before them again (`super::scratch`).
     ScratchWaits,
+    /// `super::keep`: destinations top levels named that the host had a
+    /// recipe but no structure for; bottom levels made again, and those
+    /// refused; bottom levels let go for want of memory.
+    Wanted,
+    Remade,
+    RemadeRefused,
+    Evicted,
     Swept,
 }
 

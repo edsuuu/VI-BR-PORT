@@ -244,11 +244,49 @@ fn record_on(host: &HostList, origin: Origin, builds: &[Build]) -> bool {
     let mut tops = Vec::new();
     {
         let mut table = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        // Bottom levels top levels name that the host let go or had no
+        // memory for (`super::keep`), first: the top levels below and those
+        // of lists submitted after this one name them. Only in a recording
+        // of top levels, so that they run before the top levels of the
+        // title's own call in its own list, on its own queue (a list of
+        // another queue gives no order against the lists that read them).
+        let tops_here = builds.iter().any(|b| matches!(b.level, Level::Top { .. }));
+        let wanted = if tops_here { super::keep::wanted(&table) } else { Vec::new() };
+        for (dest, recipe) in wanted {
+            let made = super::bottom::bottom(host, &list, gpu, &mut table, &recipe.build, recipe.origin, frame, &mut held, &mut scratch);
+            match made {
+                Ok(()) => {
+                    add(C::Remade, 1);
+                    super::keep::remember(recipe.origin, &recipe.build, frame);
+                }
+                Err((r, why)) => {
+                    add(C::RemadeRefused, 1);
+                    say_remade(|| format!("dest {dest:#x}: {} ({why})", r.name()));
+                    table.forget(dest);
+                    if r != Refusal::Memory {
+                        super::keep::forget(dest);
+                    } else {
+                        // No memory now: the rest waits for another time.
+                        break;
+                    }
+                }
+            }
+        }
         for b in builds.iter().filter(|b| matches!(b.level, Level::Bottom { .. })) {
-            if let Err((r, why)) = super::bottom::bottom(host, &list, gpu, &mut table, b, origin, frame, &mut held, &mut scratch) {
-                refuse(r, || format!("dest {:#x}: {why}", b.dest));
-                // What the host had there is not what the title has now.
-                table.forget(b.dest);
+            match super::bottom::bottom(host, &list, gpu, &mut table, b, origin, frame, &mut held, &mut scratch) {
+                Ok(()) => super::keep::remember(origin, b, frame),
+                Err((r, why)) => {
+                    refuse(r, || format!("dest {:#x}: {why}", b.dest));
+                    // What the host had there is not what the title has now.
+                    table.forget(b.dest);
+                    // Refused for want of memory, it can be made later, when
+                    // a top level names it.
+                    if r == Refusal::Memory {
+                        super::keep::remember(origin, b, frame);
+                    } else {
+                        super::keep::forget(b.dest);
+                    }
+                }
             }
         }
         if builds.iter().any(|b| matches!(b.level, Level::Top { .. })) {
@@ -294,6 +332,27 @@ pub(super) fn table() -> std::sync::MutexGuard<'static, Table<Structure>> {
 /// Card memory for a structure of `len` bytes.
 pub(super) fn lease_structure(len: u64) -> Result<Arc<Lease>, Refused> {
     lease(&STRUCTURES, len, most())
+}
+
+/// [`lease_structure`], letting go of bottom levels no top level named for
+/// a while if memory is short (`super::keep`, with `VICTORY_DXR_KEEP=1`).
+pub(super) fn lease_for(table: &mut Table<Structure>, len: u64, frame: u64) -> Result<Arc<Lease>, Refused> {
+    match lease_structure(len) {
+        Err((Refusal::Memory, _)) if super::keep::on() => {
+            // What only the table holds comes back as it lets go.
+            super::keep::evict(table, frame, len, |s| if Arc::strong_count(s) == 1 { s.lease.len() } else { 0 });
+            lease_structure(len)
+        }
+        r => r,
+    }
+}
+
+/// Bottom levels made again that were refused, said in full (a few).
+fn say_remade(what: impl FnOnce() -> String) {
+    static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if SAID.fetch_add(1, Relaxed) < 4 {
+        tracing::info!("host ray tracing: a bottom level made again (VICTORY_DXR_KEEP) was refused: {}", what());
+    }
 }
 
 /// Scratch memory of `len` bytes.
@@ -377,6 +436,7 @@ fn copy_on(host: &HostList, dest: u64, source: u64, mode: i32) -> bool {
     wait_all(&list);
     table.built(dest, flags, shape, made.clone(), crate::frame::current());
     drop(table);
+    super::keep::copied(dest, source, crate::frame::current());
     add(C::Copies, 1);
     Held { leases: vec![src.lease.clone()], made: vec![made], ..Held::default() }.give(host);
     true
@@ -469,6 +529,17 @@ pub(crate) fn line() {
             per(C::ExpandedUnreadable),
             per(C::ExpandedDegenerate),
             per(C::ExpandedNotFinite),
+        );
+    }
+    if super::keep::on() {
+        let _ = write!(
+            text,
+            "; VICTORY_DXR_KEEP: {:.2} bottom levels the host let go or had no memory for named by top levels again, {:.2} made \
+             again ({:.2} refused; the made again are among the built above), {:.2} let go for want of memory",
+            per(C::Wanted),
+            per(C::Remade),
+            per(C::RemadeRefused),
+            per(C::Evicted),
         );
     }
     if c[C::ScratchWaits as usize] > 0.0 {

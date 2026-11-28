@@ -30,6 +30,8 @@
 //!   the device's ray-tracing interface and the card's time of the builds;
 //! - `table`: the title's destination address to the host structure, with
 //!   generations and the refit-or-rebuild decision;
+//! - `keep` (`VICTORY_DXR_KEEP=1`): bottom levels let go or refused for want
+//!   of memory, made again when a top level names them;
 //! - `pool`: the card memory structures and scratch memory are cut from;
 //! - `scratch` (`VICTORY_DXR_SCRATCH_MB`): the builds of one list sharing
 //!   their scratch memory;
@@ -53,6 +55,7 @@ use windows::Win32::Graphics::Direct3D12::{
 mod bottom;
 mod count;
 mod expand;
+mod keep;
 mod native;
 pub mod packed;
 mod pool;

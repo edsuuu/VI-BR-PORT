@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
 use super::count::{C, REBUILT, Refusal, add};
-use super::native::{Held, Refused, Structure, lease_structure, prebuild};
+use super::native::{Held, Refused, Structure, lease_for, prebuild};
 use super::scratch::Scratch;
 use super::packed;
 use super::stamps::Gpu;
@@ -314,13 +314,13 @@ pub(super) fn bottom(
             if in_place {
                 (src.gpu(), src.gpu(), None)
             } else {
-                let lease = lease_structure(sizes.ResultDataMaxSizeInBytes.max(src.lease.len()))?;
+                let lease = lease_for(table, sizes.ResultDataMaxSizeInBytes.max(src.lease.len()), frame)?;
                 let s = Structure::new(lease);
                 (s.gpu(), src.gpu(), Some(s))
             }
         }
         Decision::Build | Decision::Rebuild(_) => {
-            let s = Structure::new(lease_structure(sizes.ResultDataMaxSizeInBytes)?);
+            let s = Structure::new(lease_for(table, sizes.ResultDataMaxSizeInBytes, frame)?);
             (s.gpu(), 0, Some(s))
         }
     };

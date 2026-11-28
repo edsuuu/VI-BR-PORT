@@ -71,7 +71,7 @@ pub(super) fn top(
         Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 { InstanceDescs: descs },
     };
     let sizes = native::prebuild(gpu, &inputs)?;
-    let s = Structure::new(native::lease_structure(sizes.ResultDataMaxSizeInBytes)?);
+    let s = Structure::new(native::lease_for(table, sizes.ResultDataMaxSizeInBytes, frame)?);
     let scratch = scratch.take(list, sizes.ScratchDataSizeInBytes, held)?;
     if count > 0 {
         let top = s.clone();
@@ -111,7 +111,15 @@ fn rewrite(instances: u64, count: usize, to: usize, top: &Arc<Structure>) {
     let frame = crate::frame::current();
     let (mut named, unknown) = {
         let mut table = native::table();
-        rename(out, |blas| table.usable(blas, frame).map(|v| (v.gpu(), v)))
+        rename(out, |blas| {
+            let found = table.usable(blas, frame);
+            // One the host let go or had no memory for is made again at the
+            // next recording of ours (`super::keep`).
+            if found.is_none() && table.get(blas).is_none() {
+                super::keep::want(blas, frame);
+            }
+            found.map(|v| (v.gpu(), v))
+        })
     };
     named.sort_by_key(|n| Arc::as_ptr(n) as usize);
     named.dedup_by(|a, b| Arc::ptr_eq(a, b));
