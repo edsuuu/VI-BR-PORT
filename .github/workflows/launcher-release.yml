@@ -2,7 +2,7 @@ name: Release
 
 # Started by hand only. The launcher and the engine are released apart, each its
 # own download, version and tag (or both in one run, as two releases):
-#   launcher  v<version>          VI-BR-PORT-<version>-windows-x64.zip  ED_Launcher.exe
+#   launcher  v<version>          VI-BR-PORT-<version>-windows-x64.zip  VI-BR-Launcher.exe
 #                                 VI-BR-PORT-<version>-linux-x64.zip    vi-launcher (it starts victory.exe
 #                                                                       through Wine or Proton)
 #                                 latest.json: each launcher bundle's address, size and SHA-256
@@ -111,7 +111,7 @@ jobs:
         run: |
           out=bundle/linux-x64
           mkdir -p "$out"
-          cp target/release/ED_Launcher "$out/"
+          cp target/release/VI-BR-Launcher "$out/"
           cp LICENSE "$out/"
           (cd "$out" && zip -r "../${PREFIX}VI-BR-PORT-$VERSION-linux-x64.zip" .)
       - uses: actions/upload-artifact@v4

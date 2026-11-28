@@ -1,6 +1,6 @@
 # Builds and packs one of the two downloads, released apart, each one executable:
 #   scripts\build-bundle.ps1                 target\bundle\VI-BR-PORT-<version>-windows-x64.zip
-#                                            (ED_Launcher.exe alone: the engine is its own download)
+#                                            (VI-BR-Launcher.exe alone: the engine is its own download)
 #   scripts\build-bundle.ps1 -NoLauncher     target\bundle\VIctory-<version>-windows-x64.zip
 #                                            (victory.exe alone: the engine, for the launcher or play.ps1)
 # -Channel   stable (the plain names: what a release of main ships) or dev (the default here:
@@ -45,7 +45,7 @@ New-Item -ItemType Directory -Force $stage | Out-Null
 if ($NoLauncher) {
     Copy-Item -LiteralPath (Join-Path $release 'victory.exe') $stage
 } else {
-    Copy-Item -LiteralPath (Join-Path $release 'ED_Launcher.exe') $stage
+    Copy-Item -LiteralPath (Join-Path $release 'VI-BR-Launcher.exe') $stage
 }
 # The executable and its licence; how to use it is in the repository's README.
 Copy-Item -LiteralPath (Join-Path $root 'LICENSE') $stage

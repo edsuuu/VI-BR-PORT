@@ -34,7 +34,7 @@ pub fn start() -> ExitCode {
     let fullscreen = config::load(&paths::config_path()).config.fullscreen.unwrap_or(false);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(if update::DEV { "ED_Launcher dev" } else { "ED_Launcher" })
+            .with_title(if update::DEV { "VI-BR-Launcher dev · edsuuu" } else { "VI-BR-Launcher · edsuuu" })
             // The same mark as the executable's icon (mark.rs, build.rs).
             .with_icon(std::sync::Arc::new(egui::IconData { rgba: crate::mark::rgba(64), width: 64, height: 64 }))
             .with_inner_size(size)
@@ -43,7 +43,7 @@ pub fn start() -> ExitCode {
             .with_fullscreen(fullscreen),
         ..Default::default()
     };
-    match eframe::run_native(if update::DEV { "ED_Launcher dev" } else { "ED_Launcher" }, options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
+    match eframe::run_native(if update::DEV { "VI-BR-Launcher dev · edsuuu" } else { "VI-BR-Launcher · edsuuu" }, options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
@@ -366,7 +366,7 @@ impl App {
         let open = self.game_open();
         if open && self.tray.is_none() {
             let lang = self.language;
-            self.tray = Tray::new(ctx, "ED_Launcher", &text::get(lang, "tray.show"), &text::get(lang, "prep.close_game"));
+            self.tray = Tray::new(ctx, "VI-BR-Launcher", &text::get(lang, "tray.show"), &text::get(lang, "prep.close_game"));
             if self.tray.is_some() {
                 ctx.send_viewport_cmd(if HIDES {
                     egui::ViewportCommand::Visible(false)
