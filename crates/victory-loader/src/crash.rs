@@ -42,6 +42,19 @@ pub fn save_on_crash(ranges: Vec<(usize, usize, std::path::PathBuf)>) {
     let _ = SAVE.set(ranges);
 }
 
+/// What adds lines to an unhandled-exception report ([`note_on_crash`]).
+static NOTE: std::sync::OnceLock<fn(&[u64; 16]) -> String> = std::sync::OnceLock::new();
+
+/// Adds the lines `note` returns to every unhandled-exception report. It is
+/// given the faulting thread's general registers in the order instructions
+/// number them (rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8 to r15): a
+/// diagnostic of the GPU side (`VICTORY_SMASH_WATCH`) prints what it saw
+/// near them. It runs in the exception filter, so it must not wait for a
+/// lock another thread may hold.
+pub fn note_on_crash(note: fn(&[u64; 16]) -> String) {
+    let _ = NOTE.set(note);
+}
+
 /// The file crash reports are appended to, besides being printed.
 static LOG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
@@ -618,6 +631,16 @@ unsafe fn report(what: &str, info: *const EXCEPTION_POINTERS, to_file: bool) {
     ));
     for (i, pc) in unwind(*context).into_iter().enumerate() {
         line(format!("  #{i:<2} {}", locate(pc as usize)));
+    }
+    if to_file && let Some(note) = NOTE.get() {
+        let c = context;
+        let registers = [
+            c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi, c.R8, c.R9, c.R10, c.R11, c.R12,
+            c.R13, c.R14, c.R15,
+        ];
+        for l in note(&registers).lines() {
+            line(l.to_string());
+        }
     }
     if to_file {
         let said = title_output();

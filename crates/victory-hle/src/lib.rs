@@ -25,6 +25,8 @@ pub use registry::{HleExport, HleModule, registry};
 pub use victory_gpu::console;
 #[cfg(windows)]
 pub use victory_gpu::set_title_dir;
+#[cfg(windows)]
+pub use victory_gpu::smash_note;
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::replay;
 

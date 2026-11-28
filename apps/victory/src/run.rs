@@ -177,6 +177,10 @@ pub fn run(
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));
+    // What `VICTORY_SMASH_WATCH` saw goes with an unhandled exception's report
+    // (nothing when it is off).
+    #[cfg(windows)]
+    victory_loader::note_on_crash(victory_hle::smash_note);
     victory_hle::runtime::use_console_timers();
     // The title patches (upscaler picker, render scale) in every build: a
     // release build left them out with the other aids, and Series S then
