@@ -27,6 +27,12 @@ pub(super) fn own() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
 }
 
+/// Whether the submissions' own sends are on and their pass could be made:
+/// then the card never copies from a copy's CPU side.
+pub(super) fn ready(host: &Host) -> bool {
+    own() && pass(host).is_some()
+}
+
 /// Runs up to this many bytes go as pairs.
 const SHORT: usize = 256;
 
@@ -118,9 +124,10 @@ unsafe impl Send for Memory {}
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
-/// At most this much is kept (of the card's memory, with [`on_card`]).
+/// At most this much is kept (of the card's memory, with [`on_card`]);
+/// less with `VICTORY_SEND_KEPT_MB` or `VICTORY_LOW_RAM` (`crate::ram`).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    crate::ram::kept_send(if on_card() { 256 << 20 } else { 768 << 20 })
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -157,6 +164,11 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         data: data as usize,
         size,
     })
+}
+
+/// For the PC memory line: the bytes kept for the next submissions.
+pub(super) fn kept_bytes() -> u64 {
+    SPARE.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|m| m.size).sum()
 }
 
 /// The submission has run.

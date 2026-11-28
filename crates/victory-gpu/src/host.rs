@@ -123,7 +123,8 @@ pub(crate) fn long_ago(moment: u64, ms: u64, frames: u64) -> bool {
     (now >> 32).saturating_sub(moment >> 32) >= frames && tenths * 100 >= ms
 }
 
-/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`.
+/// Available physical RAM on the host in bytes, from `GlobalMemoryStatusEx`,
+/// at most [`assumed_free`].
 pub(crate) fn available_physical_ram() -> Option<u64> {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     // SAFETY: plain data the call fills in.
@@ -131,7 +132,24 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
     m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
     // SAFETY: a sized structure.
     let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
-    ok.then_some(m.ullAvailPhys)
+    ok.then_some(m.ullAvailPhys.min(assumed_free()))
+}
+
+/// The most free PC memory our caches are told there is, in bytes
+/// (`VICTORY_RAM_ASSUME_FREE_MB`; unset: no limit). With 20 to 40 GB free
+/// on the 64 GB machine the runs are measured on, windows of title memory,
+/// staging buffers and the pipeline library's file are kept for five
+/// minutes ([`ram_idle_ms`]); on a 16 GB PC, with under 4 GiB free, for 2
+/// to 10 seconds. Set to 3000, the big machine lets go as the small one
+/// does, and shows what it then holds, without a process that takes the
+/// memory and makes the system page.
+fn assumed_free() -> u64 {
+    static MOST: OnceLock<u64> = OnceLock::new();
+    *MOST.get_or_init(|| assumed_free_for(std::env::var("VICTORY_RAM_ASSUME_FREE_MB").ok().as_deref()))
+}
+
+fn assumed_free_for(setting: Option<&str>) -> u64 {
+    setting.and_then(|v| v.trim().parse::<u64>().ok()).map_or(u64::MAX, |mb| mb.saturating_mul(1 << 20))
 }
 
 /// How long host copies of textures the title fills must have been idle to
@@ -781,6 +799,13 @@ pub(crate) static MADE: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::
 /// (texture data copied from buffers, scratch too big for a chunk) and
 /// their bytes.
 pub(crate) static ALIVE: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// For the PC memory line (`crate::ram`): the bytes of submissions' send
+/// memory kept for the next ones (in the card's memory with
+/// `VICTORY_SEND_BAR=1`).
+pub(crate) fn send_kept() -> u64 {
+    send::kept_bytes()
+}
 
 /// About host lists, for the memory line: lists made by the host since the
 /// start; preludes made (a list's second allocator and list, made when it
@@ -2131,7 +2156,8 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                // (`VICTORY_SCRATCH_KEPT_MB`, `VICTORY_LOW_RAM`: less.)
+                spare.give(chunk, size, crate::ram::kept_scratch(if keep_freed() { SPARE_KEPT } else { SPARE_MOST }))
             } else {
                 Some(chunk)
             };
@@ -5112,8 +5138,26 @@ impl Host {
                             continue;
                         };
                         if own.is_none() {
-                            for &(a, b) in ranges {
-                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                            match staging {
+                                Some(staging) => {
+                                    for &(a, b) in ranges {
+                                        list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                    }
+                                }
+                                // A CPU side in our own memory
+                                // (`VICTORY_CARD_SIDE_PRIVATE`) has nothing
+                                // the card can copy from: the submission's
+                                // own sends could not be made.
+                                None if !ranges.is_empty() => {
+                                    static SAID: std::sync::Once = std::sync::Once::new();
+                                    SAID.call_once(|| {
+                                        tracing::error!(
+                                            "a submission's own sends could not be made and a title buffer's CPU side is our own \
+                                             memory (VICTORY_CARD_SIDE_PRIVATE=1): what changed in it did not go up"
+                                        );
+                                    });
+                                }
+                                None => {}
                             }
                         }
                         let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
@@ -10624,6 +10668,7 @@ impl Meter {
         let drops = crate::pipeline::take_drops();
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
+            crate::ram::tick();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -11323,6 +11368,14 @@ impl Host {
             shared[2] >> 20,
             shared[3] >> 20
         );
+    }
+
+    /// Whether the card never reads a copy's CPU side: the submissions' own
+    /// sends are on and their pass made, and the diagnostics' check of what
+    /// went up (which compares that side on the card) is off. Then the side
+    /// may be memory of our own (`VICTORY_CARD_SIDE_PRIVATE`).
+    pub(crate) fn sends_own_ready(&self) -> bool {
+        send::ready(self) && !upcheck::on()
     }
 
     /// A buffer in system memory that the CPU maps (write-back, so reading
@@ -12530,6 +12583,15 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!((ms, bytes), (5_000, 5 * gib));
         assert_eq!(vram_keep(100 * gib, 120 * gib), (1_500, 35 * gib));
         assert_eq!(vram_keep(0, 7).0, 5_000);
+    }
+
+    #[test]
+    fn free_memory_can_be_assumed_lower() {
+        use super::assumed_free_for;
+        assert_eq!(assumed_free_for(None), u64::MAX);
+        assert_eq!(assumed_free_for(Some(" 3000 ")), 3000 << 20);
+        assert_eq!(assumed_free_for(Some("lots")), u64::MAX);
+        assert_eq!(super::ram_idle_for(Some(assumed_free_for(Some("3000"))), true), 5_000);
     }
 
     #[test]

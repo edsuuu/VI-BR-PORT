@@ -325,8 +325,7 @@ pub(crate) fn texture_room() -> u64 {
     (lock(&TEXTURES).blocks() as u64 * BLOCK).saturating_sub(HELD.load(Ordering::Relaxed))
 }
 
-/// For the memory line: blocks of textures and of staging buffers, in MiB.
-#[cfg(feature = "diagnostics")]
+/// For the memory lines: blocks of textures and of staging buffers, in MiB.
 pub(crate) fn memory() -> [u64; 2] {
     [lock(&TEXTURES).blocks() as u64 * (BLOCK >> 20), lock(&STAGING).blocks() as u64 * (BLOCK >> 20)]
 }
@@ -348,11 +347,17 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
     }
     // Copies from a buffer begin at multiples of 512.
     let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
-        crate::host::name(&buffer, || "staging of textures (a block)".into());
-        Some(Upload(buffer, data))
-    })?;
+    let (piece, memory, again) = {
+        let mut pool = lock(&STAGING);
+        // Fewer with `VICTORY_STAGING_BLOCKS_KEPT` or `VICTORY_LOW_RAM`
+        // (`crate::ram`): they are the PC's memory, and were never given back.
+        pool.most = crate::ram::kept_staging_blocks(STAGING_KEPT);
+        pool.take(bytes, 512, now(), || {
+            let (buffer, data) = host.upload_buffer(BLOCK)?;
+            crate::host::name(&buffer, || "staging of textures (a block)".into());
+            Some(Upload(buffer, data))
+        })?
+    };
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };

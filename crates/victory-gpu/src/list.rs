@@ -263,6 +263,14 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 #[cfg(windows)]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
+/// [`IDLE_MOST`]'s count, or fewer with `VICTORY_IDLE_LISTS_MAX` or
+/// `VICTORY_LOW_RAM` (`crate::ram`): each idle list keeps its allocators'
+/// command memory (a host list cost 0.68 MB of private memory in run 69).
+#[cfg(windows)]
+fn idle_most() -> usize {
+    crate::ram::idle_lists(IDLE_MOST.0)
+}
+
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
@@ -339,7 +347,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= idle_most() {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -352,7 +360,7 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         }
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < idle_most() &&idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }

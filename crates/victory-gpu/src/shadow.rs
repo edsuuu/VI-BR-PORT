@@ -110,7 +110,7 @@ struct Card {
     /// The CPU's side, in the PC's memory: what `data` maps. Title memory
     /// is copied into it as into any copy, and what changed in it goes to
     /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    staging: Side,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -131,6 +131,93 @@ struct Card {
     me: std::sync::OnceLock<std::sync::Weak<Shadow>>,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
+}
+
+/// The CPU's side of a copy in the card's memory.
+enum Side {
+    /// A buffer in the PC's memory shared with the card (as before).
+    Shared(ID3D12Resource),
+    /// The process's own memory ([`private_sides`]): its address and bytes.
+    Private(usize, usize),
+}
+
+impl Side {
+    /// The buffer, if the side is one.
+    fn resource(&self) -> Option<&ID3D12Resource> {
+        match self {
+            Side::Shared(buffer) => Some(buffer),
+            Side::Private(..) => None,
+        }
+    }
+}
+
+impl Drop for Side {
+    fn drop(&mut self) {
+        if let Side::Private(at, len) = *self {
+            PRIVATE_SIDES.fetch_sub(len as u64, Ordering::Relaxed);
+            // SAFETY: our own allocation (`private_side`), released once.
+            unsafe { windows_sys::Win32::System::Memory::VirtualFree(at as *mut _, 0, windows_sys::Win32::System::Memory::MEM_RELEASE) };
+        }
+    }
+}
+
+/// Bytes alive of CPU sides in the process's own memory ([`private_sides`]).
+static PRIVATE_SIDES: AtomicU64 = AtomicU64::new(0);
+
+/// For the PC memory line: the bytes of title buffers' CPU sides that are
+/// the process's own memory, not memory shared with the card.
+pub(crate) fn private_side_bytes() -> u64 {
+    PRIVATE_SIDES.load(Ordering::Relaxed)
+}
+
+/// Whether the CPU's side of a title buffer's copy in the card's memory is
+/// the process's own memory instead of a buffer shared with the card
+/// (`VICTORY_CARD_SIDE_PRIVATE=1`; off by default).
+///
+/// That side is 786-789 MB in every diagnostics run of the prison, the boat
+/// and the opening (`copies alive` less the windows, docs/ram-mapa.md item
+/// 2), all of it committed buffers the system counts as the PC's memory
+/// shared with the card, however little of it the title ever wrote. With
+/// the submission's own sends (`VICTORY_SEND_OWN`, on by default) the card
+/// never reads it: what changed is taken out of it by the CPU into memory of
+/// the submission's own (`crate::host::send`), and what shaders wrote comes
+/// back by the card's compare and fetch. So it need not be a buffer at all.
+/// In memory of our own its pages are taken only once written (title
+/// memory copied in), and the system may page out those nobody touches, as
+/// it may not a buffer shared with the card.
+///
+/// Only with the own sends on and the diagnostics' check of what went up
+/// (`crate::host::upcheck`) off: both of those read the side on the card.
+/// The risk: if the submission's sends cannot be made (no memory for them)
+/// there is no buffer to copy from instead, and what changed does not go
+/// up for that submission (said once in the log). Read once.
+fn private_sides() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_CARD_SIDE_PRIVATE").is_some_and(|v| v == "1");
+        let on = asked && host().is_some_and(|h| h.sends_own_ready());
+        if asked {
+            tracing::info!(
+                on,
+                "title buffers' CPU sides in the process's own memory (VICTORY_CARD_SIDE_PRIVATE=1; needs VICTORY_SEND_OWN on and \
+                 VICTORY_UPCHECK off)"
+            );
+        }
+        on
+    })
+}
+
+/// `len` bytes of the process's own memory, zeroed, for a CPU side.
+fn private_side(len: u64) -> Option<(Side, *mut u8)> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    let len = usize::try_from(len).ok()?;
+    // SAFETY: a plain allocation of our own.
+    let at = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) }.cast::<u8>();
+    if at.is_null() {
+        return None;
+    }
+    PRIVATE_SIDES.fetch_add(len as u64, Ordering::Relaxed);
+    Some((Side::Private(at as usize, len), at))
 }
 
 /// Whether the host copies of big title buffers are in the card's own
@@ -4827,12 +4914,13 @@ impl Shadow {
         self.card.as_ref().map_or_else(Vec::new, |c| c.dirty.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
-    /// Of a copy in the card's memory: the CPU's side (PC memory), the
-    /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    /// Of a copy in the card's memory: the CPU's side (PC memory) if it is a
+    /// buffer (not with [`private_sides`]), the card side's bytes from
+    /// before if made yet, and their size.
+    pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some((card.staging.resource(), before, card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -5054,6 +5142,44 @@ impl Shadow {
 }
 
 #[cfg(test)]
+mod side_tests {
+    use super::*;
+
+    #[test]
+    fn a_private_side_is_zeroed_memory_of_our_own_given_back_when_dropped() {
+        let before = private_side_bytes();
+        let (side, at) = private_side(3 << 16).expect("memory");
+        assert!(side.resource().is_none(), "nothing the card could copy from");
+        assert_eq!(private_side_bytes() - before, 3 << 16);
+        // SAFETY: the allocation, 3 * 64 KiB.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(at, 3 << 16) };
+        assert!(bytes.iter().all(|&b| b == 0));
+        bytes[(3 << 16) - 1] = 7;
+        drop(side);
+        assert_eq!(private_side_bytes(), before);
+    }
+
+    #[test]
+    fn committed_memory_is_found_anywhere_in_a_range() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree};
+        const LEN: usize = 8 << 16;
+        // SAFETY: plain allocations of our own, inside the reservation.
+        unsafe {
+            let at = VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE, PAGE_NOACCESS) as u64;
+            assert_ne!(at, 0);
+            assert!(!any_committed(at, LEN as u64), "reserved only");
+            assert!(!VirtualAlloc((at + (5 << 16)) as *const _, 1 << 16, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(any_committed(at, LEN as u64), "one page late in the range");
+            assert!(!any_committed(at, 5 << 16), "the range before it");
+            assert_ne!(VirtualFree((at + (5 << 16)) as *mut _, 1 << 16, MEM_DECOMMIT), 0);
+            assert!(!any_committed(at, LEN as u64), "decommitted again");
+            assert_ne!(VirtualFree(at as *mut _, 0, MEM_RELEASE), 0);
+        }
+    }
+}
+
+#[cfg(test)]
 mod touched_tests {
     use super::*;
 
@@ -5124,7 +5250,7 @@ impl Shadow {
         let mut shadow = Shadow::new(none(), data, 0, start, len);
         if card {
             shadow.card = Some(Card {
-                staging: none(),
+                staging: Side::Shared(none()),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -5281,7 +5407,7 @@ mod land_tests {
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
-            staging: buffer,
+            staging: super::Side::Shared(buffer),
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -5693,11 +5819,31 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
-        crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        // With `private_sides` the buffer in the PC's memory is made only
+        // for a copy that has no card side: a card copy's CPU side is then
+        // memory of our own.
+        let early = if private_sides() { None } else { Some(host()?.shared_buffer(size)?) };
+        let on_card = card_for(size);
+        let (side, data) = match (early, &on_card) {
+            (Some((buffer, data)), _) => (Side::Shared(buffer), data),
+            (None, Some(_)) => match private_side(size) {
+                Some(made) => made,
+                None => {
+                    CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+                    return None;
+                }
+            },
+            (None, None) => {
+                let (buffer, data) = host()?.shared_buffer(size)?;
+                (Side::Shared(buffer), data)
+            }
+        };
+        if let Some(buffer) = side.resource() {
+            crate::host::name(buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        }
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let (buffer, card) = match on_card {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(
@@ -5706,7 +5852,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: buffer,
+                    staging: side,
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
@@ -5716,7 +5862,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                 };
                 (on_card, Some(card))
             }
-            None => (buffer, None),
+            // (Always a buffer: made above when there is no card side.)
+            None => (side.resource()?.clone(), None),
         };
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5834,6 +5981,73 @@ fn holder(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u64) -> 
         .max_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
 }
 
+/// Whether an ask takes a window that is there already and holds its range,
+/// instead of making the window its range names (`VICTORY_WINDOW_SHARE`;
+/// unset or `0`: off, each ask its named window, as before).
+///
+/// The same title memory lay in more than one window, each a copy in the
+/// PC's memory filled from it: an ask across a 4 MiB line names a window of
+/// both cells, and asks in either cell alone their own. Measured with the
+/// memory line (diagnostics runs of 2026-11-27 and 28): 6,848 MB of windows
+/// over 5,228 MB of title memory on the boat, 5,020 over 3,984 in the
+/// opening, 3,656 over 3,480 in the prison.
+///
+/// Of the windows that hold the ask, the oldest is taken ([`Shadow::id`]).
+/// A descriptor slot shows the copy its view found when it was made, and the
+/// pass that brings it up to date looks the view up again
+/// (`descriptor::host::buffer_copy`): both must find the same copy. The
+/// oldest that holds a range stays the oldest for as long as it lives (and
+/// the slot keeps it alive): a window made later is younger. (The longest
+/// would not: one made later can be longer.) A window that holds the range
+/// already keeps a new one from being made; those that lay over each other
+/// before stay until nothing holds them.
+///
+/// `=1`: any window that holds the range. A view then lies at another
+/// offset in its copy where the window begins in a cell below, and one
+/// whose offset is off its elements gets a copy of its own bytes
+/// (`descriptor::host::view_home`, [`exact`]), as such views always did.
+/// `=2`: only windows that begin where the named one would (the longer ones
+/// from the same line): no view's offset changes; less memory is shared.
+fn share() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_WINDOW_SHARE").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
+/// The longest window made so far: how far below an ask a window that
+/// holds it may begin.
+static LONGEST: AtomicU64 = AtomicU64::new(0);
+
+/// Of `windows` ((start, bytes), id; in order of start), the oldest (least
+/// id) that holds `[address, end)`; only those beginning at `from` if given.
+fn oldest_holder(windows: impl Iterator<Item = ((u64, u64), u64)>, address: u64, end: u64, from: Option<u64>) -> Option<(u64, u64)> {
+    windows
+        .filter(|&((start, bytes), _)| start <= address && start + bytes >= end && from.is_none_or(|f| f == start))
+        .min_by_key(|&(_, id)| id)
+        .map(|(key, _)| key)
+}
+
+/// [`oldest_holder`] in the table of windows, for an ask whose named window
+/// is `named`.
+fn shared_window(
+    map: &BTreeMap<(u64, u64), Arc<Shadow>>,
+    address: u64,
+    end: u64,
+    named: (u64, u64),
+) -> Option<Arc<Shadow>> {
+    let (low, from) = match share() {
+        1 => (address.saturating_sub(LONGEST.load(Ordering::Relaxed)), None),
+        2 => (named.0, Some(named.0)),
+        _ => return None,
+    };
+    let there = map.range((low, 0)..=(address, u64::MAX)).map(|(key, s)| (*key, s.id));
+    let key = oldest_holder(there, address, end, from)?;
+    map.get(&key).cloned()
+}
+
 /// Whether windows may be smaller than their 4 MiB cell (a finer grid, or
 /// tails): only then is there more than one window to choose from.
 fn fine() -> bool {
@@ -5850,9 +6064,76 @@ pub(crate) fn window_cover() -> u64 {
     cover(loose.keys().copied())
 }
 
+/// For the PC memory line (`crate::ram`, release builds too): windows alive
+/// and their bytes, the bytes of title memory they lie over (each byte
+/// once), and those a descriptor slot holds (a slot keeps the host buffer
+/// it views, `HostHeap::kept`) and their bytes. Under the read lock: the
+/// lookups go on meanwhile.
+///
+/// Then two measures of what could still be cut, each the most a change of
+/// docs/ram-mapa.md section 4 could take: the bytes of the windows' pages
+/// ever copied (the rest is zeros nothing wrote, what windows committed
+/// only where copied would not hold: 4.4), and the windows, and their
+/// bytes, whose title memory has no committed page left, then the bytes of
+/// those of them a slot holds (a slot of a view of memory the title let go:
+/// what the console would read there is stale, and only such windows could
+/// be let go under a slot without taking anything a shader reads: 4.6).
+pub(crate) fn ram_windows() -> [u64; 9] {
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    let mut out = [loose.len() as u64, 0, cover(loose.keys().copied()), 0, 0, 0, 0, 0, 0];
+    for s in loose.values() {
+        out[1] += s.len;
+        let slotted = crate::host::references(&s.buffer) > 1;
+        if slotted {
+            out[3] += 1;
+            out[4] += s.len;
+        }
+        let pages = s.copied.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|&&at| at != 0).count() as u64;
+        out[5] += (pages * PAGE as u64).min(s.len);
+        if s.place.is_none() && !any_committed(s.start, s.len) {
+            out[6] += 1;
+            out[7] += s.len;
+            if slotted {
+                out[8] += s.len;
+            }
+        }
+    }
+    out
+}
+
+/// Whether any page of `[start, start + len)` is committed memory of the
+/// process (title memory lives in it).
+fn any_committed(start: u64, len: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let end = start.saturating_add(len);
+    let mut at = start;
+    while at < end {
+        // SAFETY: a plain structure of integers and pointers, all zeros valid.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a query about our own address space into our structure.
+        let got = unsafe { VirtualQuery(at as *const _, &mut info, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+        if got == 0 {
+            return false;
+        }
+        if info.State == MEM_COMMIT {
+            return true;
+        }
+        let next = info.BaseAddress as u64 + info.RegionSize as u64;
+        if next <= at {
+            return false;
+        }
+        at = next;
+    }
+    false
+}
+
+/// Host copies alive and the bytes of title memory they copy ([`LIVE`]).
+pub(crate) fn alive() -> [u64; 2] {
+    [LIVE[0].load(Ordering::Relaxed), LIVE[1].load(Ordering::Relaxed)]
+}
+
 /// The bytes `windows` (start, bytes; in order of start) lie over, each
 /// byte once.
-#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
 fn cover(windows: impl Iterator<Item = (u64, u64)>) -> u64 {
     let (mut covered, mut reached) = (0, 0);
     for (start, bytes) in windows {
@@ -5935,7 +6216,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
-        staging,
+        staging: Side::Shared(staging),
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
@@ -5974,9 +6255,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
-            note(shadow);
-            return Some(shadow.clone());
+        let there = if share() > 0 { shared_window(&map, address, end, named) } else { map.get(&named).cloned() };
+        if let Some(shadow) = there {
+            note(&shadow);
+            return Some(shadow);
         }
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
@@ -5990,12 +6272,19 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         holder(there, address, end).unwrap_or(named)
     } else {
+        // (One may have been made since the look above.)
+        if let Some(shadow) = shared_window(&map, address, end, named) {
+            note(&shadow);
+            return Some(shadow);
+        }
         named
     };
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
     }
+    // How far below an ask a window that holds it may begin (`share`).
+    LONGEST.fetch_max(len, Ordering::Relaxed);
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
@@ -6025,7 +6314,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
-                staging: buffer,
+                staging: Side::Shared(buffer),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
@@ -6141,8 +6430,8 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, oldest_holder,
+        resolve_card_limits, tail_of, window_of,
     };
 
     #[test]
@@ -6194,6 +6483,25 @@ mod window_tests {
         // Of two as long, the one that begins lower.
         let two = [(cell + 0x8_0000, 0x8_0000), (cell + 0x4_0000, 0x8_0000)];
         assert_eq!(holder(two.into_iter(), ask, end), Some((cell + 0x4_0000, 0x8_0000)));
+    }
+
+    /// A shared window is the oldest that holds the ask, and stays the one
+    /// found when younger, longer ones are made.
+    #[test]
+    fn a_shared_window_is_the_oldest_that_holds_the_ask() {
+        let cell = 0xd_1200_0000u64;
+        let (ask, end) = (WINDOW + cell + 0x1000, WINDOW + cell + 0x2000);
+        // The named one is the second cell's; one of both cells holds it too.
+        let there = [((cell, 2 * WINDOW), 7u64), ((cell + WINDOW, WINDOW), 9), ((cell, WINDOW), 3)];
+        assert_eq!(oldest_holder(there.into_iter(), ask, end, None), Some((cell, 2 * WINDOW)));
+        // A younger, longer one made later is passed over.
+        let more = [((cell, 2 * WINDOW), 7u64), ((cell, 3 * WINDOW), 12), ((cell + WINDOW, WINDOW), 9)];
+        assert_eq!(oldest_holder(more.into_iter(), ask, end, None), Some((cell, 2 * WINDOW)));
+        // From the named one's line only.
+        assert_eq!(oldest_holder(more.into_iter(), ask, end, Some(cell + WINDOW)), Some((cell + WINDOW, WINDOW)));
+        // None that holds all of it.
+        let short = [((cell + WINDOW, 0x1800), 1u64)];
+        assert_eq!(oldest_holder(short.into_iter(), ask, end, None), None);
     }
 
     /// What windows lie over counts each byte once.
