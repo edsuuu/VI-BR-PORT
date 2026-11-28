@@ -281,7 +281,12 @@ impl App {
                         }
                     }
                     Event::Skipped(id) => set(prep, id, StepState::Skipped),
-                    Event::Done(id) => set(prep, id, StepState::Done),
+                    Event::Done(id) => {
+                        if id == StepId::Shaders {
+                            run::note_shader_total();
+                        }
+                        set(prep, id, StepState::Done)
+                    }
                     Event::Failed { step, code, log } => {
                         crashed |= step == StepId::Open;
                         set(prep, step, StepState::Failed);
@@ -776,21 +781,44 @@ impl App {
                             ui.label(theme::title(&text::get(lang, title), theme::type_size("titleLarge")));
                             ui.add(egui::Label::new(theme::small(&text::get(lang, "prep.subtitle"), "textSoft").size(theme::type_size("body"))).wrap());
                         });
+                        // The running step's own progress (the engine's lines in its log).
+                        let current = prep.steps.iter().find(|(_, s)| *s == StepState::Running).map(|(id, _)| *id);
+                        let part = current.and_then(run::step_progress);
                         ui.vertical(|ui| {
                             ui.spacing_mut().item_spacing.y = 4.0;
                             for (id, state) in &prep.steps {
-                                step_row(ui, lang, *id, *state);
+                                // A build that has nothing to do (the engine is in the launcher) is not shown.
+                                if *id == StepId::Build && *state == StepState::Skipped {
+                                    continue;
+                                }
+                                step_row(ui, lang, *id, *state, if Some(*id) == current { part } else { None });
                             }
                         });
-                        let done = prep.steps.iter().filter(|(_, s)| matches!(s, StepState::Done | StepState::Skipped)).count();
-                        let running = prep.steps.iter().any(|(_, s)| *s == StepState::Running);
-                        let fraction = (done as f32 + if running { 0.5 } else { 0.0 }) / prep.steps.len().max(1) as f32;
+                        let shown: Vec<_> = prep.steps.iter().filter(|(id, s)| !(*id == StepId::Build && *s == StepState::Skipped)).collect();
+                        let done = shown.iter().filter(|(_, s)| matches!(s, StepState::Done | StepState::Skipped)).count();
+                        let running = current.is_some();
+                        let fraction = (done as f32 + if running { part.unwrap_or(0.5) } else { 0.0 }) / shown.len().max(1) as f32;
                         theme::progress(ui, fraction);
                         if let Some(m) = &prep.message {
                             ui.horizontal(|ui| {
                                 theme::dot(ui, "rose");
                                 ui.add(egui::Label::new(theme::small(m, "text")).wrap());
                             });
+                        }
+                        // The log of the step running now, open under the steps (it can be folded).
+                        let log_step = current.or_else(|| prep.steps.iter().rev().find(|(_, s)| !matches!(s, StepState::Waiting)).map(|(id, _)| *id));
+                        if let Some(id) = log_step {
+                            egui::CollapsingHeader::new(theme::label(&text::get(lang, "logs.title")))
+                                .id_salt("prep-log")
+                                .default_open(true)
+                                .show(ui, |ui| {
+                                    let tail = run::tail(&run::log_path(id), 24 * 1024);
+                                    let mut shown = strip_ansi(&tail);
+                                    egui::ScrollArea::vertical().max_height(220.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
+                                        ui.add(egui::TextEdit::multiline(&mut shown).font(egui::TextStyle::Monospace).desired_width(f32::INFINITY).interactive(false));
+                                    });
+                                });
+                            ui.ctx().request_repaint_after(Duration::from_millis(300));
                         }
                         ui.horizontal(|ui| {
                             logs = theme::outline_button(ui, &text::get(lang, "prep.see_logs"), None, false).clicked();
@@ -828,7 +856,7 @@ impl App {
     fn logs_view(&mut self, ui: &mut egui::Ui, full: Rect) {
         let lang = self.language;
         if self.logs.read_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
-            self.logs.text = run::tail(&run::log_path(self.logs.step), LOG_TAIL);
+            self.logs.text = strip_ansi(&run::tail(&run::log_path(self.logs.step), LOG_TAIL));
             self.logs.read_at = Some(Instant::now());
         }
         let mut close = false;
@@ -1217,7 +1245,7 @@ fn open_folder(dir: &std::path::Path) {
     let _ = std::process::Command::new(program).arg(dir).spawn();
 }
 
-fn step_row(ui: &mut egui::Ui, lang: Language, id: StepId, state: StepState) {
+fn step_row(ui: &mut egui::Ui, lang: Language, id: StepId, state: StepState, part: Option<f32>) {
     let (mark, state_key) = match state {
         StepState::Waiting => (StepMark::Waiting, "prep.state.waiting"),
         StepState::Running => (StepMark::Current, "prep.state.running"),
@@ -1240,11 +1268,33 @@ fn step_row(ui: &mut egui::Ui, lang: Language, id: StepId, state: StepState) {
         let name = if current { theme::label(&name) } else { RichText::new(name).color(colour(ink)) };
         ui.label(name);
         ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-            let s = theme::small(&text::get(lang, state_key), ink);
+            let label = match part {
+                Some(f) => format!("{} · {:.0}%", text::get(lang, state_key), f * 100.0),
+                None => text::get(lang, state_key),
+            };
+            let s = theme::small(&label, ink);
             ui.label(if current { s.strong() } else { s });
             if current {
                 ui.spinner();
             }
         });
     });
+}
+
+/// A log as text without the terminal's colour codes.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '' && chars.peek() == Some(&'[') {
+            for d in chars.by_ref() {
+                if d.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }

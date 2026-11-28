@@ -251,6 +251,52 @@ fn now() -> i64 {
 }
 
 /// The log file of a step.
+/// How far a running step is, 0..1, from the progress lines the engine prints
+/// into its log: `shaders` prints "<n> shaders in the cache" (its total is
+/// the last run's, kept by [`note_shader_total`], or about this game's);
+/// `warm` prints "<n> of <total>". None while there is nothing to go by.
+pub fn step_progress(id: StepId) -> Option<f32> {
+    let log = tail(&log_path(id), 16 * 1024);
+    match id {
+        StepId::Shaders => {
+            let n = log.lines().rev().find_map(|l| shader_count(l.trim()))?;
+            Some((n as f32 / shader_total() as f32).min(0.99))
+        }
+        StepId::Warm => log.lines().rev().find_map(|l| {
+            let l = l.trim();
+            let (count, rest) = l.split_once(" of ")?;
+            let total = rest.split(',').next()?.trim().parse::<f32>().ok()?;
+            let count = count.trim().parse::<f32>().ok()?;
+            (total > 0.0).then(|| (count / total).min(1.0))
+        }),
+        _ => None,
+    }
+}
+
+/// "<n> shaders in the cache, ..." -> n.
+fn shader_count(line: &str) -> Option<usize> {
+    let (n, rest) = line.split_once(' ')?;
+    rest.starts_with("shaders in the cache").then(|| n.parse().ok()).flatten()
+}
+
+/// The shaders the last full run put in the cache (a file beside the logs);
+/// before any, about what this game has (25,776 on 28 Nov 2026).
+fn shader_total() -> usize {
+    std::fs::read_to_string(paths::data_dir().join("shader-total.txt"))
+        .ok()
+        .and_then(|t| t.trim().parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(25_800)
+}
+
+/// After the shaders step: keeps its total for the next run's progress.
+pub fn note_shader_total() {
+    let log = tail(&log_path(StepId::Shaders), 16 * 1024);
+    if let Some(n) = log.lines().rev().find(|l| l.contains("do not translate")).and_then(|l| shader_count(l.trim())) {
+        let _ = std::fs::write(paths::data_dir().join("shader-total.txt"), n.to_string());
+    }
+}
+
 pub fn log_path(id: StepId) -> PathBuf {
     paths::logs_dir().join(format!("{}.log", id.key()))
 }
@@ -382,6 +428,8 @@ fn spawn(plan: &Plan, step: &Step, log: &Path) -> std::io::Result<Child> {
         };
         args.extend(step.args.iter().cloned());
         let mut cmd = Command::new(program);
+        // Plain text in the logs the window shows (no terminal colour codes).
+        cmd.env("NO_COLOR", "1");
         cmd.args(&args).current_dir(paths::run_dir(&plan.victory));
         apply_env(&mut cmd, &plan.run.env);
         if std::env::var_os("VICTORY_GAME_DIR").is_none() {
