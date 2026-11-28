@@ -19,8 +19,9 @@
 //!   the translation at `+64`, added after it: `o' = M o + T`, `d' = M d`,
 //!   where a pointer at `+56` with its top bit set has no `M` (the identity);
 //! - a triangle node keeps two triangles: the geometry index above the
-//!   geometry flags at `+48`, the primitive index of triangle `k` at `+52 +
-//!   4k`, the triangle's vertex roles in byte `k` of `+60`;
+//!   geometry flags at `+48`, the primitive index of triangle 1 at `+56` and
+//!   of every other kind (0, 2, 3) at `+52`, the triangle's vertex roles in
+//!   byte `k` of `+60`;
 //! - a bottom level's header keeps its frame at `+60` (the critic's item 3);
 //!   the walks do not read it, the instance node's turn already takes the
 //!   ray there [inf], and the walk here only hands it on with each hit.
@@ -169,7 +170,7 @@ fn walk_inner(
                     instance_flags: inst.flags,
                     geometry: w[12] >> 8,
                     geometry_flags: w[12] & 0xff,
-                    primitive: w[13 + (k as usize & 1)],
+                    primitive: w[13 + usize::from(k == 1)],
                     clockwise: den > 0.0,
                     roles: w[15] >> (8 * k) & 0xff,
                     instance: inst.address,
@@ -351,6 +352,30 @@ mod tests {
         // Starting past the first: the second.
         let Walked::Hit(h) = walk(&m, TOP, [1.0, 1.0, 0.0], [0.0, 0.0, 1.0], 6.0, 100.0, 0xff) else { panic!() };
         assert_eq!(h.id, 9);
+    }
+
+    #[test]
+    fn kinds_two_and_three_take_the_first_primitive_index() {
+        let mut m = scene();
+        // The node's fifth vertex of kinds 2 and 3 is its words 12-14 read as
+        // floats: (4, 2, 5), so the geometry word, primitive 2.0's bits at +52
+        // and 5.0's at +56.
+        m.put(BLAS + 64 + 48, &bits(&[4.0, 2.0, 5.0]));
+        // Every triangle's roles I = 1, J = 2.
+        m.put(BLAS + 64 + 60, &[0x0909_0909]);
+        let around = [-1.0, -1.0, 4.0, 5.0, 5.0, 6.0];
+        let off = [f32::NAN; 6];
+        let mut b = vec![1 << 3 | 2, 1 << 3 | 3, bvh::NONE, bvh::NONE];
+        b.extend(bits(&around));
+        b.extend(bits(&around));
+        b.extend(bits(&off));
+        b.extend(bits(&off));
+        m.put(BLAS + 2 * 64, &b);
+        // Kind 2 (node vertices 2, 3, 4) at (3, 3.5); kind 3 (2, 4, 0) at (1, 2).
+        for at in [[3.0, 3.5, 0.0], [1.0, 2.0, 0.0]] {
+            let Walked::Hit(h) = walk(&m, TOP, at, [0.0, 0.0, 1.0], 0.0, 100.0, 0x01) else { panic!("{at:?}") };
+            assert_eq!((h.t, h.primitive), (5.0, 2f32.to_bits()), "{at:?}");
+        }
     }
 
     #[test]
