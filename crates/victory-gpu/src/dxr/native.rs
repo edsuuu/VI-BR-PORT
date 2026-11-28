@@ -497,6 +497,16 @@ pub(crate) fn line() {
         per(C::InstancesUnknown),
         per(C::InstancesUnreadable),
     );
+    if per(C::InstancesUnknown) > 0.0 {
+        let _ = write!(
+            text,
+            "; the bottom levels named that the host lacked (each once a top level): {:.1} recorded in a list not submitted yet, \
+             {:.1} let go or refused for memory and asked for again (VICTORY_DXR_KEEP), {:.1} never built by the host",
+            per(C::LackPending),
+            per(C::LackKept),
+            per(C::LackNever),
+        );
+    }
     if per(C::InstancesConsoleFlags) > 0.0 {
         let _ = write!(text, "; {:.0} instances held the console's own flags (taken off)", per(C::InstancesConsoleFlags));
     }

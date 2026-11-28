@@ -113,6 +113,13 @@ pub(super) enum C {
     InstancesUnknown,
     /// Of them, in memory the CPU could not read at submission.
     InstancesUnreadable,
+    /// The bottom levels top levels named that the host lacked (each once a
+    /// top level): recorded in a list not submitted yet; let go or refused
+    /// for memory, to be made again (`super::keep`); never built by the host
+    /// (refused, or never asked of the builder).
+    LackPending,
+    LackKept,
+    LackNever,
     /// Instances whose flags held the console's own bits (taken off).
     InstancesConsoleFlags,
     /// Builds whose flags held bits the PC does not know (taken off).

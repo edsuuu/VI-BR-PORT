@@ -111,12 +111,22 @@ fn rewrite(instances: u64, count: usize, to: usize, top: &Arc<Structure>) {
     let frame = crate::frame::current();
     let (mut named, unknown) = {
         let mut table = native::table();
+        // The bottom levels named that the host lacks, each once.
+        let mut lacking = std::collections::HashSet::new();
         rename(out, |blas| {
             let found = table.usable(blas, frame);
-            // One the host let go or had no memory for is made again at the
-            // next recording of ours (`super::keep`).
-            if found.is_none() && table.get(blas).is_none() {
-                super::keep::want(blas, frame);
+            if found.is_none() && lacking.insert(blas) {
+                let why = if table.get(blas).is_some() {
+                    // Recorded in a list not submitted yet.
+                    C::LackPending
+                } else if super::keep::want(blas, frame) {
+                    // Let go or refused for memory: made again at the next
+                    // recording of top levels of ours (`super::keep`).
+                    C::LackKept
+                } else {
+                    C::LackNever
+                };
+                add(why, 1);
             }
             found.map(|v| (v.gpu(), v))
         })
