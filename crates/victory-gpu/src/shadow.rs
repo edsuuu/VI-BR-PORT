@@ -5264,6 +5264,73 @@ fn holder(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u64) -> 
         .max_by_key(|&(start, bytes)| (bytes, std::cmp::Reverse(start)))
 }
 
+/// Whether an ask takes a window that is there already and holds its range,
+/// instead of making the window its range names (`VICTORY_WINDOW_SHARE`;
+/// unset or `0`: off, each ask its named window, as before).
+///
+/// The same title memory lay in more than one window, each a copy in the
+/// PC's memory filled from it: an ask across a 4 MiB line names a window of
+/// both cells, and asks in either cell alone their own. Measured with the
+/// memory line (diagnostics runs of 2026-11-27 and 28): 6,848 MB of windows
+/// over 5,228 MB of title memory on the boat, 5,020 over 3,984 in the
+/// opening, 3,656 over 3,480 in the prison.
+///
+/// Of the windows that hold the ask, the oldest is taken ([`Shadow::id`]).
+/// A descriptor slot shows the copy its view found when it was made, and the
+/// pass that brings it up to date looks the view up again
+/// (`descriptor::host::buffer_copy`): both must find the same copy. The
+/// oldest that holds a range stays the oldest for as long as it lives (and
+/// the slot keeps it alive): a window made later is younger. (The longest
+/// would not: one made later can be longer.) A window that holds the range
+/// already keeps a new one from being made; those that lay over each other
+/// before stay until nothing holds them.
+///
+/// `=1`: any window that holds the range. A view then lies at another
+/// offset in its copy where the window begins in a cell below, and one
+/// whose offset is off its elements gets a copy of its own bytes
+/// (`descriptor::host::view_home`, [`exact`]), as such views always did.
+/// `=2`: only windows that begin where the named one would (the longer ones
+/// from the same line): no view's offset changes; less memory is shared.
+fn share() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_WINDOW_SHARE").ok().as_deref().map(str::trim) {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
+/// The longest window made so far: how far below an ask a window that
+/// holds it may begin.
+static LONGEST: AtomicU64 = AtomicU64::new(0);
+
+/// Of `windows` ((start, bytes), id; in order of start), the oldest (least
+/// id) that holds `[address, end)`; only those beginning at `from` if given.
+fn oldest_holder(windows: impl Iterator<Item = ((u64, u64), u64)>, address: u64, end: u64, from: Option<u64>) -> Option<(u64, u64)> {
+    windows
+        .filter(|&((start, bytes), _)| start <= address && start + bytes >= end && from.is_none_or(|f| f == start))
+        .min_by_key(|&(_, id)| id)
+        .map(|(key, _)| key)
+}
+
+/// [`oldest_holder`] in the table of windows, for an ask whose named window
+/// is `named`.
+fn shared_window(
+    map: &BTreeMap<(u64, u64), Arc<Shadow>>,
+    address: u64,
+    end: u64,
+    named: (u64, u64),
+) -> Option<Arc<Shadow>> {
+    let (low, from) = match share() {
+        1 => (address.saturating_sub(LONGEST.load(Ordering::Relaxed)), None),
+        2 => (named.0, Some(named.0)),
+        _ => return None,
+    };
+    let there = map.range((low, 0)..=(address, u64::MAX)).map(|(key, s)| (*key, s.id));
+    let key = oldest_holder(there, address, end, from)?;
+    map.get(&key).cloned()
+}
+
 /// Whether windows may be smaller than their 4 MiB cell (a finer grid, or
 /// tails): only then is there more than one window to choose from.
 fn fine() -> bool {
@@ -5426,9 +5493,10 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // The window is there already (nearly always): readers share the lock.
     if !(unsized_ask && tails()) && !(any && fine() && !unsized_ask) {
         let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
-        if let Some(shadow) = map.get(&named) {
-            note(shadow);
-            return Some(shadow.clone());
+        let there = if share() > 0 { shared_window(&map, address, end, named) } else { map.get(&named).cloned() };
+        if let Some(shadow) = there {
+            note(&shadow);
+            return Some(shadow);
         }
     }
     let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
@@ -5442,12 +5510,19 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         let there = map.range((cell, 0)..=(address, u64::MAX)).map(|(key, _)| *key);
         holder(there, address, end).unwrap_or(named)
     } else {
+        // (One may have been made since the look above.)
+        if let Some(shadow) = shared_window(&map, address, end, named) {
+            note(&shadow);
+            return Some(shadow);
+        }
         named
     };
     if let Some(shadow) = map.get(&(start, len)) {
         note(shadow);
         return Some(shadow.clone());
     }
+    // How far below an ask a window that holds it may begin (`share`).
+    LONGEST.fetch_max(len, Ordering::Relaxed);
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
     if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
@@ -5593,8 +5668,8 @@ pub(crate) fn exact_line(frames: f64) {
 #[cfg(test)]
 mod window_tests {
     use super::{
-        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, resolve_card_limits,
-        tail_of, window_of,
+        WINDOW, cover, default_card_limits_mb, grid, holder, longest_tail, oldest_holder,
+        resolve_card_limits, tail_of, window_of,
     };
 
     #[test]
@@ -5646,6 +5721,25 @@ mod window_tests {
         // Of two as long, the one that begins lower.
         let two = [(cell + 0x8_0000, 0x8_0000), (cell + 0x4_0000, 0x8_0000)];
         assert_eq!(holder(two.into_iter(), ask, end), Some((cell + 0x4_0000, 0x8_0000)));
+    }
+
+    /// A shared window is the oldest that holds the ask, and stays the one
+    /// found when younger, longer ones are made.
+    #[test]
+    fn a_shared_window_is_the_oldest_that_holds_the_ask() {
+        let cell = 0xd_1200_0000u64;
+        let (ask, end) = (WINDOW + cell + 0x1000, WINDOW + cell + 0x2000);
+        // The named one is the second cell's; one of both cells holds it too.
+        let there = [((cell, 2 * WINDOW), 7u64), ((cell + WINDOW, WINDOW), 9), ((cell, WINDOW), 3)];
+        assert_eq!(oldest_holder(there.into_iter(), ask, end, None), Some((cell, 2 * WINDOW)));
+        // A younger, longer one made later is passed over.
+        let more = [((cell, 2 * WINDOW), 7u64), ((cell, 3 * WINDOW), 12), ((cell + WINDOW, WINDOW), 9)];
+        assert_eq!(oldest_holder(more.into_iter(), ask, end, None), Some((cell, 2 * WINDOW)));
+        // From the named one's line only.
+        assert_eq!(oldest_holder(more.into_iter(), ask, end, Some(cell + WINDOW)), Some((cell + WINDOW, WINDOW)));
+        // None that holds all of it.
+        let short = [((cell + WINDOW, 0x1800), 1u64)];
+        assert_eq!(oldest_holder(short.into_iter(), ask, end, None), None);
     }
 
     /// What windows lie over counts each byte once.
