@@ -1145,6 +1145,22 @@ impl Player {
                         .filter(|v| *v > 64)
                         .collect();
                     bases.dedup();
+                    if let Ok(extra) = std::env::var("VICTORY_RES_EXTRA") {
+                        for n in extra.split(',').filter_map(|n| n.trim().parse::<u32>().ok()) {
+                            say(format!("  extra resource {n}: {}", self.called(n)));
+                        }
+                    }
+                    if let Ok(extra) = std::env::var("VICTORY_SLOTS_EXTRA") {
+                        for n in extra.split(',').filter_map(|n| n.trim().parse::<u32>().ok()) {
+                            let s = self.slot_at(heap, n, i);
+                            say(format!("  extra slot {n}: {}", self.slot_text(&s)));
+                            for (k, sub) in self.frame.submits.iter().enumerate() {
+                                for (h, at, v) in sub.views.iter().filter(|(h, at, _)| *h == heap && *at == n) {
+                                    say(format!("    write in submit {k} heap {h} slot {at}: {}", self.slot_text(v)));
+                                }
+                            }
+                        }
+                    }
                     for base in bases {
                         for k in 0..12 {
                             let s = self.slot_at(heap, base + k, i);
@@ -1208,13 +1224,20 @@ impl Player {
         match s.kind {
             slot::CBV => format!("cbv {res} +{:#x} size {:#x}", s.address(), word(2)),
             _ => format!(
-                "{kind} format {} dimension {} first {} count {} stride {} flags {}: {res}",
+                "{kind} format {} dimension {} first {} count {} stride {} flags {}: {res}{}",
                 word(0),
                 word(1),
                 word(if s.kind == slot::SRV { 4 } else { 2 }),
                 word(if s.kind == slot::SRV { 6 } else { 4 }),
                 word(if s.kind == slot::SRV { 7 } else { 5 }),
                 word(8),
+                // A view that names no resource: the title's own words say what it looked at.
+                if s.res == NONE {
+                    let words: Vec<String> = (0..13).map(|i| format!("{:08x}", word(i))).collect();
+                    format!(" (words {})", words.join(" "))
+                } else {
+                    String::new()
+                },
             ),
         }
     }

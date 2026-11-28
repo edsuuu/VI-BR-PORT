@@ -532,8 +532,12 @@ fn translate(
     let paired = emit::paired_names_any() && emit::paired_named(&hash);
     // (`VICTORY_EARLY_DEPTH_FOR`: early depth for the programs it names, as a run has it)
     let early = emit::early_depth_names_any() && emit::early_depth_named(&hash);
-    emit::with_early_depth_named(early, || {
-        emit::with_paired_first(paired, || translate_programs(&container, programs, &example, t, checks))
+    // (`VICTORY_NULL_FILL_FOR`: the fill for all-zero samples, likewise)
+    let fill = emit::null_fill_names_any() && emit::null_fill_named(&hash);
+    emit::with_null_fill_named(fill, || {
+        emit::with_early_depth_named(early, || {
+            emit::with_paired_first(paired, || translate_programs(&container, programs, &example, t, checks))
+        })
     });
     if let (Some(dir), Some(before)) = (dump, before) {
         for (reason, (n, _)) in &t.failed {
