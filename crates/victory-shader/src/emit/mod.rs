@@ -569,10 +569,9 @@ pub fn early_depth_names_any() -> bool {
     std::env::var_os("VICTORY_EARLY_DEPTH_FOR").is_some_and(|v| !v.is_empty())
 }
 
-/// Whether the paired form is tried for the program being translated: `VICTORY_WAVE_PAIRED=1`
-/// (every program), or [`with_paired_first`]. Off by default: each host lane does the work of
-/// two console lanes, and the form is new.
-fn paired_on() -> bool {
+/// Whether the paired form was explicitly requested for this program by `VICTORY_WAVE_PAIRED=1`
+/// or [`with_paired_first`].
+fn paired_requested() -> bool {
     static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     PAIRED_FIRST.get() || *ALL.get_or_init(|| std::env::var_os("VICTORY_WAVE_PAIRED").is_some_and(|v| v == "1"))
 }
@@ -661,18 +660,22 @@ pub fn emit(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        let try_paired = |name| {
+            let again = emit_paired(c, native, p, st);
+            lower::take_needs();
+            lower::take_meets();
+            report(name, &again);
+            match again {
+                Ok((shader, Some(32))) => Some(shader),
+                _ => None,
+            }
+        };
         // A program named in `VICTORY_WAVE_PAIRED_FOR` ([`with_paired_first`]) tries the paired
         // form before any other: the forms the chain counts as exact may still be the wrong
         // ones for it (the water's tile list, `CS_TransmissionVolumetrics_GenerateTiles`, ends
         // in one whose exchanges where not every lane runs a run cannot see).
-        if PAIRED_FIRST.get() {
-            let again = emit_paired(c, native, p, st);
-            lower::take_needs();
-            lower::take_meets();
-            report("paired, named", &again);
-            if done(&again) {
-                return again.map(|(shader, _)| shader);
-            }
+        if PAIRED_FIRST.get() && let Some(shader) = try_paired("paired, named") {
+            return Ok(shader);
         }
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
@@ -933,14 +936,8 @@ pub fn emit(
                 // (`VICTORY_WAVE_PAIRED=1`; a program named in `VICTORY_WAVE_PAIRED_FOR` tried it first):
                 // here, past every exact form the program had before, so a program it takes
                 // is one that would have ended wave-wide, approximate or refused.
-                if paired_on() && !PAIRED_FIRST.get() {
-                    let again = emit_paired(c, native, p, st);
-                    lower::take_needs();
-                    lower::take_meets();
-                    report("paired", &again);
-                    if done(&again) {
-                        return again.map(|(shader, _)| shader);
-                    }
+                if paired_requested() && !PAIRED_FIRST.get() && let Some(shader) = try_paired("paired") {
+                    return Ok(shader);
                 }
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
@@ -1025,6 +1022,15 @@ pub fn emit(
             if done(&again) {
                 return again.map(|(shader, _)| shader);
             }
+        }
+        // A divergent first-lane read cannot rely on both host waves reaching a group barrier.
+        // The paired form keeps both halves in one host wave, so it can read the console's
+        // first active lane. Try it here for programs still failing after the existing forms.
+        if matches!(&original, Err(ShaderError::Unsupported { what: lower::FIRST_LANE_DIVERGENT, .. }))
+            && !paired_requested()
+            && let Some(shader) = try_paired("paired for a divergent first-lane read")
+        {
+            return Ok(shader);
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane

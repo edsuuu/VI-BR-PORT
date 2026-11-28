@@ -459,6 +459,8 @@ pub(super) const LANE_MASK: Why = "a lane mask read as data";
 /// run that block are not all of the wave.
 pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read as data";
 
+pub(super) const FIRST_LANE_DIVERGENT: Why = "a first-lane read where not every lane runs";
+
 /// Instructions that read a lane mask (not EXEC implicitly, not a lane's
 /// bit) as a number.
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
@@ -9283,7 +9285,7 @@ impl<'a> Lower<'a> {
                             return int(self, mine);
                         }
                         need(self.cur_ir);
-                        return Err("a first-lane read where not every lane runs");
+                        return Err(FIRST_LANE_DIVERGENT);
                     }
                     let c = self.cur;
                     if guard.is_none() && super::shader_opt() & super::bitcode::opt::FIRST != 0 {
