@@ -389,6 +389,11 @@ pub(crate) fn views_gone(at: usize, len: usize) {
 /// addresses too, in address order, each with those; not the ones it shows
 /// in very many views (`crate::watch::MANY_VIEWS`).
 pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize>)> {
+    shown_elsewhere_up_to(start, end, crate::watch::MANY_VIEWS)
+}
+
+/// [`shown_elsewhere`], of the pages shown in at most `most` views.
+fn shown_elsewhere_up_to(start: usize, end: usize, most: usize) -> Vec<(usize, Vec<usize>)> {
     let v = views();
     let mut out = Vec::new();
     if start >= end || v.pages_twice == 0 {
@@ -401,7 +406,7 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
             let Some(shown) = v.pages.get(&(section, offset + (page - base) as u64)) else {
                 continue;
             };
-            if (2..=crate::watch::MANY_VIEWS).contains(&shown.len()) {
+            if (2..=most).contains(&shown.len()) {
                 out.push((page, shown.iter().copied().filter(|&at| at != page).collect()));
             }
         }
@@ -411,10 +416,13 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
 
 /// The bytes `[at, at + len)` at the other addresses that show the same
 /// physical pages ([`shown_elsewhere`]): `(address, bytes)` for each page
-/// and each other address, the part of the page the range covers.
+/// and each other address, the part of the page the range covers. Of pages
+/// shown in very many views too, unlike [`shown_elsewhere`] (which is for
+/// the guards, a protection call each): a write is told at every address
+/// that shows it, and each is one range kept for the texture pass.
 pub(crate) fn ranges_elsewhere(at: usize, len: usize) -> Vec<(usize, usize)> {
     let end = at.saturating_add(len);
-    elsewhere_parts(at, end, &shown_elsewhere(at & !(K64 - 1), end))
+    elsewhere_parts(at, end, &shown_elsewhere_up_to(at & !(K64 - 1), end, usize::MAX))
 }
 
 /// [`ranges_elsewhere`] from what [`shown_elsewhere`] said of the pages.
@@ -1346,6 +1354,30 @@ pub(crate) mod tests {
         assert_eq!(parts, vec![(b + 0x8000, 0x8000), (b + 8 * K64 + 0x8000, 0x8000), (b + K64, 0x1000)]);
         // A page the range does not reach gives nothing.
         assert!(elsewhere_parts(a, a + 0x100, &[(a + K64, vec![b])]).is_empty());
+    }
+
+    /// A write is told at every other address of its page, even of one
+    /// shown in more views than the guards take together: the pool's page
+    /// mapped at many places of the title's tiled heap.
+    #[test]
+    fn a_write_is_told_at_every_view_of_a_page_shown_in_many() {
+        // Addresses nothing has: only the record is asked.
+        let (pool, heap) = (0x7ff3_0000_0000_usize, 0x7ff4_0000_0000_usize);
+        let views = crate::watch::MANY_VIEWS + 6;
+        title_memory_view(pool, K64, 91, 5 * K64 as u64);
+        for k in 0..views {
+            title_memory_view(heap + k * 2 * K64, K64, 91, 5 * K64 as u64);
+        }
+        // The guards' look leaves such a page out; the write's does not.
+        assert!(shown_elsewhere(pool, pool + K64).is_empty());
+        let told = ranges_elsewhere(pool + 0x100, 0x200);
+        assert_eq!(told.len(), views);
+        assert!(told.iter().all(|&(at, len)| len == 0x200 && (at - 0x100 - heap).is_multiple_of(2 * K64)));
+        views_gone(pool, K64);
+        for k in 0..views {
+            views_gone(heap + k * 2 * K64, K64);
+        }
+        assert!(ranges_elsewhere(pool, K64).is_empty());
     }
 
     /// Views as the runtime tells them: a range inside one view, or over

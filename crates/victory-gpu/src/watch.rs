@@ -2516,6 +2516,13 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
     for other in elsewhere.into_iter().flat_map(|(_, others)| others) {
         crate::descriptor::host::remapped(other, BLOCK);
     }
+    if writes_elsewhere() {
+        // Also where a page is shown in very many views, and without the
+        // guards' switch (`VICTORY_VIEW_GUARD`).
+        for &(at, len) in spans {
+            told_elsewhere(at, len);
+        }
+    }
     (noted, before)
 }
 
@@ -3117,6 +3124,14 @@ pub fn writing(at: usize, len: usize) {
 /// 4 to 400 frames) fell on a changed page. Every other page kept what was
 /// there before: other textures' bytes, a 64 KiB square of each over a
 /// character's shirt and face for the whole run (capture-10, capture-6).
+///
+/// The same switch has every other write the guards do not see told at
+/// every address of its pages: through [`writing`] (ours into title memory,
+/// `crate::host::copy_mapped`: the title's buffer copies at submission,
+/// textures copied back; what shaders wrote landing, [`landing`]), the
+/// kernel's ([`kernel_writing`]: file reads, DirectStorage to an address;
+/// told again when its bytes are there), and what lands beside the guards
+/// ([`landed_beside`]: also past [`MANY_VIEWS`]).
 fn writes_elsewhere() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WRITES_ELSEWHERE").is_some_and(|v| v == "1"))
@@ -3151,8 +3166,8 @@ fn told_elsewhere(at: usize, len: usize) {
 }
 
 /// The kernel writes title memory `[at, at + len)` until what this returns
-/// is dropped ([`kernel_writing`]).
-pub struct KernelWrite(usize, usize);
+/// is dropped ([`kernel_writing`]): blocks, and the bytes.
+pub struct KernelWrite(usize, usize, usize, usize);
 
 /// The runtime is about to have the kernel write title memory
 /// `[at, at + len)` (a file read): its guarded blocks are opened, as by
@@ -3178,13 +3193,23 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
         }
     }
     crate::descriptor::host::remapped(at, len);
-    KernelWrite(first, if len == 0 { first } else { last })
+    if writes_elsewhere() {
+        told_elsewhere(at, len);
+    }
+    KernelWrite(first, if len == 0 { first } else { last }, at, len)
 }
 
 impl Drop for KernelWrite {
     fn drop(&mut self) {
         if self.0 == self.1 {
             return;
+        }
+        // The bytes are there now. Told before the write only, a texture
+        // pass in between (the read of a big file takes longer than a
+        // frame) uploaded what was there before, and nothing said so again.
+        if writes_elsewhere() {
+            crate::descriptor::host::remapped(self.2, self.3);
+            told_elsewhere(self.2, self.3);
         }
         let mut g = guards();
         if let Some(i) = g.kernel.iter().position(|&r| r == (self.0, self.1)) {
