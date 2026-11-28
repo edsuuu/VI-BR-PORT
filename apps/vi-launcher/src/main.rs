@@ -107,7 +107,15 @@ fn cli(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
-        other => Err(format!("unknown argument {other}: --version, --check <folder>, --updates")),
+        "--settings" => {
+            let path = paths::config_path();
+            let loaded = config::load(&path);
+            println!("{}", path.display());
+            println!("game: {:?}", loaded.config.game_exe);
+            println!("saves: {:?}", loaded.config.saves_dir);
+            Ok(())
+        }
+        other => Err(format!("unknown argument {other}: --version, --check <folder>, --updates, --settings")),
     }
 }
 
