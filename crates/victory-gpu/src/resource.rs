@@ -1869,9 +1869,11 @@ pub(crate) fn targets_presented(frame: u64) {
     static LAST_DRAWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let drawn = crate::draw::drawn();
     let before = LAST_DRAWN.swap(drawn, Relaxed);
-    if drawn.saturating_sub(before) >= 500 && WORLD_AT.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok() {
+    let world = drawn.saturating_sub(before) >= 500 && WORLD_AT.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok();
+    if world {
         tracing::info!(frame, "the world's first frame (500 draws or more): what its targets take is measured from here on");
     }
+    crate::lutwatch::presented(frame, world);
     // Once a second.
     static SECOND: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let now_ms = crate::host::now_ms();

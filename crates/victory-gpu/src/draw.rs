@@ -1714,6 +1714,12 @@ impl State {
             STORES.set(true);
             #[cfg(feature = "diagnostics")]
             PED_STAGE.set(false);
+            if stage.shader.lut == Some(crate::lutwatch::Role::ToneMap) && crate::lutwatch::probing() {
+                crate::lutwatch::note_tone_map(self.lut_bindings(&stage.shader.hash, &t.used, compute));
+            }
+            if crate::lutwatch::null_3d_linear() {
+                self.null_samplers_linear(&t.used, compute);
+            }
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return false;
@@ -3160,11 +3166,19 @@ impl State {
             }
             return;
         }
+        // A bake of the colour grading's table: counted for the line at the
+        // world's first frame.
+        let lut_bake = crate::pipeline::shaders_any(self.pipeline as This, |s| {
+            s.lut == Some(crate::lutwatch::Role::Bake)
+        });
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
             );
+            if lut_bake {
+                crate::lutwatch::note_bake(false, || crate::pipeline::shader_hashes(self.pipeline as This));
+            }
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             {
@@ -3179,6 +3193,11 @@ impl State {
         }
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
+            if lut_bake {
+                crate::lutwatch::note_bake(false, || {
+                    format!("{} (not bound)", crate::pipeline::shader_hashes(self.pipeline as This))
+                });
+            }
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
             if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3212,6 +3231,9 @@ impl State {
         }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        if lut_bake {
+            crate::lutwatch::note_bake(true, String::new);
+        }
         #[cfg(feature = "diagnostics")]
         list.note_after(|| format!("after {}", p.name));
         self.buffers_written();
@@ -3724,6 +3746,79 @@ impl State {
             }
         }
         note_empty(host, index, handle, u);
+    }
+
+    /// What a stage reads, for the colour grading's line
+    /// ([`crate::lutwatch`]): each view with its dimension and format, each
+    /// sampler with its filter, or "null" for a slot whose title record holds
+    /// no sampler (its host slot holds the plain point sampler).
+    fn lut_bindings(&self, hash: &str, used: &[UsedResource], compute: bool) -> String {
+        use std::fmt::Write as _;
+        let mut text = format!("ps {hash}:");
+        for u in used {
+            let register = match u.kind {
+                ResourceType::Srv => 't',
+                ResourceType::Sampler => 's',
+                ResourceType::Uav => 'u',
+                // (Constants say nothing of the table.)
+                _ => continue,
+            };
+            let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
+                (RootType::Table, Some(Root::Table(table))) => {
+                    match crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) {
+                        Some(view) => lut_view_text(&view),
+                        None if u.kind == ResourceType::Sampler => "null sampler (point)".to_owned(),
+                        None => "no view".to_owned(),
+                    }
+                }
+                (RootType::Table, _) => "no table bound".to_owned(),
+                (RootType::ImmediateSampler, _) => "sampler in the code".to_owned(),
+                (root, _) => format!("{root:?}"),
+            };
+            let _ = write!(text, " {register}{}={what};", u.lower_bound);
+        }
+        text
+    }
+
+    /// `VICTORY_NULL_SAMPLER_3D_LINEAR=1`: the sampler slots a stage reads
+    /// whose title record holds no sampler get a linear sampler instead of
+    /// the plain point one, if the stage reads a 3D texture. A colour
+    /// grading table read by point gives every channel its own steps, over
+    /// the whole picture. (Which sampler a sample pairs with which view is
+    /// not known here: a stage reading a 3D texture is the whole test.)
+    fn null_samplers_linear(&self, used: &[UsedResource], compute: bool) {
+        let handle = |u: &UsedResource| match self.roots_ref(compute).get(usize::from(u.slot)) {
+            Some(Root::Table(table)) if u.root == RootType::Table => Some(table + u64::from(u.table_offset_dwords) * 4),
+            _ => None,
+        };
+        // Cheap first: most stages have a sampler in every slot they read.
+        let mut empty = used
+            .iter()
+            .filter(|u| u.kind == ResourceType::Sampler)
+            .filter_map(handle)
+            .filter(|&h| crate::descriptor::view(h).is_none())
+            .peekable();
+        if empty.peek().is_none() {
+            return;
+        }
+        let reads_3d = used
+            .iter()
+            .filter(|u| u.kind == ResourceType::Srv)
+            .filter_map(handle)
+            .filter_map(crate::descriptor::view)
+            .any(|view| srv_dimension(&view).is_some_and(|(d, _)| d == D3D12_SRV_DIMENSION_TEXTURE3D.0 as u32));
+        if !reads_3d {
+            return;
+        }
+        for h in empty {
+            let Some(heap) = self.heap_of(h) else {
+                continue;
+            };
+            if let (Some(host), Some(index)) = (heap.host(), heap.index(h)) {
+                once!("a sampler slot without a sampler, read with a 3D texture, made linear (VICTORY_NULL_SAMPLER_3D_LINEAR=1)");
+                host.linear_sampler(index);
+            }
+        }
     }
 
     /// The descriptors a shader reads through tables. Tables holding a
@@ -4695,6 +4790,61 @@ fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
 
 /// Gets what a shader reads or writes through a view ready: buffer data
 /// copied, textures moved to the state they need.
+/// A shader resource view's host dimension (`D3D12_SRV_DIMENSION`: 4 2D,
+/// 8 3D, ...) and format; `None` for other views.
+fn srv_dimension(view: &View) -> Option<(u32, u32)> {
+    match view {
+        View::Shader(_, Some(desc)) => Some((desc[1], desc[0])),
+        View::Shader(r, None) => {
+            let resource = crate::resource::host_resource(*r as This)?;
+            // SAFETY: a live host resource.
+            let desc = unsafe { resource.GetDesc() };
+            let dimension = match desc.Dimension {
+                D3D12_RESOURCE_DIMENSION_BUFFER => D3D12_SRV_DIMENSION_BUFFER,
+                D3D12_RESOURCE_DIMENSION_TEXTURE1D => D3D12_SRV_DIMENSION_TEXTURE1D,
+                D3D12_RESOURCE_DIMENSION_TEXTURE3D => D3D12_SRV_DIMENSION_TEXTURE3D,
+                _ => D3D12_SRV_DIMENSION_TEXTURE2D,
+            };
+            Some((dimension.0 as u32, desc.Format.0 as u32))
+        }
+        // (The first words of a placed view are the host's description.)
+        View::Placed(false, _, desc) => Some((desc[1], desc[0])),
+        _ => None,
+    }
+}
+
+/// A view in a few words, for [`State::lut_bindings`].
+fn lut_view_text(view: &View) -> String {
+    let dimension = |d: u32| match d {
+        1 => "buffer",
+        2 | 3 => "1d",
+        4..=7 => "2d",
+        8 => "3d",
+        9 | 10 => "cube",
+        _ => "unknown",
+    };
+    match view {
+        View::Sampler(words) => format!("sampler {}", crate::lutwatch::filter_name(words[0] as i32)),
+        View::ConsoleSampler(words) => {
+            format!("console sampler {}", crate::lutwatch::filter_name(crate::sampler::console(words).Filter.0))
+        }
+        View::Shader(r, _) => match srv_dimension(view) {
+            Some((d, format)) => format!("{} format {format} resource {r:#x}", dimension(d)),
+            None => format!("view of resource {r:#x}"),
+        },
+        View::Placed(false, _, desc) => match srv_dimension(view) {
+            Some((d, format)) => format!(
+                "{} format {format} placed at {:#x}",
+                dimension(d),
+                u64::from(desc[10]) | u64::from(desc[11]) << 32
+            ),
+            None => "placed view".to_owned(),
+        },
+        View::Placed(true, ..) | View::Unordered(..) => "unordered view".to_owned(),
+        View::Constant(address, size) => format!("constants {address:#x}+{size:#x}"),
+    }
+}
+
 pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
     match view {
         View::Shader(..) | View::Placed(false, ..) => Some(ResourceType::Srv),
