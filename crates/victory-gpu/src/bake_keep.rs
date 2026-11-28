@@ -70,9 +70,14 @@ pub(crate) fn on() -> bool {
 pub(crate) const AGAIN: [u64; 6] = [1, 4, 16, 64, 256, 1024];
 
 /// The most bytes of keepers at once (a run bakes some hundreds of results of
-/// 12 KiB to 1.4 MB, and one atlas of some 12 MB); past it new results are
-/// not kept.
+/// 12 KiB to 1.4 MB); past it new results are not kept.
 const MOST_BYTES: u64 = 512 << 20;
+
+/// The widest and highest result kept: the bakes' results met were 128x128
+/// to 1024x1024. The 4224x4224 BC1 textures the title compresses a few
+/// regions of every frame are not bakes, and putting them back each frame
+/// would copy 9 MB a time.
+const MOST_SIDE: u64 = 2048;
 
 /// Whether DXGI format `format` is block-compressed (BC1 to BC5, BC6H, BC7).
 pub(crate) fn block_compressed(format: u32) -> bool {
@@ -325,7 +330,7 @@ fn keep_copy(
         let k = match map.entry(title as usize) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                if !result {
+                if !result || d.Width > MOST_SIDE || u64::from(d.Height) > MOST_SIDE {
                     return None;
                 }
                 let bytes = bytes_of(&d);
