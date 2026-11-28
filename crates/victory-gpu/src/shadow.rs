@@ -2253,6 +2253,9 @@ fn under_wide() -> bool {
 /// shortcut: a piece with very many runs has them joined over small gaps,
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
+    if crate::smash::on() {
+        crate::smash::before_put(crate::smash::Path::PutBack, at, title, merged);
+    }
     crate::watch::landing(at, title.len());
     if !exact_back() {
         crate::host::write_mapped(at as *mut u8, merged.as_ptr(), merged.len());
@@ -3092,6 +3095,10 @@ impl Shadow {
         self.written.store(true, Ordering::Relaxed);
         let len = len.min(self.left(address));
         list.defer_gpu_write(self, address as usize, len as usize);
+        // Diagnostics (`VICTORY_SMASH_WATCH`): which program declared it.
+        if crate::smash::on() {
+            list.smash_declare(address as usize, (address + len) as usize);
+        }
     }
 
     /// At submission, after the range's refresh: a submitted list's shaders
@@ -4610,6 +4617,9 @@ impl Shadow {
         let Some(card) = &self.card else {
             return 0;
         };
+        // Diagnostics (`VICTORY_SMASH_WATCH=2`): the biggest copy landed
+        // through is watched.
+        crate::smash::seen_copy(self.start as usize, self.len as usize);
         let waiting = std::time::Instant::now();
         let _merging = self.merging.read().unwrap_or_else(|e| e.into_inner());
         crate::land::spent(crate::land::stat::LOCK, waiting);

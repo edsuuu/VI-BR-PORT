@@ -1574,6 +1574,9 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // (The stage's program, `crate::smash::program`, is forgotten when
+        // this returns, whichever way.)
+        let _binding = crate::smash::Binding;
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1636,6 +1639,11 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            // Diagnostics (`VICTORY_SMASH_WATCH`): the program that declares
+            // the writes of this stage's views.
+            if crate::smash::on() {
+                crate::smash::program(Some(stage.shader.hash.as_str()));
+            }
             STORES.set(t.stores);
             #[cfg(feature = "diagnostics")]
             PED_STAGE.set(stage.shader.peds);

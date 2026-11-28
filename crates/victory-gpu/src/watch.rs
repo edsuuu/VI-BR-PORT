@@ -3194,6 +3194,8 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     if len == 0 {
         return;
     }
+    // Diagnostics (`VICTORY_SMASH_WATCH=2`): who wrote there last.
+    crate::smash::touched(crate::smash::Path::Runtime, at, len);
     let mode = page_writes();
     let end = at.saturating_add(len);
     if pages {

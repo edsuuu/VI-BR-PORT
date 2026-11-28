@@ -79,6 +79,8 @@ mod memory;
 #[cfg(windows)]
 mod shadow;
 #[cfg(windows)]
+mod smash;
+#[cfg(windows)]
 mod tiles;
 pub mod signature;
 mod switch;
@@ -117,6 +119,15 @@ pub fn frame_phase() -> u32 {
 }
 #[cfg(windows)]
 pub use host::set_title_dir;
+
+/// For the crash report: the writes of ours into title memory that turned a
+/// title pointer into no pointer (`VICTORY_SMASH_WATCH`; empty when it is
+/// off), those near one of the faulting thread's sixteen general registers
+/// (in the order instructions number them) first.
+#[cfg(windows)]
+pub fn smash_note(registers: &[u64; 16]) -> String {
+    smash::crash_note(registers)
+}
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]

@@ -2429,6 +2429,10 @@ struct Deferred {
     /// indirect arguments; 0 if none. It stays readable until the next
     /// clamp into it ([`HostList::indirect_state`]).
     indirect_readable: usize,
+    /// Diagnostics (`VICTORY_SMASH_WATCH`): title memory declared written
+    /// by the list's shaders, from, to, and the program that declared it
+    /// (`crate::smash::current_program`).
+    smash_declared: Vec<(usize, usize, u64)>,
 }
 
 impl Deferred {
@@ -3997,6 +4001,7 @@ fn late_line(frames: f64) {
         }
     }
     crate::land::log(frames);
+    crate::smash::log(frames);
     if place::on() {
         let t: Vec<f64> = place::STATS.iter().map(|r| r.swap(0, Ordering::Relaxed) as f64 / frames).collect();
         tracing::info!(
@@ -4207,6 +4212,11 @@ fn read_backs(list: &HostList) {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
+                    // Diagnostics (`VICTORY_SMASH_WATCH`).
+                    if crate::smash::on() {
+                        let src = from.add(line * row.next_multiple_of(256));
+                        crate::smash::before_copy(crate::smash::Path::ReadBack, *at + line * pitch, src, *row);
+                    }
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
                 }
                 // The walls trace: what the title is handed (one row of at
@@ -5744,6 +5754,17 @@ impl Host {
                     }
                 }
                 let mut hand_back = relay_hand_back(&back);
+                // Diagnostics (`VICTORY_SMASH_WATCH`): what is landed, for
+                // what a merge into a title pointer says.
+                if crate::smash::on() {
+                    let numbers = flights.iter().map(|f| f.number).collect();
+                    let declared = flights
+                        .iter()
+                        .flat_map(|f| f.order.iter().map(|&i| f.lists[i].host()))
+                        .flat_map(|l| l.smash_declared())
+                        .collect();
+                    crate::smash::landing(numbers, declared);
+                }
                 stage.next("landing: copies in the card's memory");
                 self.relay_card_back(&plans, fetch, &mut || {
                     if crate::land::on() {
@@ -7744,6 +7765,23 @@ impl HostList {
         }
     }
 
+    /// Diagnostics (`VICTORY_SMASH_WATCH`): the list's shaders write
+    /// `[from, to)` of title memory, for the program being bound on this
+    /// thread (once per range and program in a row: dispatches declare the
+    /// same ranges thousands of times).
+    pub(crate) fn smash_declare(&self, from: usize, to: usize) {
+        let entry = (from, to, crate::smash::current_program());
+        let mut deferred = self.deferred();
+        if deferred.smash_declared.last() != Some(&entry) {
+            deferred.smash_declared.push(entry);
+        }
+    }
+
+    /// What [`HostList::smash_declare`] noted since the list was reset.
+    pub(crate) fn smash_declared(&self) -> Vec<(usize, usize, u64)> {
+        self.deferred().smash_declared.clone()
+    }
+
     /// A read back: once the list has run, `rows` rows of `row` bytes go
     /// from `buffer` (rows 256-byte pitched, see `PlacedFootprint::host_rows`)
     /// to title memory at `dst`, pitched `pitch`. The buffer lives until
@@ -9338,6 +9376,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     if title_dst {
+        // Diagnostics (`VICTORY_SMASH_WATCH`): a title pointer this changes
+        // (a source that cannot be read is taken as the zeros it leaves).
+        if crate::smash::on() {
+            crate::smash::before_copy(crate::smash::Path::Copy, dst as usize, src, len);
+        }
         // The kernel writes the destination: it must not be guarded.
         crate::watch::writing(dst as usize, len);
     }
