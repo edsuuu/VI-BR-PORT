@@ -29,6 +29,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Settings as environment variables, `NAME=value` (repeatable): for
+    /// offline tools started where the environment cannot be given, as
+    /// `translate` or `replay` A/B runs of translator switches.
+    #[arg(long = "set", global = true, value_name = "NAME=VALUE")]
+    set: Vec<String>,
 }
 
 #[derive(Subcommand)]
@@ -179,6 +184,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let cli = Cli::parse();
+    for pair in &cli.set {
+        let (name, value) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--set {pair}: not NAME=VALUE"))?;
+        // SAFETY: still one thread; nothing has read the settings yet.
+        unsafe { std::env::set_var(name, value) };
+    }
     match cli.command {
         Command::Inspect {
             file,
