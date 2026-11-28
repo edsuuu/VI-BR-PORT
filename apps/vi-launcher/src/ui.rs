@@ -961,15 +961,18 @@ impl App {
         let mut reset = false;
         self.big_card(ui, full, &text::get(lang, "more.title"), &mut close, |app, ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = num("layout", "sectionGap");
-                // One section under the other, the game's folder first.
-                app.game_section(ui);
-                for g in options::GROUPS {
-                    app.group_section(ui, g);
-                }
-                app.controls_section(ui);
-                app.flags_section(ui);
-                app.advanced_section(ui, ctx);
+                // A margin on the right: the controls end clear of the card's edge and the scroll bar.
+                egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 24, top: 0, bottom: 12 }).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = num("layout", "sectionGap");
+                    // One section under the other, the game's folder first.
+                    app.game_section(ui);
+                    for g in options::GROUPS {
+                        app.group_section(ui, g);
+                    }
+                    app.controls_section(ui);
+                    app.flags_section(ui);
+                    app.advanced_section(ui, ctx);
+                });
             });
         }, |app, ui| {
             reset = theme::outline_button(ui, &text::get(app.language, "more.reset"), None, false).clicked();
@@ -997,16 +1000,13 @@ impl App {
             .iter()
             .filter(|o| o.group == group && !options::AUTOMATIC.contains(&o.id.as_str()))
             .collect();
-        if opts.is_empty() && group != "performance" {
+        if opts.is_empty() {
             return;
         }
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.label(theme::caption(&self.t(&format!("group.{group}"))));
             ui.add_space(4.0);
-            if group == "performance" {
-                self.automatic_rows(ui);
-            }
             for opt in opts {
                 let h = num("layout", "rowHeight");
                 match opt.kind {
@@ -1080,7 +1080,7 @@ impl App {
             ui.label(theme::caption(&self.t("controls.title")));
             self.mouse_keyboard_switch(ui);
             ui.add(egui::Label::new(theme::small(&text::fill(lang, "controls.help", &[&crate::controls::path().display().to_string()]), "textMuted")).wrap());
-            let text = self.bindings_text.get_or_insert_with(crate::controls::read);
+            let text = self.bindings_text.get_or_insert_with(|| crate::controls::without_header(&crate::controls::read()));
             ui.add(egui::TextEdit::multiline(text).desired_rows(10).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace).margin(vec2(10.0, 10.0)));
             ui.horizontal(|ui| {
                 if theme::outline_button(ui, &text::get(lang, "flags.save"), None, false).clicked() {
@@ -1091,7 +1091,7 @@ impl App {
                     });
                 }
                 if theme::outline_button(ui, &text::get(lang, "controls.reset"), None, false).clicked() {
-                    self.bindings_text = Some(crate::controls::DEFAULT.to_owned());
+                    self.bindings_text = Some(crate::controls::without_header(crate::controls::DEFAULT));
                     self.bindings_note = None;
                 }
                 if let Some(n) = &self.bindings_note {
@@ -1137,21 +1137,6 @@ impl App {
     }
 
     /// What the launcher sets from the PC, shown, not chosen.
-    fn automatic_rows(&mut self, ui: &mut egui::Ui) {
-        let lang = self.language;
-        let h = num("layout", "rowHeight");
-        let vram = crate::hardware::vram();
-        let card = crate::hardware::card_memory_mb(vram);
-        let card_line = match vram {
-            Some(b) => text::fill(lang, "auto.card_memory.found", &[&format!("{:.0}", b as f64 / (1u64 << 30) as f64), &card.to_string()]),
-            None => text::fill(lang, "auto.card_memory.unknown", &[&card.to_string()]),
-        };
-        let threads_line = text::fill(lang, "auto.threads.value", &[&crate::hardware::threads().to_string()]);
-        for (label, value) in [(text::get(lang, "auto.card_memory"), card_line), (text::get(lang, "auto.threads"), threads_line)] {
-            setting_row(ui, h, 0.0, &label, &value, "textSoft", |_| {});
-        }
-    }
-
     fn advanced_section(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let lang = self.language;
         let h = num("layout", "rowHeight");

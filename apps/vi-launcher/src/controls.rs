@@ -33,6 +33,18 @@ pub fn read() -> String {
     std::fs::read_to_string(path()).unwrap_or_else(|_| DEFAULT.to_owned())
 }
 
+/// The bindings as the settings show them: without the comment lines at the
+/// top of the file (how to edit it by hand, which the launcher does for the player).
+pub fn without_header(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let body = lines.iter().position(|l| !(l.trim_start().starts_with('#') || l.trim().is_empty())).unwrap_or(lines.len());
+    let mut out = lines[body..].join("\n");
+    if text.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
 pub fn write(text: &str) -> std::io::Result<()> {
     let p = ensure()?;
     std::fs::write(p, text)
@@ -40,6 +52,13 @@ pub fn write(text: &str) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_settings_show_the_bindings_without_the_header() {
+        let shown = super::without_header(super::DEFAULT);
+        assert!(!shown.starts_with('#'));
+        assert!(shown.contains("MoveUp = W"));
+    }
+
     #[test]
     fn the_defaults_move_with_wasd() {
         for line in ["MoveUp = W", "MoveLeft = A", "MoveDown = S", "MoveRight = D"] {
