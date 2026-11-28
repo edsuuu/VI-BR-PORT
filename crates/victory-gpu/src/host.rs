@@ -2688,6 +2688,77 @@ fn flagged_pieces(flags: &[(usize, u32, bool)]) -> Vec<(usize, u32)> {
     pieces
 }
 
+/// A piece fetched from a copy in the card's memory ([`relay`]): the copy,
+/// the piece's bytes in it (from, to), where they came down to in the
+/// fetch's mapping.
+type Fetched = (std::sync::Arc<crate::shadow::Shadow>, usize, usize, u64);
+
+/// With `crate::land` on: what shaders wrote in the fetched `pieces` of
+/// `jobs` (`crate::land::jobs`) goes into title memory, on the threads that
+/// land; the bytes put. `data` is the fetch's mapping, `after` the sends of
+/// title bytes the fetch ran behind (`Shadow::land_card`).
+///
+/// # Safety
+/// The copy of those pieces into `data` has run, and nothing writes them
+/// there before this returns.
+unsafe fn land_fetched(pieces: &[Fetched], jobs: &[std::ops::Range<usize>], data: usize, after: u64, check: Option<&torn::Check>) -> u64 {
+    use crate::land;
+    let put = std::sync::atomic::AtomicU64::new(0);
+    land::each(jobs.len(), &|j| {
+        let working = std::time::Instant::now();
+        if let Some(check) = check {
+            for i in jobs[j].clone() {
+                // SAFETY: as below.
+                unsafe { check.look(i, data) };
+            }
+        }
+        let mut notes = land::Notes::default();
+        for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
+            let addressed: Vec<(usize, usize, usize)> = run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
+            // SAFETY: the caller's.
+            put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
+        }
+        notes.flush();
+        land::spent(land::stat::CARD_ALL, working);
+    });
+    land::count(land::stat::JOBS, jobs.len() as u64);
+    put.into_inner()
+}
+
+/// Whether the pieces a fetch brings from copies in the card's memory are
+/// copied in as few regions as they allow (`VICTORY_FETCH_JOIN=1`; off by
+/// default): pieces of one copy that follow one another there and in the
+/// fetch's memory are one `CopyBufferRegion`.
+///
+/// The pieces are 64 KiB of a copy, in the order of title memory, and come
+/// down one after the other: in the prison some 820 pieces a frame in eight
+/// fetches, each its own region on the copy engine. The bytes that come down
+/// are the same either way; only the regions recorded are fewer.
+fn fetch_join() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FETCH_JOIN").is_some_and(|v| v == "1"))
+}
+
+/// The copy regions of `copies` (copy, from, to, where in the fetch's
+/// memory), with `join` ([`fetch_join`]) those that continue one another
+/// joined: (the copy's place in `copies`, from, to, where).
+fn fetch_regions<T>(copies: &[(T, usize, usize, u64)], join: bool, same: impl Fn(&T, &T) -> bool) -> Vec<(usize, usize, usize, u64)> {
+    let mut out: Vec<(usize, usize, usize, u64)> = Vec::with_capacity(copies.len());
+    for (i, (copy, lo, hi, at)) in copies.iter().enumerate() {
+        if join
+            && let Some(last) = out.last_mut()
+            && same(&copies[last.0].0, copy)
+            && last.2 == *lo
+            && last.3 + (last.2 - last.1) as u64 == *at
+        {
+            last.2 = *hi;
+            continue;
+        }
+        out.push((i, *lo, *hi, *at));
+    }
+    out
+}
+
 /// Whether compares read only the declared pieces found changed lately
 /// ([`heat`], `VICTORY_CARD_COMPARE_HOT=<D>`; off by default). Only with
 /// [`relay`], whose landing thread holds back the flights that owe pieces.
@@ -2814,7 +2885,35 @@ fn chosen_parts(shadow: &crate::shadow::Shadow, span: &crate::shadow::CardSpan, 
 
 #[cfg(test)]
 mod relay_tests {
-    use super::{flagged_pieces, landable};
+    use super::{fetch_regions, flagged_pieces, landable};
+
+    /// Pieces of one copy that follow one another there and in the fetch's
+    /// memory are one region; another copy, a gap in either, or the switch
+    /// off keep them apart.
+    #[test]
+    fn fetch_regions_join_only_what_continues() {
+        const K: usize = 64 << 10;
+        let copies = [
+            (1, 0, K, 0u64),
+            (1, K, 2 * K, K as u64),
+            (1, 2 * K, 2 * K + 100, 2 * K as u64),
+            // Another copy, right after in the fetch's memory.
+            (2, 2 * K + 100, 3 * K, 2 * K as u64 + 100),
+            // A gap in the copy.
+            (2, 4 * K, 5 * K, 3 * K as u64 - 100 + (K as u64)),
+            (2, 5 * K, 6 * K, 4 * K as u64 - 100 + (K as u64)),
+        ];
+        let same = |a: &i32, b: &i32| a == b;
+        assert_eq!(fetch_regions(&copies, false, same).len(), copies.len());
+        assert_eq!(
+            fetch_regions(&copies, true, same),
+            vec![(0, 0, 2 * K + 100, 0), (3, 2 * K + 100, 3 * K, 2 * K as u64 + 100), (4, 4 * K, 6 * K, 4 * K as u64 - 100)]
+        );
+        // A gap in the fetch's memory alone.
+        let apart = [(1, 0, K, 0u64), (1, K, 2 * K, K as u64 + 16)];
+        assert_eq!(fetch_regions(&apart, true, same).len(), 2);
+    }
+
 
     /// Two flights and what follows each: nothing of the second lands
     /// before the card has run it, and nothing behind a flight lands
@@ -5602,10 +5701,11 @@ impl Host {
                 allocator.Reset()?;
                 list.Reset(&allocator, None)?;
                 let copies = check.as_ref().map_or(&pieces, |c| &c.copies);
-                for (shadow, lo, hi, at) in copies {
-                    list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
+                let regions = fetch_regions(copies, fetch_join(), std::sync::Arc::ptr_eq);
+                for &(i, lo, hi, at) in &regions {
+                    list.CopyBufferRegion(&buffer, at, &copies[i].0.buffer, lo as u64, (hi - lo) as u64);
                 }
-                backmin::add(backmin::k::REGIONS, copies.len() as u64);
+                backmin::add(backmin::k::REGIONS, regions.len() as u64);
                 list.Close()?;
                 let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                 let _fetching = crate::timeline::span("landing: fetching pieces");
@@ -5659,29 +5759,9 @@ impl Host {
             let titles: Vec<(usize, usize)> =
                 pieces.iter().map(|(shadow, lo, hi, _)| (shadow.span().0 as usize + lo, hi - lo)).collect();
             let jobs = land::jobs(&titles);
-            let put = std::sync::atomic::AtomicU64::new(0);
-            land::each(jobs.len(), &|j| {
-                let working = std::time::Instant::now();
-                if let Some(check) = &check {
-                    for i in jobs[j].clone() {
-                        // SAFETY: as below.
-                        unsafe { check.look(i, data) };
-                    }
-                }
-                let mut notes = land::Notes::default();
-                for run in pieces[jobs[j].clone()].chunk_by(|a, b| std::sync::Arc::ptr_eq(&a.0, &b.0)) {
-                    let addressed: Vec<(usize, usize, usize)> =
-                        run.iter().map(|(_, lo, hi, at)| (*lo, *hi, data + *at as usize)).collect();
-                    // SAFETY: the mapping of the fetched bytes, `total` of
-                    // them; the copy into it has run, and the next waits
-                    // for this call.
-                    put.fetch_add(unsafe { run[0].0.land_card(&addressed, after, &mut notes) }, Ordering::Relaxed);
-                }
-                notes.flush();
-                land::spent(land::stat::CARD_ALL, working);
-            });
-            land::count(land::stat::JOBS, jobs.len() as u64);
-            written = put.into_inner();
+            // SAFETY: the copy into the mapping has run, and the next waits
+            // for this call.
+            written = unsafe { land_fetched(&pieces, &jobs, data, after, check.as_ref()) };
         } else {
             let mut title = Vec::new();
             for (i, (shadow, lo, hi, at)) in pieces.iter().enumerate() {
