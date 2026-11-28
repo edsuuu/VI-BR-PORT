@@ -88,6 +88,8 @@ fn build() -> [u8; 32] {
             "VICTORY_EARLY_DEPTH_FOR",
             // Whether the ray-tracing node test always misses.
             "VICTORY_RT_MISS",
+            // The order of `v_div_fixup_f32`'s special cases.
+            "VICTORY_DIV_FIXUP_ZERO_FIRST",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');

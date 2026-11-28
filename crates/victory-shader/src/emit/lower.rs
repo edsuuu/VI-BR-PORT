@@ -1361,6 +1361,28 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
+/// Whether `v_div_fixup_f32` takes a zero or infinite operand before a NaN
+/// quotient, in the console's order: numerator NaN, denominator NaN, 0/0 and
+/// inf/inf, then x/0 and inf/y (a signed infinity), then x/inf and 0/y (a
+/// signed zero), and only then a NaN quotient (a signed infinity).
+/// `VICTORY_DIV_FIXUP_ZERO_FIRST=1`; off by default, where a NaN quotient
+/// comes before x/inf and 0/y, which then give a signed infinity (as before).
+/// Part of the translation: the shader cache keys on it.
+fn div_fixup_zero_first() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_DIV_FIXUP_ZERO_FIRST.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIV_FIXUP_ZERO_FIRST").is_some_and(|v| v == "1"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`div_fixup_zero_first`], for its thread only.
+    pub(super) static TEST_DIV_FIXUP_ZERO_FIRST: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
 /// What the translator was told of the host, for a cache's key: the widest
 /// wave, the view heap's limit, where the raw twins of its views start, and
 /// what it writes for the console's own hardware.
@@ -8732,7 +8754,14 @@ impl<'a> Lower<'a> {
                 let both_inf = self.s.m.bin(c, Bin::And, n_inf, d_inf);
                 let both_zero = self.s.m.bin(c, Bin::And, n_zero, d_zero);
                 let invalid = self.s.m.bin(c, Bin::Or, both_inf, both_zero);
-                let make_inf = {
+                // The console resolves a zero or infinite operand before a
+                // quotient that is NaN: x/inf and 0/y are a signed zero
+                // whatever the quotient ([`div_fixup_zero_first`]). Without
+                // the switch, a NaN quotient makes a signed infinity first.
+                let zero_first = div_fixup_zero_first();
+                let make_inf = if zero_first {
+                    self.s.m.bin(c, Bin::Or, n_inf, d_zero)
+                } else {
                     let t = self.s.m.bin(c, Bin::Or, n_inf, d_zero);
                     self.s.m.bin(c, Bin::Or, t, q_nan)
                 };
@@ -8741,7 +8770,12 @@ impl<'a> Lower<'a> {
                 let signed_inf = self.s.m.bin(c, Bin::Or, sign, kinf);
                 let n_qnan = self.s.m.bin(c, Bin::Or, ni, kqnan_bit);
                 let d_qnan = self.s.m.bin(c, Bin::Or, di, kqnan_bit);
-                let r = self.s.m.select(c, make_zero, sign, signed_q);
+                let r = if zero_first {
+                    let r = self.s.m.select(c, q_nan, signed_inf, signed_q);
+                    self.s.m.select(c, make_zero, sign, r)
+                } else {
+                    self.s.m.select(c, make_zero, sign, signed_q)
+                };
                 let r = self.s.m.select(c, make_inf, signed_inf, r);
                 let r = self.s.m.select(c, invalid, kneg_qnan, r);
                 let r = self.s.m.select(c, d_nan, d_qnan, r);

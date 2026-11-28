@@ -2713,6 +2713,182 @@ mod tests {
         }
     }
 
+    /// `v_div_fixup_f32` alone, its quotient, denominator and numerator
+    /// read from the SRV (four dwords a lane: q, den, num, unused) and the
+    /// result written to the UAV: the special cases with a quotient of the
+    /// test's choice, not only the one a whole division leaves (a NaN
+    /// quotient beside a zero or infinite operand). From the tn1 fork's
+    /// feb90adeb.
+    #[cfg(windows)]
+    fn div_fixup_corner_fixture(lanes: u32) -> super::lower::Lowered {
+        let words: &[u32] = &[
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0
+            0xF408_0302,
+            0xFA00_0020, // s_load_dwordx4 s[12:15], s[4:5], 0x20
+            0x340E_0084, // v_lshlrev_b32 v7, 4, v0
+            0xE038_1000,
+            0x8002_0107, // buffer_load_dwordx4 v[1:4], v7, s[8:11], 0 offen
+            0xD55F_0001,
+            0x040E_0501, // v_div_fixup_f32 v1, v1, v2, v3
+            0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+            0xE070_1000,
+            0x8003_0107, // buffer_store_dword v1, v7, s[12:15], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let table = |kind, at| crate::UsedResource {
+            kind,
+            root: crate::RootType::Table,
+            table_offset_dwords: at,
+            lower_bound: 0,
+            stride: 4,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 9,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                table(crate::ResourceType::Srv, 0),
+                table(crate::ResourceType::Uav, 8),
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [lanes, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, None).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        super::lower::lower(&super::lower::Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            prims: Vec::new(),
+            mesh_stride: 0,
+        })
+        .unwrap()
+    }
+
+    /// What [`div_fixup_corner_fixture`] writes for each (q, den, num) of
+    /// `cases`, with `VICTORY_DIV_FIXUP_ZERO_FIRST` as `zero_first` says;
+    /// none without a host GPU.
+    #[cfg(windows)]
+    fn div_fixup_corners(zero_first: bool, cases: &[(u32, u32, u32)]) -> Option<Vec<u32>> {
+        super::lower::TEST_DIV_FIXUP_ZERO_FIRST.set(Some(zero_first));
+        let l = div_fixup_corner_fixture(cases.len() as u32);
+        super::lower::TEST_DIV_FIXUP_ZERO_FIRST.set(None);
+        let mut dxil = l.dxil;
+        assert!(!dxil.is_empty());
+        if let Ok(mut v) = super::validator::Validator::load(
+            super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut dxil).unwrap();
+        }
+        let Ok(host) = super::host::Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            return None;
+        };
+        let cs = super::HostShader {
+            stage: super::HwStage::Cs,
+            dxil,
+            user_data: l.user_data,
+            samplers: Vec::new(),
+            static_samplers: Vec::new(),
+            root_cbvs: l.root_cbvs,
+            root_srvs: l.root_srvs,
+            root_uavs: l.root_uavs,
+            root_indexed_views: Vec::new(),
+            half_views: l.half_views,
+        };
+        let (root, pso) = host.compute_pipeline(&cs).unwrap();
+        let inputs: Vec<u32> = cases.iter().flat_map(|&(q, d, n)| [q, d, n, 0]).collect();
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &super::host::Dispatch {
+                    roots: vec![(0, super::host::Root::Constants(vec![0, 0, 0, 0, 0]))],
+                    views: &[
+                        super::host::View::Buffer {
+                            data: &inputs,
+                            stride: super::host::Stride::Raw,
+                        },
+                        super::host::View::RawUav(64),
+                    ],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap();
+        Some(out[0][..cases.len()].to_vec())
+    }
+
+    /// `v_div_fixup_f32`'s special cases in the console's order
+    /// (`VICTORY_DIV_FIXUP_ZERO_FIRST=1`): a NaN quotient gives way to x/inf
+    /// and 0/y (a signed zero); and without the switch, as before, it
+    /// comes first there (a signed infinity), every other case the same.
+    #[test]
+    #[cfg(windows)]
+    fn div_fixup_takes_zero_and_infinite_operands_before_a_nan_quotient() {
+        const NAN: u32 = 0x7fc0_0000;
+        // (q, den, num), the result in the console's order, and before.
+        let cases: [((u32, u32, u32), u32, u32); 12] = [
+            ((NAN, 0x3f80_0000, 0x0000_0000), 0x0000_0000, 0x7f80_0000), // 0/1
+            ((NAN, 0xbf80_0000, 0x0000_0000), 0x8000_0000, 0xff80_0000), // 0/-1
+            ((NAN, 0xbf80_0000, 0x8000_0000), 0x0000_0000, 0x7f80_0000), // -0/-1
+            ((NAN, 0x7f80_0000, 0x3f80_0000), 0x0000_0000, 0x7f80_0000), // 1/inf
+            ((NAN, 0xff80_0000, 0x4040_0000), 0x8000_0000, 0xff80_0000), // 3/-inf
+            ((NAN, 0x0000_0000, 0x3f80_0000), 0x7f80_0000, 0x7f80_0000), // 1/0
+            ((NAN, 0x3f80_0000, 0x7f80_0000), 0x7f80_0000, 0x7f80_0000), // inf/1
+            ((NAN, 0x3f80_0000, 0x3f80_0000), 0x7f80_0000, 0x7f80_0000), // 1/1, NaN quotient
+            ((NAN, 0x0000_0000, 0x0000_0000), 0xffc0_0000, 0xffc0_0000), // 0/0
+            ((NAN, 0x7f80_0000, 0x7f80_0000), 0xffc0_0000, 0xffc0_0000), // inf/inf
+            ((0x4000_0000, 0x3f80_0000, 0x7fa0_0000), 0x7fe0_0000, 0x7fe0_0000), // sNaN/1
+            ((0x4000_0000, 0xffa0_0000, 0x3f80_0000), 0xffe0_0000, 0xffe0_0000), // 1/-sNaN
+        ];
+        let inputs: Vec<(u32, u32, u32)> = cases.iter().map(|c| c.0).collect();
+        for zero_first in [true, false] {
+            let Some(out) = div_fixup_corners(zero_first, &inputs) else {
+                return;
+            };
+            for (i, &((q, d, n), console, before)) in cases.iter().enumerate() {
+                let want = if zero_first { console } else { before };
+                assert_eq!(
+                    out[i], want,
+                    "zero first {zero_first}: q={q:#010x} den={d:#010x} num={n:#010x}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn valu_div_f32_sequence_executes_on_gpu() {
         let words: &[u32] = &[
