@@ -997,6 +997,76 @@ impl Instance {
     }
 }
 
+/// DXGI format 53 (`R16_TYPELESS`): an index format the builder takes
+/// beside `R16_UINT` and `R32_UINT`, as a third mode of its leaf stage
+/// (bit 0x40000 of a geometry's constants, where `R16_UINT` sets 0x10000
+/// and `R32_UINT` 0x20000: `FUN_18001c460`, 0x18001c460), with
+/// `IndexCount / 3` triangles (0x180014270). What its indices are is not
+/// in the builder's CPU code.
+pub const INDEX_53: u32 = 53;
+/// `R32G32_FLOAT`: two-float vertices (z read as 0 by Direct3D).
+pub const TWO_FLOATS: u32 = 16;
+/// Indices and vertices read at most from a geometry to test them.
+pub const PEEKED_INDICES: usize = 96;
+pub const PEEKED_VERTICES: usize = 8;
+
+/// The first indices of a triangle geometry, read from title memory as
+/// 16-bit and as 32-bit values: whether all of those read are below its
+/// vertex count, each way. Lists of 16-bit indices pass the first and
+/// (with fewer than 65,536 vertices) fail the second; 32-bit ones pass
+/// both, their halves being small too. `None`: no indices, too few, or
+/// not readable.
+pub fn index_fit(memory: &dyn Memory, g: &Geometry) -> Option<[bool; 2]> {
+    let Geometry::Triangles {
+        index_format,
+        index_count,
+        vertex_count,
+        index_buffer,
+        ..
+    } = *g
+    else {
+        return None;
+    };
+    if index_format == 0 || index_buffer == 0 || index_count < 2 {
+        return None;
+    }
+    let n = (index_count as usize).min(PEEKED_INDICES) & !1;
+    let b = memory.bytes(index_buffer, n * 2)?;
+    let sixteen = b
+        .chunks_exact(2)
+        .all(|c| u32::from(u16::from_le_bytes([c[0], c[1]])) < vertex_count);
+    let thirty_two = b.chunks_exact(4).all(|c| u32_at(c, 0) < vertex_count);
+    Some([sixteen, thirty_two])
+}
+
+/// Whether the first vertices of a two-float geometry read as positions
+/// do: finite, and 0 or between 1e-4 and 1e5 in size. Packed or quantized
+/// data read as floats mostly does not. `None`: not two floats, a stride
+/// with bit 15 set (not a stride the builder documents), or not readable.
+pub fn plausible_two_floats(memory: &dyn Memory, g: &Geometry) -> Option<bool> {
+    let Geometry::Triangles {
+        vertex_format: TWO_FLOATS,
+        vertex_count,
+        vertex_buffer,
+        vertex_stride,
+        ..
+    } = *g
+    else {
+        return None;
+    };
+    if vertex_buffer == 0 || vertex_count == 0 || vertex_stride < 8 || vertex_stride >= 0x8000 {
+        return None;
+    }
+    let n = (vertex_count as usize).min(PEEKED_VERTICES);
+    let len = (n - 1) * vertex_stride as usize + 8;
+    let b = memory.bytes(vertex_buffer, len)?;
+    let sane = |x: f32| x.is_finite() && (x == 0.0 || (1e-4..=1e5).contains(&x.abs()));
+    Some((0..n).all(|k| {
+        let at = k * vertex_stride as usize;
+        sane(f32_at(&b, at)) && sane(f32_at(&b, at + 4))
+    }))
+}
+
 /// The kinds and flags of `geometries`, counted, in the order first seen:
 /// `3 triangles OPAQUE, 1 triangles NONE`. The rehydrate's descriptions
 /// say them, but its GPU path copies each from +8 on, past `Type` and
@@ -1560,6 +1630,68 @@ mod tests {
             "{}",
             d.describe()
         );
+    }
+
+    #[test]
+    fn indices_and_two_float_vertices_are_tested_for_what_they_hold() {
+        let mut memory = Fake::default();
+        // 16-bit indices below 120 vertices: they fit as 16-bit, and as
+        // 32-bit pairs (b << 16 | a) they do not.
+        let mut sixteen = Vec::new();
+        for i in [0u16, 1, 2, 2, 1, 3, 100, 119] {
+            sixteen.extend_from_slice(&i.to_le_bytes());
+        }
+        memory.0.insert(0xb000, sixteen);
+        let mut list = triangles(0xa000, 0xb000);
+        list[16..20].copy_from_slice(&INDEX_53.to_le_bytes());
+        list[24..28].copy_from_slice(&8u32.to_le_bytes());
+        let g = Geometry::parse(&list);
+        assert_eq!(index_fit(&memory, &g), Some([true, false]));
+        // 32-bit indices pass both: their halves are small too.
+        let mut wide = Vec::new();
+        for i in [0u32, 1, 2, 119] {
+            put32(&mut wide, i);
+        }
+        memory.0.insert(0xb000, wide);
+        assert_eq!(index_fit(&memory, &g), Some([true, true]));
+        // No indices, or none readable.
+        assert_eq!(
+            index_fit(&memory, &Geometry::parse(&triangles(0xa000, 0))),
+            None
+        );
+        assert_eq!(index_fit(&Fake::default(), &g), None);
+
+        // Two floats a vertex: positions, or packed data read as floats.
+        let mut b = triangles(0xc000, 0);
+        b[20..24].copy_from_slice(&TWO_FLOATS.to_le_bytes());
+        b[48..56].copy_from_slice(&8u64.to_le_bytes());
+        let two = Geometry::parse(&b);
+        let mut floats = Vec::new();
+        for f in [0.0f32, 1.5, -20.25, 300.0, 0.001, -7.0, 2.0, 4.0] {
+            floats.extend_from_slice(&f.to_le_bytes());
+        }
+        memory.0.insert(0xc000, floats);
+        // (120 vertices; the first 8 read, 4 of them in these 32 bytes.)
+        assert_eq!(plausible_two_floats(&memory, &two), None);
+        let mut floats = Vec::new();
+        for k in 0..16 {
+            floats.extend_from_slice(&(k as f32 * 0.5).to_le_bytes());
+        }
+        memory.0.insert(0xc000, floats);
+        assert_eq!(plausible_two_floats(&memory, &two), Some(true));
+        let mut packed = Vec::new();
+        for _ in 0..16 {
+            put32(&mut packed, 0x7fc0_1234);
+        }
+        memory.0.insert(0xc000, packed);
+        assert_eq!(plausible_two_floats(&memory, &two), Some(false));
+        // Not two floats, or a stride with bit 15.
+        assert_eq!(
+            plausible_two_floats(&memory, &Geometry::parse(&triangles(0xc000, 0))),
+            None
+        );
+        b[48..56].copy_from_slice(&0x8008u64.to_le_bytes());
+        assert_eq!(plausible_two_floats(&memory, &Geometry::parse(&b)), None);
     }
 
     #[test]

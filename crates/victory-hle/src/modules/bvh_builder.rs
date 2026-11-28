@@ -351,11 +351,107 @@ struct Seen {
     placements: [u64; 5],
     /// How often each +60 word was seen (at most [`WORDS`] words).
     words: HashMap<u32, u64>,
+    /// What the geometries' data holds ([`Peeks`]), of builds and of
+    /// unpackings.
+    peeks: [Peeks; 2],
 }
 
 /// The +60 words told apart at most, and those the summary names.
 const WORDS: usize = 4096;
 const COMMON: usize = 8;
+
+/// What the trace reads in geometries' data to tell what their formats
+/// mean, before a host build relies on it: the first indices of format 53
+/// and of `R16_UINT` read as 16-bit and as 32-bit ([`desc::index_fit`]:
+/// tested, fit as 16-bit only, both ways, neither, not readable), whether
+/// two-float vertices read as positions ([`desc::plausible_two_floats`]:
+/// tested, plausible, not readable), and whether the vertices lie in a
+/// title buffer or outside them.
+#[derive(Clone, Copy, Default)]
+struct Peeks {
+    fit53: [u64; 5],
+    fit16: [u64; 5],
+    floats: [u64; 3],
+    placed: [u64; 2],
+}
+
+/// Geometries tested at most in a run (each test reads title memory).
+const PEEKS: u64 = 50_000;
+static TESTED: AtomicU64 = AtomicU64::new(0);
+
+/// Tests `geometries` (see [`Peeks`]), outside the summary's lock.
+fn peek(geometries: &[Geometry]) -> Peeks {
+    let mut p = Peeks::default();
+    for g in geometries {
+        if TESTED.fetch_add(1, Relaxed) >= PEEKS {
+            break;
+        }
+        let Geometry::Triangles {
+            index_format,
+            vertex_format,
+            ..
+        } = *g
+        else {
+            continue;
+        };
+        let fit = match index_format {
+            desc::INDEX_53 => Some(&mut p.fit53),
+            57 => Some(&mut p.fit16),
+            _ => None,
+        };
+        if let Some(f) = fit {
+            f[0] += 1;
+            f[match desc::index_fit(&Process, g) {
+                Some([true, false]) => 1,
+                Some([true, true]) => 2,
+                Some(_) => 3,
+                None => 4,
+            }] += 1;
+        }
+        if vertex_format == desc::TWO_FLOATS {
+            p.floats[0] += 1;
+            match desc::plausible_two_floats(&Process, g) {
+                Some(true) => p.floats[1] += 1,
+                Some(false) => {}
+                None => p.floats[2] += 1,
+            }
+        }
+        if let Some(&(_, at, len)) = g.spans().iter().find(|s| s.0 == "vertices") {
+            p.placed[usize::from(rtcalls::in_title_buffer(at, len).is_none())] += 1;
+        }
+    }
+    p
+}
+
+impl Peeks {
+    fn add(&mut self, o: &Peeks) {
+        let sum = |a: &mut [u64], b: &[u64]| a.iter_mut().zip(b).for_each(|(a, b)| *a += b);
+        sum(&mut self.fit53, &o.fit53);
+        sum(&mut self.fit16, &o.fit16);
+        sum(&mut self.floats, &o.floats);
+        sum(&mut self.placed, &o.placed);
+    }
+
+    fn describe(&self) -> String {
+        let fit = |f: &[u64; 5]| {
+            format!(
+                "{} tested: {} fit as 16-bit only, {} both ways, {} neither, {} not readable",
+                f[0], f[1], f[2], f[3], f[4]
+            )
+        };
+        format!(
+            "first indices of index format 53 {}; of R16_UINT {}; two-float vertices {} tested, {} read as positions, {} \
+             not readable; vertices in a title buffer {}, outside {}",
+            fit(&self.fit53),
+            fit(&self.fit16),
+            self.floats[0],
+            self.floats[1],
+            self.floats[2],
+            self.placed[0],
+            self.placed[1],
+        )
+    }
+}
 
 /// The summary's period.
 const SAY_EVERY: Duration = Duration::from_secs(5);
@@ -466,7 +562,7 @@ impl Seen {
              geometries built: {bo} opaque triangle lists, {bt} other triangle lists, {bb} box lists, {bx} of other kinds; \
              unpacked: {uo} opaque triangle lists, {ut} other triangle lists, {ub} box lists, {ux} of other kinds; the +60 \
              word of the unpacked: none (0x7f7f7f) {pn}, rotated {pr}, centred {pc}, scaled {ps}, another word that changes \
-             nothing {pi}; {}",
+             nothing {pi}; {}; in the builds' data: {}; in the unpackings' data: {}",
             self.entries,
             self.listed,
             self.prebuilds_listed,
@@ -484,6 +580,8 @@ impl Seen {
             self.shipped_invalid,
             self.bare,
             self.common(),
+            self.peeks[0].describe(),
+            self.peeks[1].describe(),
         )
     }
 }
@@ -559,7 +657,11 @@ fn say_build(
             geometries.iter().map(|g| g.triangles()).sum(),
         );
         rtcalls::add(Count::Aabbs, geometries.iter().map(|g| g.aabbs()).sum());
-        seen(|s| Seen::kinds(&mut s.built, geometries));
+        let p = peek(geometries);
+        seen(|s| {
+            Seen::kinds(&mut s.built, geometries);
+            s.peeks[0].add(&p);
+        });
     }
     if !say {
         return;
@@ -977,7 +1079,11 @@ unsafe extern "system" fn rehydrate_batched(
             // Whether an unpacking still says what the structure is made
             // of (what a host build of it would need), and how much.
             let (g, whole) = desc::geometries(&Process, &d.inputs);
-            seen(|s| s.shipped(data.as_ref(), &g));
+            let p = peek(&g);
+            seen(|s| {
+                s.shipped(data.as_ref(), &g);
+                s.peeks[1].add(&p);
+            });
             if say && k < LISTED {
                 describe_unpacking(&mut text, k, &d, at, data.as_ref(), &g, whole);
             }
@@ -1050,6 +1156,20 @@ fn describe_unpacking(
     );
     if let Some(first) = g.first() {
         let _ = write!(text, "; the first: {}", first.describe());
+        // Where a host build would read it from, as for a build's.
+        for (what, at, len) in first.spans() {
+            match rtcalls::in_title_buffer(at, len) {
+                Some((start, bytes)) => {
+                    let _ = write!(
+                        text,
+                        "; {what} in a title buffer at {start:#x} ({bytes} bytes)"
+                    );
+                }
+                None => {
+                    let _ = write!(text, "; {what} outside title buffers");
+                }
+            }
+        }
     }
 }
 
@@ -1354,6 +1474,38 @@ mod tests {
                  5 distinct, 0x7f7f7f x2, 0x5000000 x1, 0x40000000 x1"
             ),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn the_summary_adds_and_says_what_the_data_holds() {
+        let mut s = Seen::default();
+        let p = Peeks {
+            fit53: [5, 4, 0, 1, 0],
+            fit16: [2, 2, 0, 0, 0],
+            floats: [3, 0, 1],
+            placed: [1, 4],
+        };
+        s.peeks[1].add(&p);
+        s.peeks[1].add(&p);
+        assert_eq!(s.peeks[1].fit53, [10, 8, 0, 2, 0]);
+        let text = s.describe();
+        assert!(
+            text.contains(
+                "in the unpackings' data: first indices of index format 53 10 tested: 8 fit as 16-bit only, 0 both ways, \
+                 2 neither, 0 not readable; of R16_UINT 4 tested"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("two-float vertices 6 tested, 0 read as positions, 2 not readable; vertices in a title buffer 2, outside 8"),
+            "{text}"
+        );
+        // A geometry of another kind is not tested.
+        let none = peek(&[Geometry::Other { kind: 3, flags: 0 }]);
+        assert_eq!(
+            none.fit53[0] + none.floats[0] + none.placed[0] + none.placed[1],
+            0
         );
     }
 
