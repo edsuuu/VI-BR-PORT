@@ -1224,13 +1224,20 @@ impl Player {
         match s.kind {
             slot::CBV => format!("cbv {res} +{:#x} size {:#x}", s.address(), word(2)),
             _ => format!(
-                "{kind} format {} dimension {} first {} count {} stride {} flags {}: {res}",
+                "{kind} format {} dimension {} first {} count {} stride {} flags {}: {res}{}",
                 word(0),
                 word(1),
                 word(if s.kind == slot::SRV { 4 } else { 2 }),
                 word(if s.kind == slot::SRV { 6 } else { 4 }),
                 word(if s.kind == slot::SRV { 7 } else { 5 }),
                 word(8),
+                // A view that names no resource: the title's own words say what it looked at.
+                if s.res == NONE {
+                    let words: Vec<String> = (0..13).map(|i| format!("{:08x}", word(i))).collect();
+                    format!(" (words {})", words.join(" "))
+                } else {
+                    String::new()
+                },
             ),
         }
     }
