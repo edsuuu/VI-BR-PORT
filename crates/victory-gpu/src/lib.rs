@@ -52,6 +52,8 @@ mod port_journal;
 #[cfg(windows)]
 mod land;
 pub mod list;
+#[cfg(windows)]
+mod lutwatch;
 pub mod object;
 pub mod pipeline;
 #[cfg(windows)]

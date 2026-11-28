@@ -67,6 +67,9 @@ pub(crate) struct Shader {
     /// A pixel program of the title's decoration bake ([`bakes`]).
     #[cfg(windows)]
     pub(crate) bakes: bool,
+    /// Its part in the colour grading ([`crate::lutwatch`]).
+    #[cfg(windows)]
+    pub(crate) lut: Option<crate::lutwatch::Role>,
     /// A pixel program of the title's characters' G-buffer pass
     /// (`PS_DeferredPed*`): what it samples a capture can save
     /// ([`crate::capture::note_ped_read`]).
@@ -126,6 +129,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 bakes: bakes(bytes),
+                #[cfg(windows)]
+                lut: crate::lutwatch::role(stage, bytes),
                 #[cfg(all(windows, feature = "diagnostics"))]
                 peds: stage == "pixel" && bytes.windows(14).any(|w| w == b"PS_DeferredPed"),
                 #[cfg(windows)]
@@ -615,6 +620,12 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
 #[cfg(windows)]
 pub(crate) fn shaders_any(this: This, f: impl Fn(&Shader) -> bool) -> bool {
     !this.is_null() && pipeline(this).shaders.iter().any(|s| f(s))
+}
+
+/// The shader hashes of the title pipeline `this` (`a+b`), as logged.
+#[cfg(windows)]
+pub(crate) fn shader_hashes(this: This) -> String {
+    if this.is_null() { String::new() } else { make::hashes(&pipeline(this).host) }
 }
 
 /// Host pipelines queued and not made yet.
