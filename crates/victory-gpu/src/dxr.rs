@@ -19,10 +19,13 @@
 //! ordering of skinning, builds and reads. No program reads them yet; a
 //! five-second line says what was built (`native::line`).
 //!
-//! - `native`: the recording (copies of the vertex data, refit or build,
-//!   barriers, timestamps), the counts and the line;
-//! - `top`: top levels, their instances rewritten at submission to name the
-//!   host's bottom levels;
+//! - `native`: the recording at the title list's place (barriers, copies of
+//!   structures, what a list holds) and the five-second line;
+//! - `bottom`: bottom levels, from the geometry found in the host copies of
+//!   title memory; `top`: top levels, their instances rewritten at
+//!   submission to name the host's bottom levels;
+//! - `count`: what the line counts, and why builds were refused; `stamps`:
+//!   the device's ray-tracing interface and the card's time of the builds;
 //! - `table`: the title's destination address to the host structure, with
 //!   generations and the refit-or-rebuild decision;
 //! - `pool`: the card memory structures and scratch memory are cut from;
@@ -39,9 +42,12 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_DATA_D3D12_OPTIONS5, ID3D12Device,
 };
 
+mod bottom;
+mod count;
 mod native;
-mod probe;
 mod pool;
+mod probe;
+mod stamps;
 mod table;
 mod top;
 mod walk;

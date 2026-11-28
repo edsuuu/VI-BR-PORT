@@ -22,7 +22,9 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::native::{self, C, Gpu, Held, Refusal, Refused, Structure};
+use super::count::{C, Refusal, add};
+use super::native::{self, Held, Refused, Structure};
+use super::stamps::Gpu;
 use super::table::{Shape, Table};
 use super::{Build, Level, Origin};
 use crate::host::HostList;
@@ -58,7 +60,7 @@ pub(super) fn top(
             (gpu, cpu as usize)
         }
     };
-    let flags = native::host_flags(b.flags, Origin::Batched);
+    let flags = super::bottom::host_flags(b.flags, Origin::Batched);
     let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
         Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
         Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAGS(flags as i32),
@@ -86,8 +88,8 @@ pub(super) fn top(
     table.built(b.dest, flags, Shape::Top(count), s.clone(), frame);
     held.leases.push(scratch);
     held.made.push(s.clone());
-    native::add(C::TopBuilt, 1);
-    native::add(C::Instances, u64::from(count));
+    add(C::TopBuilt, 1);
+    add(C::Instances, u64::from(count));
     Ok((s, cpu))
 }
 
@@ -99,8 +101,8 @@ fn rewrite(instances: u64, count: usize, to: usize, top: &Arc<Structure>) {
     let out = unsafe { std::slice::from_raw_parts_mut(to as *mut u8, len) };
     if !crate::texture::committed(instances as *const u8, len) {
         out.fill(0);
-        native::add(C::InstancesUnknown, count as u64);
-        native::add(C::InstancesUnreadable, count as u64);
+        add(C::InstancesUnknown, count as u64);
+        add(C::InstancesUnreadable, count as u64);
         return;
     }
     // SAFETY: committed title memory of that length, read as bytes.
@@ -113,7 +115,7 @@ fn rewrite(instances: u64, count: usize, to: usize, top: &Arc<Structure>) {
     named.sort_by_key(|n| Arc::as_ptr(n) as usize);
     named.dedup_by(|a, b| Arc::ptr_eq(a, b));
     *top.named.lock().unwrap_or_else(|e| e.into_inner()) = named;
-    native::add(C::InstancesUnknown, unknown);
+    add(C::InstancesUnknown, unknown);
     static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     if unknown > 0 && SAID.fetch_add(1, Relaxed) < 4 {
         let first = out.chunks_exact(INSTANCE).position(|d| d[51] == 0 && d[56..64] == [0; 8]);
