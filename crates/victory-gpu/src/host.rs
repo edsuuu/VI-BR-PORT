@@ -613,6 +613,41 @@ pub(crate) fn log_removal_context() {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Of the submissions sent ahead, since the last frame-rate line, in
+/// microseconds: the time ahead of their preparing (the submission lock, the
+/// steps done on the card planned, flights waited for, the heaps' records
+/// begun, the sweep), from their preparing's end to the flight handed back
+/// (the send, what is in the air noted), the flight put in the line and the
+/// waits behind it, and the landed lists given back; and how many went the
+/// whole way ([`lane_line`]).
+///
+/// Why: in the prison walk of 28 Nov the thread that prepares worked 35-45
+/// ms a frame (`queue::behind`'s line) of which the frame line's
+/// "preparing" was 20-30: the other 8-12 ms, growing with the draws, had
+/// no line of their own.
+static LANE_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The line of [`LANE_PARTS`], with the frame-rate lines. (Two clock reads
+/// a part, some 25 submissions a frame: nothing a frame would notice.)
+fn lane_line(frames: f64) {
+    let p: Vec<f64> = LANE_PARTS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64).collect();
+    if p.iter().all(|&n| n == 0.0) {
+        return;
+    }
+    let ms = |i: usize| p[i] / 1000.0 / frames;
+    tracing::info!(
+        "submissions sent ahead, the submitting thread's time per frame beside their preparing: {:.1} ms ahead of it (the lock, \
+         steps done on the card planned, flights waited for, the heaps' records begun, the sweep), {:.1} from its end to the \
+         flight handed back (the send, what is in the air noted), {:.1} putting the flight in the line and the waits behind it \
+         (the frame line's \"on the GPU\" among them), {:.1} giving landed lists back; {:.1} submissions",
+        ms(0),
+        ms(1),
+        ms(2),
+        ms(3),
+        p[4] / frames
+    );
+}
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -4178,6 +4213,7 @@ fn late_line(frames: f64) {
     crate::port_journal::line(frames);
     crate::picked::log(frames);
     send_thread::line(frames);
+    lane_line(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {
@@ -6237,6 +6273,7 @@ impl Host {
             crate::list::recycle(lists, &order);
             return;
         };
+        let lined = std::time::Instant::now();
         let told = !sent.writes.is_empty();
         let sizes = crate::memory::asked_sizes(order.iter().map(|&i| lists[i].host()));
         let most = {
@@ -6279,8 +6316,12 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
+        let landing = std::time::Instant::now();
+        LANE_PARTS[2].fetch_add((landing - lined).as_micros() as u64, Ordering::Relaxed);
         let _landing = crate::timeline::span("landed lists reset and given back");
         land();
+        LANE_PARTS[3].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        LANE_PARTS[4].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
@@ -6527,8 +6568,9 @@ impl Host {
     /// ([`joins`]): those go to the queue in calls of their own, one after the
     /// other, as they would have.
     fn submit<'a>(&'a self, runs: &[&HostList], parts: &[usize], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        let entered = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
-        let called = std::time::Instant::now();
+        let called = entered;
         #[cfg(feature = "diagnostics")]
         crate::copystat::submission_begins();
         // A list put away closed as it ran ([`lazy_reset`]) runs empty, as one
@@ -6621,6 +6663,9 @@ impl Host {
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
         let started = std::time::Instant::now();
+        if late {
+            LANE_PARTS[0].fetch_add((started - entered).as_micros() as u64, Ordering::Relaxed);
+        }
         #[cfg(feature = "diagnostics")]
         ahead.part(14);
         #[cfg(feature = "diagnostics")]
@@ -6814,6 +6859,7 @@ impl Host {
                 texture_back_ranges,
                 writes,
             };
+            LANE_PARTS[1].fetch_add(prepared.elapsed().as_micros() as u64, Ordering::Relaxed);
             working(was_working);
             return Some((submitted, sent));
         }
