@@ -14,7 +14,10 @@
 //! - `D3D12XBOX_XDXR_STREAM_DESC`, which the prebuild call takes beside the
 //!   inputs: its first 16 bytes are the same size and address of extension
 //!   records (the prebuild copies them to +0x40 of an entry it makes up,
-//!   `GetRaytracingAccelerationStructurePrebuildInfo` at 0x180021880).
+//!   `GetRaytracingAccelerationStructurePrebuildInfo` at 0x180021880);
+//! - the header of a structure's shipped ("dehydrated") data, which the
+//!   rehydrate reads on the CPU ([`Dehydrated`], with the frame its nodes
+//!   are in, [`Placement`]).
 //!
 //! The readers take memory through [`Memory`], so the tests can hand them
 //! bytes of their own and a run hands them the title's (`super::Process`).
@@ -67,7 +70,8 @@ pub const ARRAY_OF_POINTERS: u32 = 1;
 // D3D12_RAYTRACING_GEOMETRY_TYPE and _FLAGS.
 const TRIANGLES: u32 = 0;
 const AABBS: u32 = 1;
-const GEOMETRY_FLAGS: [(u32, &str); 2] = [(0x1, "OPAQUE"), (0x2, "NO_DUPLICATE_ANYHIT")];
+const OPAQUE: u32 = 0x1;
+const GEOMETRY_FLAGS: [(u32, &str); 2] = [(OPAQUE, "OPAQUE"), (0x2, "NO_DUPLICATE_ANYHIT")];
 
 // D3D12_RAYTRACING_INSTANCE_FLAGS.
 const INSTANCE_FLAGS: [(u32, &str); 4] = [
@@ -530,6 +534,193 @@ pub fn describe_extensions(stream: &Stream, records: Option<&[Record]>, inputs: 
     text
 }
 
+/// The first 64 bytes of a structure's shipped ("dehydrated") data, as the
+/// rehydrate reads them on the CPU (`FUN_180014700`, 0x180014700): at
+/// `p[i]` of `RehydrateRaytracingAccelerationStructureBatched2X` (the
+/// fourth argument, one address a structure), or at the description's
+/// `SourceAccelerationStructureData` when `p` is null. The rehydrate first
+/// copies a header of this size from the description's source to its
+/// destination on the card, so (if `p[i]` holds what the source does
+/// [inf]) its +0x30 and +0x3c are the words a ray program reads at +48
+/// (the root node) and +60 of the structure.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Dehydrated {
+    /// +0: [`DEHYDRATED_BIT`] set, or the whole call answers
+    /// `E_INVALIDARG`; bits 20..23 the level n.
+    pub first: u32,
+    /// +0xc: what the leaf stage is dispatched over, 2048 a group (its
+    /// leaves [inf]).
+    pub leaves: u32,
+    /// +0x10..+0x27: the structure's box, its lower corner then its upper
+    /// (what the centring of [`Placement`] reads).
+    pub low: [f32; 3],
+    pub high: [f32; 3],
+    /// +0x2c: if not 0, the header is `size` (+0x38) bytes long; if 0,
+    /// n²·0x90 + 0x40.
+    pub sized: u32,
+    pub size: u32,
+    /// +0x30: the root node pointer, its kind in the low 3 bits.
+    pub root: u32,
+    /// +0x3c.
+    pub placement: Placement,
+}
+
+pub const DEHYDRATED: usize = 64;
+/// The bit of the first dword the rehydrate wants set.
+pub const DEHYDRATED_BIT: u32 = 1 << 24;
+
+impl Dehydrated {
+    pub fn parse(b: &[u8]) -> Dehydrated {
+        let f = |at| f32_at(b, at);
+        Dehydrated {
+            first: u32_at(b, 0),
+            leaves: u32_at(b, 0xc),
+            low: [f(0x10), f(0x14), f(0x18)],
+            high: [f(0x1c), f(0x20), f(0x24)],
+            sized: u32_at(b, 0x2c),
+            size: u32_at(b, 0x38),
+            root: u32_at(b, 0x30),
+            placement: Placement(u32_at(b, 0x3c)),
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.first & DEHYDRATED_BIT != 0
+    }
+
+    pub fn level(&self) -> u32 {
+        self.first >> 20 & 0xf
+    }
+
+    /// The header's bytes, as the rehydrate sizes its copy.
+    pub fn header(&self) -> u32 {
+        if self.sized == 0 {
+            self.level() * self.level() * 0x90 + 0x40
+        } else {
+            self.size
+        }
+    }
+
+    /// What the centring of bit 30 moves each axis by: the middle of the
+    /// box on an axis it does not hold 0 on, else nothing (0x180014700).
+    pub fn centre(&self) -> [f32; 3] {
+        std::array::from_fn(|k| {
+            let (low, high) = (self.low[k], self.high[k]);
+            if 0.0 < low || high < 0.0 {
+                (low + high) * 0.5
+            } else {
+                0.0
+            }
+        })
+    }
+
+    pub fn describe(&self) -> String {
+        let (l, h) = (self.low, self.high);
+        let mut text = format!(
+            "first dword {:#010x} ({}, level {}), header {} bytes, {} leaves, root {:#x} ({}), box ({} {} {}) - ({} {} {}), +60 {}",
+            self.first,
+            if self.valid() {
+                "bit 24 set"
+            } else {
+                "BIT 24 CLEAR: the builder answers E_INVALIDARG"
+            },
+            self.level(),
+            self.header(),
+            self.leaves,
+            self.root,
+            node_kind(self.root),
+            l[0],
+            l[1],
+            l[2],
+            h[0],
+            h[1],
+            h[2],
+            self.placement.describe()
+        );
+        if self.placement.centred() {
+            let c = self.centre();
+            let _ = write!(text, " (moved by {} {} {})", c[0], c[1], c[2]);
+        }
+        text
+    }
+}
+
+/// The kind of node a node pointer names (its low 3 bits).
+pub fn node_kind(pointer: u32) -> &'static str {
+    match pointer & 7 {
+        0..=3 => "triangle",
+        4 => "box16",
+        5 => "box32",
+        6 => "instance",
+        _ => "procedural",
+    }
+}
+
+/// The word at +0x3c (+60) of a bottom level's header: the frame its nodes
+/// are stored in, which the rehydrate hands to the leaf stage
+/// (0x180014700). [`NO_PLACEMENT`]: none, the nodes are in the geometry's
+/// own frame. Any other word: bits 24..29 index a table of 64 rotations
+/// the builder makes from permutations and signs of the axes (0x18000be20;
+/// index 0 is skipped there, the identity [inf]); bit 30 centres each axis
+/// on the box's middle where the box does not hold 0
+/// ([`Dehydrated::centre`]); bit 31 scales the axes by the powers of two
+/// whose float exponents are its bytes 0, 1 and 2 (x, y, z; 127 is 1.0),
+/// and without it they are not scaled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Placement(pub u32);
+
+pub const NO_PLACEMENT: u32 = 0x7f_7f7f;
+
+impl Placement {
+    pub fn none(self) -> bool {
+        self.0 == NO_PLACEMENT
+    }
+
+    /// The rotation's index (0 with no placement).
+    pub fn rotation(self) -> u32 {
+        if self.none() { 0 } else { self.0 >> 24 & 0x3f }
+    }
+
+    pub fn centred(self) -> bool {
+        !self.none() && self.0 & 1 << 30 != 0
+    }
+
+    /// The powers of two the axes are scaled by (x, y, z), with bit 31.
+    pub fn exponents(self) -> Option<[i32; 3]> {
+        (!self.none() && self.0 & 1 << 31 != 0)
+            .then(|| [0, 8, 16].map(|s| (self.0 >> s & 0xff) as i32 - 127))
+    }
+
+    pub fn scaled(self) -> bool {
+        self.exponents().is_some_and(|e| e != [0; 3])
+    }
+
+    /// The nodes are in the geometry's own frame: no placement, or one that
+    /// changes nothing.
+    pub fn identity(self) -> bool {
+        self.rotation() == 0 && !self.centred() && !self.scaled()
+    }
+
+    pub fn describe(self) -> String {
+        if self.none() {
+            return "0x7f7f7f (none)".to_string();
+        }
+        let mut text = format!("{:#010x} (rotation {}", self.0, self.rotation());
+        if let Some(e) = self.exponents() {
+            let _ = write!(text, ", scale 2^{} 2^{} 2^{}", e[0], e[1], e[2]);
+        }
+        if self.centred() {
+            text.push_str(", centred");
+        }
+        text.push_str(if self.identity() {
+            ": in effect none)"
+        } else {
+            ")"
+        });
+        text
+    }
+}
+
 /// `D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC` (16 bytes):
 /// where the builder stores a fact about the built structure, and which.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -690,6 +881,20 @@ impl Geometry {
         out
     }
 
+    /// Its `D3D12_RAYTRACING_GEOMETRY_FLAGS`.
+    pub fn flags(&self) -> u32 {
+        match *self {
+            Geometry::Triangles { flags, .. }
+            | Geometry::Aabbs { flags, .. }
+            | Geometry::Other { flags, .. } => flags,
+        }
+    }
+
+    /// Whether it is a list of triangles marked opaque.
+    pub fn opaque_triangles(&self) -> bool {
+        matches!(*self, Geometry::Triangles { flags, .. } if flags & OPAQUE != 0)
+    }
+
     /// Boxes it holds (0 for triangles).
     pub fn aabbs(&self) -> u64 {
         match *self {
@@ -790,6 +995,32 @@ impl Instance {
             t[11]
         )
     }
+}
+
+/// The kinds and flags of `geometries`, counted, in the order first seen:
+/// `3 triangles OPAQUE, 1 triangles NONE`. The rehydrate's descriptions
+/// say them, but its GPU path copies each from +8 on, past `Type` and
+/// `Flags` (0x180014700): whether they are what the console builds with is
+/// for a run to show.
+pub fn flags_tally(geometries: &[Geometry]) -> String {
+    let mut seen: Vec<(String, u32)> = Vec::new();
+    for g in geometries {
+        let kind = match g {
+            Geometry::Triangles { .. } => "triangles",
+            Geometry::Aabbs { .. } => "boxes",
+            Geometry::Other { .. } => "other",
+        };
+        let name = format!("{kind} {}", bits(g.flags(), &GEOMETRY_FLAGS));
+        match seen.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, n)) => *n += 1,
+            None => seen.push((name, 1)),
+        }
+    }
+    if seen.is_empty() {
+        return "no geometries".into();
+    }
+    let parts: Vec<String> = seen.iter().map(|(name, n)| format!("{n} {name}")).collect();
+    parts.join(", ")
 }
 
 /// Geometry descriptions read at most from one build (the rest are counted
@@ -1214,6 +1445,136 @@ mod tests {
         assert!(!taken(&bottom(MINIMIZE_MEMORY), &[ten]).mode);
         // The first record of a kind is the one taken.
         assert_eq!(taken(&bottom(0), &[ten, high]).quality, 10.0);
+    }
+
+    /// 64 bytes of shipped data: the first dword, the leaves at +0xc, a box
+    /// at +0x10, the header's size switch and size at +0x2c/+0x38, the root
+    /// at +0x30 and the placement word at +0x3c.
+    fn shipped(
+        first: u32,
+        low: [f32; 3],
+        high: [f32; 3],
+        sized: (u32, u32),
+        placement: u32,
+    ) -> Vec<u8> {
+        let mut b = Vec::new();
+        put32(&mut b, first);
+        put32(&mut b, 0);
+        put32(&mut b, 0);
+        put32(&mut b, 5000);
+        for f in low.iter().chain(&high) {
+            b.extend_from_slice(&f.to_bits().to_le_bytes());
+        }
+        put32(&mut b, 0); // +0x28
+        put32(&mut b, sized.0);
+        put32(&mut b, 0x45); // +0x30: box32 node 8
+        put32(&mut b, 0);
+        put32(&mut b, sized.1);
+        put32(&mut b, placement);
+        assert_eq!(b.len(), DEHYDRATED);
+        b
+    }
+
+    #[test]
+    fn shipped_data_reads_as_the_rehydrate_reads_it() {
+        // Bit 24 set, level 3 in bits 20..23: a header of 3²·0x90 + 0x40.
+        let d = Dehydrated::parse(&shipped(
+            0x0130_0000,
+            [-1.0; 3],
+            [1.0; 3],
+            (0, 0),
+            NO_PLACEMENT,
+        ));
+        assert!(d.valid());
+        assert_eq!(
+            (d.level(), d.header(), d.leaves, d.root),
+            (3, 3 * 3 * 0x90 + 0x40, 5000, 0x45)
+        );
+        assert_eq!(node_kind(d.root), "box32");
+        assert!(d.placement.none() && d.placement.identity());
+        let text = d.describe();
+        assert!(text.contains("bit 24 set, level 3"), "{text}");
+        assert!(text.contains("+60 0x7f7f7f (none)"), "{text}");
+        // +0x2c not 0: the header's size is +0x38.
+        let sized = Dehydrated::parse(&shipped(
+            0x0100_0000,
+            [0.0; 3],
+            [0.0; 3],
+            (1, 0x200),
+            NO_PLACEMENT,
+        ));
+        assert_eq!(sized.header(), 0x200);
+        // Without bit 24 the builder refuses the call.
+        let bad = Dehydrated::parse(&shipped(
+            0x0030_0000,
+            [0.0; 3],
+            [0.0; 3],
+            (0, 0),
+            NO_PLACEMENT,
+        ));
+        assert!(!bad.valid());
+        assert!(
+            bad.describe().contains("BIT 24 CLEAR"),
+            "{}",
+            bad.describe()
+        );
+    }
+
+    #[test]
+    fn the_placement_word_names_rotation_scale_and_centring() {
+        // Rotation 5, centred, scaled by 2^1 2^0 2^-2.
+        let word = 1 << 31 | 1 << 30 | 5 << 24 | 125 << 16 | 127 << 8 | 128;
+        let p = Placement(word);
+        assert!(!p.none() && !p.identity());
+        assert_eq!(p.rotation(), 5);
+        assert!(p.centred() && p.scaled());
+        assert_eq!(p.exponents(), Some([1, 0, -2]));
+        assert!(
+            p.describe()
+                .contains("rotation 5, scale 2^1 2^0 2^-2, centred"),
+            "{}",
+            p.describe()
+        );
+        // Without bit 31 the bytes are not exponents.
+        assert_eq!(Placement(3 << 24 | 0x80_8080).exponents(), None);
+        assert_eq!(Placement(3 << 24 | 0x80_8080).rotation(), 3);
+        // Another word that changes nothing: rotation 0, exponents of 1.0.
+        let plain = Placement(1 << 31 | 0x7f_7f7f);
+        assert!(!plain.none() && plain.identity());
+        assert!(
+            plain.describe().contains("in effect none"),
+            "{}",
+            plain.describe()
+        );
+        // The centring moves an axis whose box does not hold 0, to its middle.
+        let d = Dehydrated::parse(&shipped(
+            0x0100_0000,
+            [2.0, -1.0, -6.0],
+            [4.0, 1.0, -2.0],
+            (0, 0),
+            1 << 30,
+        ));
+        assert_eq!(d.centre(), [3.0, 0.0, -4.0]);
+        assert!(
+            d.describe().contains("(moved by 3 0 -4)"),
+            "{}",
+            d.describe()
+        );
+    }
+
+    #[test]
+    fn geometry_flags_are_counted_by_kind() {
+        let opaque = Geometry::parse(&triangles(0xa000, 0xb000));
+        let mut b = triangles(0xa000, 0);
+        b[4..8].copy_from_slice(&0u32.to_le_bytes());
+        let other = Geometry::parse(&b);
+        assert!(opaque.opaque_triangles() && !other.opaque_triangles());
+        assert_eq!((opaque.flags(), other.flags()), (1, 0));
+        assert_eq!(
+            flags_tally(&[opaque, other, opaque]),
+            "2 triangles OPAQUE, 1 triangles NONE"
+        );
+        assert_eq!(flags_tally(&[]), "no geometries");
     }
 
     #[test]

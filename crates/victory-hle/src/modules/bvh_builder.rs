@@ -19,7 +19,8 @@
 //! the builder's decompiled code reads them; the first calls are dumped in
 //! hex all the same. Beside the call lines, a line at most every five
 //! seconds says what was seen since the start ([`Seen`]): the extension
-//! records of the builds.
+//! records of the builds, the shipped data of the unpacked structures, and
+//! the kinds and opacity of the geometries.
 // The exported names are the title's.
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
@@ -39,8 +40,8 @@ use victory_loader::{ImportResolver, Provenance, Resolution};
 use victory_pe::ImportSymbol;
 
 use desc::{
-    BATCHED, BUILD_DESC, Batched, BuildDesc, INPUTS, INSTANCE, Inputs, Instance, Memory, POSTBUILD,
-    Postbuild, PrebuildInfo, Record, STREAM, Stream,
+    BATCHED, BUILD_DESC, Batched, BuildDesc, DEHYDRATED, Dehydrated, Geometry, INPUTS, INSTANCE,
+    Inputs, Instance, Memory, POSTBUILD, Postbuild, PrebuildInfo, Record, STREAM, Stream,
 };
 
 /// The DLL the title imports the builder from.
@@ -280,6 +281,17 @@ struct Seen {
     instances: u64,
     levels: u64,
     modes: u64,
+    /// Structures unpacked, those whose shipped data the CPU cannot read,
+    /// those without its bit 24 (the builder refuses the whole call), and
+    /// those whose description names no geometry.
+    unpacked: u64,
+    shipped_unread: u64,
+    shipped_invalid: u64,
+    bare: u64,
+    /// Geometries by kind and opacity, of the builds and of the unpackings:
+    /// opaque triangle lists, other triangle lists, box lists, other kinds.
+    built: [u64; 4],
+    unpacked_geometries: [u64; 4],
 }
 
 /// The summary's period.
@@ -326,12 +338,40 @@ impl Seen {
         self.modes += u64::from(t.mode);
     }
 
+    /// Counts geometries by kind and opacity into `into`.
+    fn kinds(into: &mut [u64; 4], geometries: &[Geometry]) {
+        for g in geometries {
+            into[match g {
+                _ if g.opaque_triangles() => 0,
+                Geometry::Triangles { .. } => 1,
+                Geometry::Aabbs { .. } => 2,
+                Geometry::Other { .. } => 3,
+            }] += 1;
+        }
+    }
+
+    /// One structure unpacked: its shipped data (`None`: not readable) and
+    /// the geometries its description names.
+    fn shipped(&mut self, data: Option<&Dehydrated>, geometries: &[Geometry]) {
+        self.unpacked += 1;
+        self.bare += u64::from(geometries.is_empty());
+        Self::kinds(&mut self.unpacked_geometries, geometries);
+        match data {
+            Some(d) => self.shipped_invalid += u64::from(!d.valid()),
+            None => self.shipped_unread += 1,
+        }
+    }
+
     fn describe(&self) -> String {
+        let [bo, bt, bb, bx] = self.built;
+        let [uo, ut, ub, ux] = self.unpacked_geometries;
         format!(
             "dxr trace: since the start (VICTORY_DXR_TRACE): {} batched entries, {} with extension records, and {} prebuild \
              asks with them; records of kind 0 {}, kind 1 {}, kind 2 {}, other kinds {}; lists not a multiple of 16 {}, not \
              readable {}; the builder takes kind 1's instance count on {} top levels, a level on {} bottom levels, the mode \
-             bit on {}",
+             bit on {}; {} structures unpacked (shipped data not readable {}, BIT 24 CLEAR {}, no geometries named {}); \
+             geometries built: {bo} opaque triangle lists, {bt} other triangle lists, {bb} box lists, {bx} of other kinds; \
+             unpacked: {uo} opaque triangle lists, {ut} other triangle lists, {ub} box lists, {ux} of other kinds",
             self.entries,
             self.listed,
             self.prebuilds_listed,
@@ -344,6 +384,10 @@ impl Seen {
             self.instances,
             self.levels,
             self.modes,
+            self.unpacked,
+            self.shipped_unread,
+            self.shipped_invalid,
+            self.bare,
         )
     }
 }
@@ -402,6 +446,7 @@ fn note_build(call: u64, entry: u32, of: u32, d: &BuildDesc, tail: &str) {
             geometries.iter().map(|g| g.triangles()).sum(),
         );
         rtcalls::add(Count::Aabbs, geometries.iter().map(|g| g.aabbs()).sum());
+        seen(|s| Seen::kinds(&mut s.built, &geometries));
     }
     if !say {
         return;
@@ -726,7 +771,7 @@ unsafe extern "system" fn rehydrate_batched(
     list: *mut c_void,
     count: u32,
     descs: *const u8,
-    extra: *const u64,
+    shipped: *const u64,
 ) -> i32 {
     let call = number(REHYDRATE);
     rtcalls::add(Count::Rehydrated, u64::from(count));
@@ -734,49 +779,76 @@ unsafe extern "system" fn rehydrate_batched(
     let logged = LOGGED.fetch_add(1, Relaxed);
     let say = rtcalls::trace() == Trace::All || logged < BUDGET;
     let mut text = format!(
-        "dxr trace: rehydrate call {call}, {count} structures, list {list:p}, the 64-bit values at {extra:p}"
+        "dxr trace: rehydrate call {call}, {count} structures, list {list:p}, the addresses of their shipped data at {shipped:p}"
     );
     if call < DUMPED {
         let _ = write!(
             text,
             "; {}; {}",
             dump("the descriptions", descs as u64, n.min(4) * BUILD_DESC),
-            dump("the 64-bit values", extra as u64, n.min(8) * 8)
+            dump(
+                "the addresses of the shipped data",
+                shipped as u64,
+                n.min(8) * 8
+            )
         );
     }
-    let values = Process.bytes(extra as u64, n * 8);
+    // `p[i]` is the address of structure i's shipped data, which the
+    // builder reads on the CPU; with `p` null it reads the description's
+    // source instead (0x180014700).
+    let addresses = (!shipped.is_null())
+        .then(|| Process.bytes(shipped as u64, n * 8))
+        .flatten();
     if let Some(b) = Process.bytes(descs as u64, n * BUILD_DESC) {
         for (k, one) in b.chunks_exact(BUILD_DESC).enumerate() {
             let d = BuildDesc::parse(one);
             rtcalls::named(d.inputs.top(), d.dest);
-            if say && k < LISTED {
-                let value = values.as_ref().map(|v| {
-                    u64::from_le_bytes(v[k * 8..k * 8 + 8].try_into().unwrap_or_default())
-                });
-                let _ = write!(
-                    text,
-                    "\n  {k}: {} level {} count {} dest {:#x} source {:#x} scratch {:#x} value {}",
-                    d.inputs.level(),
-                    desc::build_flags(d.inputs.flags),
-                    d.inputs.count,
-                    d.dest,
-                    d.source,
-                    d.scratch,
-                    value.map_or("?".to_string(), |v| format!("{v:#x}")),
-                );
-                // Whether an unpacking still says what the structure is made
-                // of (what a host build of it would need), and how much.
-                let (g, whole) = desc::geometries(&Process, &d.inputs);
-                let triangles: u64 = g.iter().map(|g| g.triangles()).sum();
-                let _ = write!(
-                    text,
-                    "; {} geometries read{}, {triangles} triangles",
-                    g.len(),
-                    if whole { "" } else { " (not all)" }
-                );
-                if let Some(first) = g.first() {
-                    let _ = write!(text, "; the first: {}", first.describe());
+            let at = if shipped.is_null() {
+                Some(d.source)
+            } else {
+                addresses
+                    .as_ref()
+                    .map(|v| u64::from_le_bytes(v[k * 8..k * 8 + 8].try_into().unwrap_or_default()))
+            };
+            let data = at
+                .and_then(|a| Process.bytes(a, DEHYDRATED))
+                .map(|b| Dehydrated::parse(&b));
+            // Whether an unpacking still says what the structure is made
+            // of (what a host build of it would need), and how much.
+            let (g, whole) = desc::geometries(&Process, &d.inputs);
+            seen(|s| s.shipped(data.as_ref(), &g));
+            if !(say && k < LISTED) {
+                continue;
+            }
+            let _ = write!(
+                text,
+                "\n  {k}: {} level {} count {} dest {:#x} source {:#x} scratch {:#x}",
+                d.inputs.level(),
+                desc::build_flags(d.inputs.flags),
+                d.inputs.count,
+                d.dest,
+                d.source,
+                d.scratch,
+            );
+            match (at, data) {
+                (None, _) => text.push_str("; the shipped data's address is not readable"),
+                (Some(a), None) => {
+                    let _ = write!(text, "; the shipped data at {a:#x} is not readable");
                 }
+                (Some(a), Some(data)) => {
+                    let _ = write!(text, "; the shipped data at {a:#x}: {}", data.describe());
+                }
+            }
+            let triangles: u64 = g.iter().map(|g| g.triangles()).sum();
+            let _ = write!(
+                text,
+                "; {} geometries read{}, {triangles} triangles, flags: {}",
+                g.len(),
+                if whole { "" } else { " (not all)" },
+                desc::flags_tally(&g)
+            );
+            if let Some(first) = g.first() {
+                let _ = write!(text, "; the first: {}", first.describe());
             }
         }
     }
@@ -784,7 +856,7 @@ unsafe extern "system" fn rehydrate_batched(
     // SAFETY: as above.
     let code = unsafe {
         std::mem::transmute::<*const (), Rehydrate>(original(REHYDRATE))(
-            this, list, count, descs, extra,
+            this, list, count, descs, shipped,
         )
     };
     took(since);
@@ -868,6 +940,50 @@ mod tests {
         s.entry(&e, Some(&[Record::parse(&r)]));
         s.entry(&Batched::default(), None);
         assert_eq!((s.entries, s.listed, s.instances, s.kinds[1]), (2, 1, 1, 1));
+    }
+
+    #[test]
+    fn the_summary_counts_unpacked_structures_and_geometry_kinds() {
+        let triangles = |flags| Geometry::Triangles {
+            flags,
+            transform: 0,
+            index_format: 0,
+            vertex_format: 6,
+            index_count: 0,
+            vertex_count: 3,
+            index_buffer: 0,
+            vertex_buffer: 0x1000,
+            vertex_stride: 12,
+        };
+        let boxes = Geometry::Aabbs {
+            flags: 0,
+            count: 2,
+            start: 0x2000,
+            stride: 24,
+        };
+        let good = Dehydrated {
+            first: desc::DEHYDRATED_BIT,
+            ..Dehydrated::default()
+        };
+        let mut s = Seen::default();
+        s.shipped(Some(&good), &[triangles(1), triangles(0), boxes]);
+        s.shipped(Some(&Dehydrated::default()), &[]);
+        s.shipped(None, &[triangles(1)]);
+        assert_eq!(
+            (s.unpacked, s.shipped_unread, s.shipped_invalid, s.bare),
+            (3, 1, 1, 1)
+        );
+        assert_eq!(s.unpacked_geometries, [2, 1, 1, 0]);
+        Seen::kinds(
+            &mut s.built,
+            &[boxes, Geometry::Other { kind: 3, flags: 0 }],
+        );
+        assert_eq!(s.built, [0, 0, 1, 1]);
+        let text = s.describe();
+        assert!(
+            text.contains("3 structures unpacked (shipped data not readable 1, BIT 24 CLEAR 1, no geometries named 1)"),
+            "{text}"
+        );
     }
 
     #[test]
