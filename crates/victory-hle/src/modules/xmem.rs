@@ -1965,8 +1965,11 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
     }
 }
 
-/// The oldest layout we know; newer titles pass other flag values (Minecraft
-/// 0x20000001) and read the same leading fields.
+/// The title-facing statistics structure. The first 0x50 bytes are the
+/// oldest layout we knew (newer titles pass other flag values, Minecraft
+/// 0x20000001, and read the same leading fields); the kit's current one is
+/// 0x78 bytes: direct storage use, the frame preserve buffer, the peak of
+/// the title's use, the page tables' sizes and two reserved words.
 #[repr(C)]
 #[derive(Debug, Default)]
 pub struct WorkingSet {
@@ -1982,6 +1985,42 @@ pub struct WorkingSet {
     pub tools_gpu_optimal_used: usize,
     pub kernel_pool_used: u32,
     pub kernel_pool_limit: u32,
+    pub direct_storage_used: u32,
+    pub frame_preserve_size: u32,
+    pub title_used_peak: usize,
+    pub gpu_page_table_size: u32,
+    pub cpu_page_table_size: u32,
+    pub reserved: [usize; 2],
+}
+
+/// Bytes of [`WorkingSet`] the oldest layout has.
+const WORKING_SET_OLD: usize = 0x50;
+
+/// Whether the whole current structure is written (default), or only the
+/// first 0x50 bytes as before (`VICTORY_WORKING_SET_FULL=0`). A title built
+/// against an older kit passes a smaller buffer; the logs show it asking
+/// 3 times in all, for the title bit only (0x20000001).
+fn working_set_full() -> bool {
+    static FULL: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("VICTORY_WORKING_SET_FULL").is_none_or(|v| v != "0"));
+    *FULL
+}
+
+/// Writes `stats` to the title's structure, all of it or the oldest part.
+///
+/// # Safety
+/// `out` has room for the bytes written: 0x78, or 0x50 when `full` is off.
+unsafe fn write_working_set(out: *mut WorkingSet, stats: WorkingSet, full: bool) {
+    let bytes = if full {
+        size_of::<WorkingSet>()
+    } else {
+        WORKING_SET_OLD
+    };
+    // SAFETY: the caller's room; `stats` is plain data.
+    unsafe {
+        out.cast::<u8>()
+            .copy_from_nonoverlapping((&raw const stats).cast(), bytes)
+    };
 }
 
 /// The title's budget and our process's commit as what it uses. No tools
@@ -2003,6 +2042,7 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
     let stats = WorkingSet {
         title_limit: gpu_optimal + standard - TRANSFERRED.load(Ordering::Relaxed),
         title_used: counters.PagefileUsage,
+        title_used_peak: counters.PeakPagefileUsage,
         gpu_optimal_limit: gpu_optimal,
         ..Default::default()
     };
@@ -2025,8 +2065,9 @@ pub extern "system" fn XMemGetWorkingSetStatistics(_which: u32, out: *mut Workin
             "the title asks how much memory it uses"
         );
     }
-    // SAFETY: checked non-null; the title passes room for the structure.
-    unsafe { out.write(stats) };
+    // SAFETY: checked non-null; the title passes room for the structure
+    // (see `working_set_full`).
+    unsafe { write_working_set(out, stats, working_set_full()) };
     1
 }
 
@@ -2180,11 +2221,52 @@ mod tests {
 
     #[test]
     fn statistics_have_the_console_layout() {
-        assert_eq!(size_of::<WorkingSet>(), 0x50);
+        assert_eq!(size_of::<WorkingSet>(), 0x78);
+        assert_eq!(std::mem::offset_of!(WorkingSet, kernel_pool_used), 0x48);
+        assert_eq!(std::mem::offset_of!(WorkingSet, direct_storage_used), 0x50);
+        assert_eq!(std::mem::offset_of!(WorkingSet, frame_preserve_size), 0x54);
+        assert_eq!(std::mem::offset_of!(WorkingSet, title_used_peak), 0x58);
+        assert_eq!(std::mem::offset_of!(WorkingSet, gpu_page_table_size), 0x60);
+        assert_eq!(std::mem::offset_of!(WorkingSet, cpu_page_table_size), 0x64);
+        assert_eq!(std::mem::offset_of!(WorkingSet, reserved), 0x68);
         assert_eq!(size_of::<BasicInformation>(), 0x40);
         assert_eq!(std::mem::offset_of!(WorkingSet, gpu_optimal_limit), 0x28);
     }
 
+    /// The structure is written whole, or only its first 0x50 bytes.
+    #[test]
+    fn statistics_write_the_whole_structure_or_the_old_part() {
+        let canary = 0xa5u8;
+        let stats = || WorkingSet {
+            title_limit: 1,
+            kernel_pool_limit: 2,
+            direct_storage_used: 3,
+            title_used_peak: 4,
+            reserved: [5, 6],
+            ..Default::default()
+        };
+        for full in [true, false] {
+            let mut room = [canary; 0x80];
+            // SAFETY: room for 0x78 bytes.
+            unsafe { write_working_set(room.as_mut_ptr().cast(), stats(), full) };
+            assert_eq!(room[0], 1);
+            assert_eq!(room[0x4c], 2, "kernel pool limit");
+            let end = if full { 0x78 } else { 0x50 };
+            assert!(room[end..].iter().all(|b| *b == canary), "past {end:#x}");
+            if full {
+                assert_eq!(
+                    (room[0x50], room[0x58], room[0x68], room[0x70]),
+                    (3, 4, 5, 6)
+                );
+            } else {
+                assert!(room[0x50..0x78].iter().all(|b| *b == canary));
+            }
+        }
+        // The call fills the peak.
+        let mut got = WorkingSet::default();
+        assert_eq!(XMemGetWorkingSetStatistics(0x2000_0001, &mut got), 1);
+        assert!(got.title_used_peak >= got.title_used);
+    }
     #[test]
     fn commit_limit_report_includes_request_and_system_commit() {
         let error = std::io::Error::from_raw_os_error(ERROR_COMMITMENT_LIMIT as i32);
