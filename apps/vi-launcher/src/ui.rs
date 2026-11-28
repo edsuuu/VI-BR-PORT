@@ -964,14 +964,14 @@ impl App {
                 // A margin on the right: the controls end clear of the card's edge and the scroll bar.
                 egui::Frame::new().inner_margin(egui::Margin { left: 0, right: 24, top: 0, bottom: 12 }).show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = num("layout", "sectionGap");
-                    // One section under the other, the game's folder first.
+                    // One section under the other: language and updates at the top, then the game's folder.
+                    app.advanced_section(ui, ctx);
                     app.game_section(ui);
                     for g in options::GROUPS {
                         app.group_section(ui, g);
                     }
                     app.controls_section(ui);
                     app.flags_section(ui);
-                    app.advanced_section(ui, ctx);
                 });
             });
         }, |app, ui| {
