@@ -20,7 +20,10 @@
 //!   where a pointer at `+56` with its top bit set has no `M` (the identity);
 //! - a triangle node keeps two triangles: the geometry index above the
 //!   geometry flags at `+48`, the primitive index of triangle `k` at `+52 +
-//!   4k`, the triangle's vertex roles in byte `k` of `+60`.
+//!   4k`, the triangle's vertex roles in byte `k` of `+60`;
+//! - a bottom level's header keeps its frame at `+60` (the critic's item 3);
+//!   the walks do not read it, the instance node's turn already takes the
+//!   ray there [inf], and the walk here only hands it on with each hit.
 //!
 //! The walk takes every triangle the ray meets (no culling, no judging, as
 //! the probe's ray queries do) and keeps the nearest. The bottom level's own
@@ -64,6 +67,13 @@ pub(crate) struct Hit {
     pub roles: u32,
     /// The instance node's address.
     pub instance: u64,
+    /// The 3x3 (rows of three) the instance node turned the ray by into the
+    /// bottom level's own space; `None`: it has none (the identity).
+    pub turn: Option<[f32; 9]>,
+    /// The word at `+60` of the bottom level's header, which holds its
+    /// frame (the critic's item 3: an index into the builder's 64 turns of
+    /// the axes and a scale of each axis), as it is.
+    pub frame_word: u32,
 }
 
 /// The mask byte of an instance, its id and the rest of its node.
@@ -74,6 +84,8 @@ struct Instance {
     address: u64,
     origin: [f32; 3],
     direction: [f32; 3],
+    turn: Option<[f32; 9]>,
+    frame_word: u32,
 }
 
 /// Nodes walked at most a ray.
@@ -161,6 +173,8 @@ fn walk_inner(
                     clockwise: den > 0.0,
                     roles: w[15] >> (8 * k) & 0xff,
                     instance: inst.address,
+                    turn: inst.turn,
+                    frame_word: inst.frame_word,
                 });
             }
             6 => {
@@ -177,17 +191,17 @@ fn walk_inner(
                 }
                 let f = |k: usize| f32::from_bits(w[k]);
                 let translation = [f(16), f(17), f(18)];
-                let turned = (w[14] as i32) >= 0;
+                let turn: Option<[f32; 9]> = ((w[14] as i32) >= 0).then(|| std::array::from_fn(|k| f(19 + k)));
                 let apply = |v: [f32; 3]| -> [f32; 3] {
-                    if !turned {
-                        return v;
-                    }
-                    std::array::from_fn(|r| f(19 + 3 * r) * v[0] + f(20 + 3 * r) * v[1] + f(21 + 3 * r) * v[2])
+                    let Some(m) = turn else { return v };
+                    std::array::from_fn(|r| m[3 * r] * v[0] + m[3 * r + 1] * v[1] + m[3 * r + 2] * v[2])
                 };
                 let mut o2 = apply(o);
                 for (c, t) in o2.iter_mut().zip(translation) {
                     *c += t;
                 }
+                let base = u64::from(w[15]) << 8;
+                let [frame_word] = words::<1>(pages, base + 60).map_err(Err)?;
                 let inst = Instance {
                     id: w[12] & 0xff_ffff,
                     contribution: w[13] & 0xff_ffff,
@@ -195,8 +209,10 @@ fn walk_inner(
                     address: at,
                     origin: o2,
                     direction: apply(d),
+                    turn,
+                    frame_word,
                 };
-                stack.push((u64::from(w[15]) << 8, blas_root, Some(std::rc::Rc::new(inst))));
+                stack.push((base, blas_root, Some(std::rc::Rc::new(inst))));
             }
             // Procedural boxes: the program's own code judges them.
             _ => {}
@@ -295,6 +311,8 @@ mod tests {
         // Triangle 0: roles I = 1, J = 2; triangle 1 (node vertices 1, 3, 2): the same.
         t[15] = (1 | 2 << 2) | (1 | 2 << 2) << 8;
         m.put(BLAS + 64, &t);
+        // Its header's frame word.
+        m.put(BLAS + 60, &[0x0a7f_7f7f]);
         // Its root (node 2): a box node naming triangles 0 and 1 of node 1.
         let around = [-1.0, -1.0, 4.0, 5.0, 5.0, 6.0];
         let mut b = vec![1 << 3, 1 << 3 | 1, bvh::NONE, bvh::NONE];
@@ -315,12 +333,14 @@ mod tests {
         assert_eq!((h.t, h.id, h.contribution, h.geometry, h.geometry_flags, h.primitive), (5.0, 7, 3, 2, 1, 11));
         assert!((h.barycentrics[0] - 0.25).abs() < 1e-6 && (h.barycentrics[1] - 0.25).abs() < 1e-6);
         assert_eq!(h.instance, TOP + 2 * 64);
+        assert_eq!((h.turn, h.frame_word), (None, 0x0a7f_7f7f));
         // Mask 2 only: the turned instance, met at z = 7.5 (t = 7.5 along the
         // world direction although its space is scaled by 2). At (0.5, 0.5)
         // its space has (1, 1): triangle 0 again.
         let Walked::Hit(h) = walk(&m, TOP, [0.5, 0.5, 0.0], [0.0, 0.0, 1.0], 0.0, 100.0, 0x02) else { panic!() };
         assert_eq!((h.id, h.contribution, h.instance_flags, h.primitive), (9, 5, 1, 11));
         assert!((h.t - 7.5).abs() < 1e-5, "{}", h.t);
+        assert_eq!(h.turn, Some([0.0, 2.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0]));
         // At (1.75, 0.5) world, the turned space has (1, 3.5): x + y > 4 is
         // triangle 1 (primitive 12).
         let Walked::Hit(h) = walk(&m, TOP, [1.75, 0.5, 0.0], [0.0, 0.0, 1.0], 0.0, 100.0, 0x02) else { panic!() };
