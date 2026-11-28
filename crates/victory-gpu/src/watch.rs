@@ -3172,8 +3172,42 @@ pub(crate) fn page_writes() -> u8 {
 /// views that landed at addresses the title has mapped (one for each run
 /// of addresses); their bytes; guarded blocks that lay under them (host
 /// copies that would otherwise keep the bytes from before); reads to
-/// plain addresses that finished.
-pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// plain addresses that finished; of all those writes, the ones told the
+/// default way ([`stream_written`]) rather than by [`title_memory_written`].
+pub(crate) static WRITTEN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// The bytes of a write the guards do not see are there, as for
+/// [`title_memory_written`], and the runtime tells of it the default way
+/// (`VICTORY_STREAM_NOTICE` unset): counted in [`WRITTEN`] as that function
+/// counts, then done as [`writing`] does, and nothing else.
+///
+/// The default way used to go to [`writing`] alone, so the counts of the
+/// `writes behind the guards` line stayed at 0 whatever DirectStorage
+/// wrote: a run's 0 there read as "no writes into physical pages" when it
+/// only said the counting path was off (kit review of 28/11, item 2). The
+/// guarded blocks are counted from their bits ([`PROTECTED`]), without the
+/// guards' lock, before [`writing`] opens them.
+pub fn stream_written(at: usize, len: usize, pages: bool) {
+    count_stream_written(&PROTECTED, at, len, pages);
+    writing(at, len);
+}
+
+/// [`stream_written`]'s counts, the guarded blocks taken from `guarded`.
+fn count_stream_written(guarded: &Bits, at: usize, len: usize, pages: bool) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if len == 0 {
+        return;
+    }
+    if pages {
+        let under = guarded.set_in(at / BLOCK, at.saturating_add(len).div_ceil(BLOCK)).count() as u64;
+        WRITTEN[0].fetch_add(1, Relaxed);
+        WRITTEN[1].fetch_add(len as u64, Relaxed);
+        WRITTEN[2].fetch_add(under, Relaxed);
+    } else {
+        WRITTEN[3].fetch_add(1, Relaxed);
+    }
+    WRITTEN[4].fetch_add(1, Relaxed);
+}
 
 /// The bytes of a write the guards do not see are there: title memory
 /// `[at, at + len)`. `pages`: DirectStorage wrote them into physical pages
@@ -3779,6 +3813,30 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn writes_told_the_default_way_are_counted() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Bits of our own, not the guards' (other tests rely on those).
+        let guarded = Box::new(Bits::new());
+        let at = 0x5000_0000_0000usize;
+        // One block under the write is guarded, one past its end is not.
+        guarded.set(at / BLOCK + 1);
+        guarded.set(at / BLOCK + 3);
+        let before = WRITTEN.each_ref().map(|n| n.load(Relaxed));
+        count_stream_written(&guarded, at, 3 * PAGE, true);
+        count_stream_written(&guarded, at, 100, false);
+        count_stream_written(&guarded, at, 0, true);
+        let after = WRITTEN.each_ref().map(|n| n.load(Relaxed));
+        // Other tests may count at the same time: at least ours. (Only this
+        // file's default way counts the last one.)
+        let grew = |i: usize| after[i] - before[i];
+        assert!(grew(0) >= 1, "{before:?} {after:?}");
+        assert!(grew(1) >= 3 * PAGE as u64, "{before:?} {after:?}");
+        assert!(grew(2) >= 1, "{before:?} {after:?}");
+        assert!(grew(3) >= 1, "{before:?} {after:?}");
+        assert_eq!(grew(4), 2, "{before:?} {after:?}");
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {

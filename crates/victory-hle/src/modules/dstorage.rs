@@ -1644,7 +1644,7 @@ fn into_destination(
         // Again now that the bytes are there: a texture looked at in between
         // was uploaded without them (`xmem::pages_written`).
         if super::xmem::stream_notice() {
-            victory_gpu::kernel_will_write(request.destination as usize, len);
+            victory_gpu::stream_written(request.destination as usize, len, false);
         } else {
             victory_gpu::title_memory_written(request.destination as usize, len, false);
         }
