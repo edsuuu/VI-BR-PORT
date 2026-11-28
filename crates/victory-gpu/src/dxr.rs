@@ -34,7 +34,9 @@
 //!   through the console's structure read back from the card (`walk`),
 //!   compared ray by ray;
 //! - [`query`] (`VICTORY_RT_QUERY`): the host's top level bound where a
-//!   translated program's ray query reads it (`t252`), or an empty one.
+//!   translated program's ray query reads it (`t252`), or an empty one;
+//! - [`packed`]: the console's packed indices and quantized positions, and
+//!   their expansion into formats the host's builder takes.
 //!
 //! The tests prove the host side end to end on the card with programs of
 //! our own writer (`victory_shader::emit::ray_query_probe`) and measure
@@ -47,6 +49,7 @@ use windows::Win32::Graphics::Direct3D12::{
 mod bottom;
 mod count;
 mod native;
+pub mod packed;
 mod pool;
 mod probe;
 pub(crate) mod query;
