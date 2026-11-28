@@ -14,12 +14,13 @@
 
 use windows::Win32::Graphics::Direct3D12::*;
 
+use super::recognize::Field;
 use super::replace::{CULL_BACK, CULL_FRONT, FIRST_HIT, FORCE_OPAQUE, OutKind, Output, Query, SKIP_PROCEDURAL, TMin};
 use super::with_queries;
 use crate::bvh::{self, Ray};
 use crate::emit::host::{Dispatch, Host, Root, Stride, View};
 use crate::emit::intersect_tests::build_compute_shader;
-use crate::emit::{SLOT_STRUCTURE, USER_STRUCTURE};
+use crate::emit::{HostShader, SLOT_STRUCTURE, USER_STRUCTURE};
 use crate::ir::{self, Reg};
 use crate::native::{ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
 
@@ -114,13 +115,17 @@ fn native() -> NativeProgram {
 /// site's ray at its entry; the results t (v13), the hit's node pointer
 /// (v14, [`MARK`] at a hit) and two left as they were (v15, v16).
 fn query(native: &NativeProgram, flags: u32) -> Query {
+    query_of(native, flags, [OutKind::T, OutKind::Hit(MARK), OutKind::Entry, OutKind::Entry])
+}
+
+/// [`query`] with the outputs v13-v16 of `kinds`.
+fn query_of(native: &NativeProgram, flags: u32, kinds: [OutKind; 4]) -> Query {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     let insts = || p.blocks.iter().flat_map(|b| b.insts.iter());
     let site = insts().find(|i| i.name().starts_with("image_bvh")).expect("the node test");
     let structure = insts()
         .find(|i| i.name() == "s_load_dwordx4" && i.write(Reg::S(16)).is_some())
         .expect("the structure's view load");
-    let kinds = [OutKind::T, OutKind::Hit(MARK), OutKind::Entry, OutKind::Entry];
     let outputs = (0..4u8).map(|k| Output { reg: Reg::V(13 + k), kind: kinds[usize::from(k)] }).collect();
     Query {
         offset: site.machine.offset,
@@ -219,69 +224,14 @@ fn a_walk_taken_out_is_a_host_ray_query_that_hits_what_the_walk_would() {
         shaders.push((label, shader, cull, first));
     }
     let _one = crate::emit::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 hardware device; skipped");
-        return;
-    };
-    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
-    // SAFETY: the feature query writes the structure of the given size.
-    let tier = unsafe {
-        host.device.CheckFeatureSupport(
-            D3D12_FEATURE_D3D12_OPTIONS5,
-            (&raw mut options).cast(),
-            size_of_val(&options) as u32,
-        )
-    };
-    if tier.is_err() || options.RaytracingTier.0 < D3D12_RAYTRACING_TIER_1_1.0 {
-        eprintln!("no ray tracing tier 1.1; skipped");
-        return;
-    }
+    let Some(host) = card() else { return };
     let cases = cases();
-    let mut records = vec![0u32; THREADS as usize * RECORD];
-    for (t, c) in cases.iter().enumerate() {
-        let Some((origin, direction, extent)) = *c else { continue };
-        let r = &mut records[RECORD * t..RECORD * (t + 1)];
-        r[2] = extent.to_bits();
-        for a in 0..3 {
-            r[3 + a] = origin[a].to_bits();
-            r[6 + a] = direction[a].to_bits();
-            r[9 + a] = (1.0 / direction[a]).to_bits();
-        }
-        r[12] = 1;
-    }
+    let records = records(&cases);
     for (label, shader, cull, first) in &shaders {
-        let (root, pso) = host.compute_pipeline(shader).unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        // The structure's root parameter: after the user data, in the order the
-        // host's root signature lists root views (by slot, then kind).
-        let mut views: Vec<(u8, u8)> = shader.root_cbvs.iter().map(|&r| (r, 0)).collect();
-        views.extend(shader.root_srvs.iter().map(|&r| (r, 1)));
-        views.push((SLOT_STRUCTURE, 1));
-        views.extend(shader.root_uavs.iter().map(|&r| (r, 2)));
-        views.sort_unstable();
-        views.dedup();
-        let at = 1 + views.iter().position(|&v| v == (SLOT_STRUCTURE, 1)).expect("the structure") as u32;
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![
-                        (at, Root::Structure(vec![A, B])),
-                        (0, Root::Constants(vec![0; shader.user_data_dwords().max(5) as usize])),
-                    ],
-                    views: &[
-                        View::Buffer { data: &records, stride: Stride::Raw },
-                        View::RawUav(4 * THREADS),
-                        View::Buffer { data: &[0; 4], stride: Stride::Raw },
-                    ],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        let out = run(&host, shader, &records, label);
         for t in 0..THREADS as usize {
             let case = cases.get(t).copied().flatten();
-            let got = &out[0][4 * t..4 * t + 4];
+            let got = &out[4 * t..4 * t + 4];
             let hits = walk(&case, *cull);
             let ok = match (case, hits[0]) {
                 // (left out, or a miss: what the registers held)
@@ -298,6 +248,168 @@ fn a_walk_taken_out_is_a_host_ray_query_that_hits_what_the_walk_would() {
                 f32::from_bits(got[0]),
                 hits.iter().map(|h| h.map(f32::from_bits)).collect::<Vec<_>>()
             );
+        }
+    }
+}
+
+/// The host's device, when it has ray tracing tier 1.1 (`None`: skipped).
+fn card() -> Option<Host> {
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; skipped");
+        return None;
+    };
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+    // SAFETY: the feature query writes the structure of the given size.
+    let tier = unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS5,
+            (&raw mut options).cast(),
+            size_of_val(&options) as u32,
+        )
+    };
+    if tier.is_err() || options.RaytracingTier.0 < D3D12_RAYTRACING_TIER_1_1.0 {
+        eprintln!("no ray tracing tier 1.1; skipped");
+        return None;
+    }
+    Some(host)
+}
+
+/// The threads' records for `cases`.
+fn records(cases: &[Case]) -> Vec<u32> {
+    let mut records = vec![0u32; THREADS as usize * RECORD];
+    for (t, c) in cases.iter().enumerate() {
+        let Some((origin, direction, extent)) = *c else { continue };
+        let r = &mut records[RECORD * t..RECORD * (t + 1)];
+        r[2] = extent.to_bits();
+        for a in 0..3 {
+            r[3 + a] = origin[a].to_bits();
+            r[6 + a] = direction[a].to_bits();
+            r[9 + a] = (1.0 / direction[a]).to_bits();
+        }
+        r[12] = 1;
+    }
+    records
+}
+
+/// Runs `shader` on the card against the structure of [`A`] and [`B`] (one
+/// instance, one geometry, A primitive 0): the four result dwords a thread.
+fn run(host: &Host, shader: &HostShader, records: &[u32], label: &str) -> Vec<u32> {
+    let (root, pso) = host.compute_pipeline(shader).unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+    // The structure's root parameter: after the user data, in the order the
+    // host's root signature lists root views (by slot, then kind).
+    let mut views: Vec<(u8, u8)> = shader.root_cbvs.iter().map(|&r| (r, 0)).collect();
+    views.extend(shader.root_srvs.iter().map(|&r| (r, 1)));
+    views.push((SLOT_STRUCTURE, 1));
+    views.extend(shader.root_uavs.iter().map(|&r| (r, 2)));
+    views.sort_unstable();
+    views.dedup();
+    let at = 1 + views.iter().position(|&v| v == (SLOT_STRUCTURE, 1)).expect("the structure") as u32;
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![
+                    (at, Root::Structure(vec![A, B])),
+                    (0, Root::Constants(vec![0; shader.user_data_dwords().max(5) as usize])),
+                ],
+                views: &[
+                    View::Buffer { data: records, stride: Stride::Raw },
+                    View::RawUav(4 * THREADS),
+                    View::Buffer { data: &[0; 4], stride: Stride::Raw },
+                ],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+    out[0][..4 * THREADS as usize].to_vec()
+}
+
+/// The closest hit of `case` without culling.
+#[derive(Debug, Clone, Copy)]
+struct Hit {
+    t: f32,
+    /// The weights of the triangle's second and third vertices.
+    i: f32,
+    j: f32,
+    /// The denominator is positive: DXR's front face.
+    front: bool,
+    primitive: u32,
+}
+
+fn closest(case: &Case) -> Option<Hit> {
+    let (origin, direction, extent) = (*case)?;
+    let ray = Ray::new(origin, direction, extent);
+    let mut best: Option<Hit> = None;
+    for (n, p) in [A, B].iter().enumerate() {
+        let [num, den, i, j] = bvh::triangle(p, &ray);
+        if den == 0.0 || num.is_nan() || den.is_nan() {
+            continue;
+        }
+        let t = num / den;
+        if t >= 0.0 && t < extent && best.is_none_or(|b| t < b.t) {
+            best = Some(Hit { t, i: i / den, j: j / den, front: den > 0.0, primitive: n as u32 });
+        }
+    }
+    best
+}
+
+/// What a query gives beyond t and a hit's mark, for the code after a walk
+/// that reads it (`VICTORY_RT_QUERY=a0f`): the closest hit's barycentrics and
+/// DXR hit kind, and the instance's index, the geometry's word (its index in
+/// the high 24 bits, OPAQUE in the low 8) and the primitive's index, which
+/// the console keeps in the hit's nodes; the registers' values from before
+/// on a miss.
+#[test]
+fn a_query_gives_the_hit_kind_barycentrics_and_node_fields_the_code_after_reads() {
+    let native = native();
+    let flags = FORCE_OPAQUE | SKIP_PROCEDURAL;
+    let variants = [
+        (
+            "t, bary i, hit kind, primitive",
+            [OutKind::T, OutKind::BaryI, OutKind::HitKind, OutKind::Field(Field::PrimitiveIndex)],
+        ),
+        (
+            "bary j, geometry, instance, mark",
+            [OutKind::BaryJ, OutKind::Field(Field::GeometryWord), OutKind::Field(Field::InstanceIndex), OutKind::Hit(MARK)],
+        ),
+    ];
+    let mut shaders = Vec::new();
+    for &(label, kinds) in &variants {
+        let q = query_of(&native, flags, kinds);
+        let (shader, _) =
+            with_queries(vec![q], || build_compute_shader(&native)).unwrap_or_else(|e| panic!("{label}: {e}"));
+        shaders.push((label, shader, kinds));
+    }
+    let _one = crate::emit::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(host) = card() else { return };
+    let cases = cases();
+    let records = records(&cases);
+    for (label, shader, kinds) in &shaders {
+        let out = run(&host, shader, &records, label);
+        for t in 0..THREADS as usize {
+            let case = cases.get(t).copied().flatten();
+            let got = &out[4 * t..4 * t + 4];
+            let Some(h) = closest(&case) else {
+                assert_eq!(got, BEFORE, "{label}, thread {t}: {case:?} misses");
+                continue;
+            };
+            for (k, kind) in kinds.iter().enumerate() {
+                let near = |want: f32| (f32::from_bits(got[k]) - want).abs() < 1e-4;
+                let ok = match kind {
+                    OutKind::T => near(h.t),
+                    OutKind::BaryI => near(h.i),
+                    OutKind::BaryJ => near(h.j),
+                    OutKind::HitKind => got[k] == if h.front { 0xfe } else { 0xff },
+                    OutKind::Field(Field::PrimitiveIndex) => got[k] == h.primitive,
+                    OutKind::Field(Field::GeometryWord) => got[k] == 1,
+                    OutKind::Field(Field::InstanceIndex) => got[k] == 0,
+                    OutKind::Hit(m) => got[k] == *m,
+                    _ => unreachable!("{kind:?}"),
+                };
+                assert!(ok, "{label}, thread {t}: {case:?}, output {k} ({kind:?})\n got {got:x?}\nwant {h:?}");
+            }
         }
     }
 }
