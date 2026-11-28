@@ -71,6 +71,18 @@ pub(crate) extern "system" fn add_ref(this: This) -> u32 {
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// One more reference to `this`, but only while it still has one: `false`
+/// if it is being released (its count reached 0, and its drop is on its
+/// way). For [`crate::resource::alias_of`], which pins a texture found in a
+/// table that the texture leaves only in its drop.
+pub(crate) fn add_ref_alive(this: This) -> bool {
+    // SAFETY: `this` is one of our objects, not freed yet (the caller holds
+    // the lock of a table it leaves before it is freed).
+    let refs = &unsafe { &*this }.refs;
+    refs.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n > 0).then(|| n + 1))
+        .is_ok()
+}
+
 pub(crate) extern "system" fn release(this: This) -> u32 {
     // SAFETY: `this` is one of our objects.
     let refs = &unsafe { &*this }.refs;
@@ -407,6 +419,24 @@ mod tests {
             S_OK
         );
         this
+    }
+
+    /// An object whose count reached 0 (its drop on its way, as a texture a
+    /// lookup finds between its last release and leaving its table) is not
+    /// given a reference back.
+    #[test]
+    fn a_reference_is_not_taken_back_from_zero() {
+        let this = new_test_object();
+        assert!(add_ref_alive(this));
+        assert_eq!(release(this), 1);
+        // (The count at 0 without the drop yet.)
+        assert_eq!(release(this), 0);
+        assert!(!add_ref_alive(this), "a count of 0 stays 0");
+        // SAFETY: one of ours.
+        assert_eq!(unsafe { &*this }.refs.load(Ordering::Relaxed), 0);
+        // SAFETY: made by `new_test_object` as a boxed `Object`; nothing
+        // else names it.
+        drop(unsafe { Box::from_raw(this.cast_mut()) });
     }
 
     #[test]
