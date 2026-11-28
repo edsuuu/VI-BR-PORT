@@ -648,7 +648,7 @@ enum Hop {
 type Seen = HashMap<(Hop, Site), bool>;
 
 /// A value followed back through copies, selects and phis inside a region.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Root {
     /// Defined outside the region.
     Outside(Value),
@@ -1227,6 +1227,14 @@ impl<'a> Facts<'a> {
     }
 }
 
+/// `set` in order: what is read out of a set must not depend on how it was
+/// hashed, or two runs of the census tell the same walk differently.
+fn sorted<T: Ord>(set: HashSet<T>) -> Vec<T> {
+    let mut v: Vec<T> = set.into_iter().collect();
+    v.sort_unstable();
+    v
+}
+
 /// The node tests of `p`.
 fn sites(p: &Program) -> Vec<Site> {
     let mut out = Vec::new();
@@ -1468,7 +1476,7 @@ fn accept(facts: &Facts, tri: &Triangle, region: &[bool], extent: &HashSet<Value
     }
     let mut cond = None;
     let mut why = String::new();
-    'find: for &t in &tri.t {
+    'find: for t in sorted(tri.t.clone()) {
         for u in facts.uses.get(&t).into_iter().flatten() {
             let Use::Inst(b, i) = *u else { continue };
             if !region[b] {
@@ -1774,7 +1782,7 @@ fn walk(facts: &Facts, loops: &Loops, l: &Loop, sites: Vec<Site>) -> Walk {
             }
             // the first site's world-space ray (mold B: the top's)
             if s == first {
-                for root in roots {
+                for root in sorted(roots) {
                     if let Root::Outside(o) = root {
                         roles.entry(o).or_insert(role.clone());
                     }
@@ -1785,7 +1793,7 @@ fn walk(facts: &Facts, loops: &Loops, l: &Loop, sites: Vec<Site>) -> Walk {
             let (roots, seen) = facts.roots(ptr, region);
             pointers.extend(seen);
             if s == first {
-                for root in roots {
+                for root in sorted(roots) {
                     if let Root::Outside(o) = root {
                         roles.entry(o).or_insert(Role::Root);
                     }
@@ -1860,7 +1868,7 @@ fn walk(facts: &Facts, loops: &Loops, l: &Loop, sites: Vec<Site>) -> Walk {
     for live in &mut outputs {
         let (roots, seen) = facts.roots(live.value, region);
         let uncapped = not_capped(facts, live.value, region);
-        let inside: Vec<Site> = roots.iter().filter_map(|r| match r {
+        let inside: Vec<Site> = sorted(roots.clone()).iter().filter_map(|r| match r {
             Root::Inside(s) => Some(*s),
             _ => None,
         }).collect();
@@ -2241,7 +2249,11 @@ fn instance_mask(facts: &Facts, region: &[bool], loads: &HashMap<Site, i64>) -> 
     match found.len() {
         1 => found.pop().expect("one"),
         0 => Mask::Unknown("no test of an instance's +48".into()),
-        n => Mask::Unknown(format!("{n} tests: {found:?}")),
+        n => {
+            let mut said: Vec<String> = found.iter().map(|m| format!("{m:?}")).collect();
+            said.sort();
+            Mask::Unknown(format!("{n} tests: {}", said.join(", ")))
+        }
     }
 }
 
