@@ -218,6 +218,14 @@ fn record_on(host: &HostList, origin: Origin, builds: &[Build]) -> bool {
         if builds.iter().any(|b| matches!(b.level, Level::Top { .. })) {
             // The top levels read the bottom levels' boxes.
             wait_all(&list);
+            // Their instances are rewritten at submission to name the newest
+            // bottom levels already submitted (`super::top`): the ones built
+            // just above are, for a top level after them in the same list, so
+            // they are said submitted at a step before the rewrite's (steps
+            // run in the order they are put; else the first build of a bottom
+            // level was not named by the top level of its own batch, and a
+            // rebuilt one was named in its stale version).
+            std::mem::take(&mut held).give(host);
         }
         for b in builds.iter().filter(|b| matches!(b.level, Level::Top { .. })) {
             match super::top::top(host, &list, gpu, &mut table, b, frame, &mut held) {
