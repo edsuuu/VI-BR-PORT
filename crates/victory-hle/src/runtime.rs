@@ -11,6 +11,9 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
     crate::image_watch::start(base);
+    // Diagnostics (`VICTORY_RING_CHECK`, off unless set).
+    #[cfg(windows)]
+    victory_gpu::title_image(base);
 }
 
 pub fn main_image() -> Option<usize> {

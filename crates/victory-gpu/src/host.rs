@@ -4212,7 +4212,8 @@ fn read_backs(list: &HostList) {
             if buffer.Map(0, None, Some(&mut data)).is_ok() && !data.is_null() {
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
-                    // Diagnostics (`VICTORY_SMASH_WATCH`).
+                    // Diagnostics (`VICTORY_SMASH_WATCH`, `VICTORY_RING_CHECK`).
+                    crate::smash::touched(crate::smash::Path::ReadBack, *at + line * pitch, *row);
                     if crate::smash::checks() {
                         let src = from.add(line * row.next_multiple_of(256));
                         crate::smash::before_copy(crate::smash::Path::ReadBack, *at + line * pitch, src, *row);
@@ -9378,6 +9379,7 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if title_dst {
         // Diagnostics (`VICTORY_SMASH_WATCH`): a title pointer this changes
         // (a source that cannot be read is taken as the zeros it leaves).
+        crate::smash::touched(crate::smash::Path::Copy, dst as usize, len);
         if crate::smash::checks() {
             crate::smash::before_copy(crate::smash::Path::Copy, dst as usize, src, len);
         }

@@ -69,6 +69,8 @@ pub mod replay;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod ringcheck;
+#[cfg(windows)]
 mod safecopy;
 #[cfg(windows)]
 mod sampler;
@@ -119,6 +121,13 @@ pub fn frame_phase() -> u32 {
 }
 #[cfg(windows)]
 pub use host::set_title_dir;
+
+/// The title's main image is mapped at `base`: with `VICTORY_RING_CHECK`,
+/// the walks of its ring allocator's records begin (`ringcheck`).
+#[cfg(windows)]
+pub fn title_image(base: usize) {
+    ringcheck::title_image(base);
+}
 
 /// For the crash report: the writes of ours into title memory that turned a
 /// title pointer into no pointer (`VICTORY_SMASH_WATCH`; empty when it is

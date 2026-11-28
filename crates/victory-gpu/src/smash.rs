@@ -37,6 +37,10 @@
 //! path of ours wrote that 64 KiB last and when ([`touched`]). A write that
 //! none of our paths made (the title's own code, or something not listed
 //! here) is seen there too, as one with no event of ours at its address.
+//! But so is the title's own reuse of a block's last bytes (a block handed
+//! out again without a record holds data there): some 8,000 lines a run in
+//! barco-q-w1..3, none of them a crash. `crate::ringcheck` (`VICTORY_RING_CHECK`)
+//! looks only at the records the title still holds.
 //!
 //! What it costs (`1`): a landed 4 KiB page in which the card's bytes differ
 //! from the CPU side's is read from title memory once more (some 25 MB a
@@ -52,12 +56,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// `VICTORY_SMASH_WATCH`: 0 (unset) off, 1 the writes, 2 also the watch of
-/// block ends.
+/// block ends. Off without `crate::safecopy` (`VICTORY_SAFE_COPY=0`): its
+/// reads of title memory go through that copy.
 pub(crate) fn level() -> u8 {
     static LEVEL: OnceLock<u8> = OnceLock::new();
     *LEVEL.get_or_init(|| match std::env::var("VICTORY_SMASH_WATCH").ok().as_deref().map(str::trim) {
-        Some("2") => 2,
-        Some(v) if !v.is_empty() && v != "0" => 1,
+        Some("2") if crate::safecopy::on() => 2,
+        Some(v) if !v.is_empty() && v != "0" && crate::safecopy::on() => 1,
         _ => 0,
     })
 }
@@ -88,7 +93,7 @@ pub(crate) fn checks() -> bool {
 /// title's CPU; the card keeps it.
 pub(crate) fn guard() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_SMASH_GUARD"))
+    *ON.get_or_init(|| crate::switch::on("VICTORY_SMASH_GUARD") && crate::safecopy::on())
 }
 
 /// Qwords [`keep_title`] kept, since the start and since the last line.
@@ -186,7 +191,7 @@ impl Path {
         self as usize
     }
 
-    fn name(self) -> &'static str {
+    pub(crate) fn name(self) -> &'static str {
         match self {
             Path::LandCard => "landing (a copy in the card's memory)",
             Path::LandBack => "landing (a copy in the PC's memory)",
@@ -300,11 +305,11 @@ static BY_ADDRESS: Mutex<Option<std::collections::HashMap<usize, Event>>> = Mute
 const BY_ADDRESS_MOST: usize = 1 << 16;
 
 /// The last event at `at`, if one is kept.
-fn event_at(at: usize) -> Option<Event> {
+pub(crate) fn event_at(at: usize) -> Option<Event> {
     BY_ADDRESS.try_lock().ok()?.as_ref()?.get(&at).copied()
 }
 
-fn ms() -> u64 {
+pub(crate) fn ms() -> u64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
@@ -419,8 +424,7 @@ pub(crate) fn seen_copy(start: usize, len: usize) {
         }
         *watched = (start, len);
     }
-    TOUCHED_BASE.store(start / BLOCK * BLOCK, Ordering::Relaxed);
-    let _ = TOUCHED.set((0..(len / BLOCK + 2).min(WATCH_MOST)).map(|_| AtomicU64::new(0)).collect());
+    touch_range(start, len);
     tracing::info!(
         start = format_args!("{start:#x}"),
         len,
@@ -428,6 +432,17 @@ pub(crate) fn seen_copy(start: usize, len: usize) {
         "smash watch (VICTORY_SMASH_WATCH=2): the qword 16 bytes before the end of each 64 KiB of this copy is watched"
     );
     let _ = std::thread::Builder::new().name("victory-smash-watch".into()).spawn(move || watch(start, len));
+}
+
+/// From now on [`touched`] notes who of ours writes each 64 KiB of `[start,
+/// start + len)`, for the watch of block ends and `crate::ringcheck` (the
+/// first range asked for is kept).
+pub(crate) fn touch_range(start: usize, len: usize) {
+    if TOUCHED.get().is_some() {
+        return;
+    }
+    TOUCHED_BASE.store(start / BLOCK * BLOCK, Ordering::Relaxed);
+    let _ = TOUCHED.set((0..(len / BLOCK + 2).min(WATCH_MOST)).map(|_| AtomicU64::new(0)).collect());
 }
 
 /// A path of ours writes `[at, at + len)` of title memory: noted for the
@@ -450,7 +465,7 @@ pub(crate) fn touched(path: Path, at: usize, len: usize) {
 }
 
 /// Who of ours wrote the 64 KiB at `at` last, and how long ago.
-fn last_touch(at: usize) -> Option<(Path, u64)> {
+pub(crate) fn last_touch(at: usize) -> Option<(Path, u64)> {
     let pieces = TOUCHED.get()?;
     let base = TOUCHED_BASE.load(Ordering::Relaxed);
     let stamp = pieces.get(at.checked_sub(base)? / BLOCK)?.load(Ordering::Relaxed);
@@ -601,7 +616,6 @@ unsafe fn look_before_merge(
 ) -> Vec<(usize, u64, u64)> {
     let path = if card { Path::LandCard } else { Path::LandBack };
     let mut keep = Vec::new();
-    touched(path, title, len);
     // SAFETY: the caller's.
     if len == 0 || len > 4096 || !unsafe { crate::safecopy::differ(now, held, len) } {
         return keep;
@@ -640,7 +654,6 @@ unsafe fn look_before_merge(
 /// Before `now` is put at title address `at` where it differs from `was`
 /// (what title memory held when read: `crate::shadow`'s `put_changed`).
 pub(crate) fn before_put(path: Path, at: usize, was: &[u8], now: &[u8]) {
-    touched(path, at, now.len());
     let n = was.len().min(now.len());
     let mut i = at.wrapping_neg() & 7;
     while i + 8 <= n {
@@ -657,7 +670,6 @@ pub(crate) fn before_put(path: Path, at: usize, was: &[u8], now: &[u8]) {
 /// memory at `dst`: both are read here (what cannot be read is taken as
 /// zeros, which the copy leaves there).
 pub(crate) fn before_copy(path: Path, dst: usize, src: *const u8, len: usize) {
-    touched(path, dst, len);
     let (mut was, mut now) = ([0u8; 4096], [0u8; 4096]);
     let mut from = 0;
     while from < len {
@@ -672,29 +684,15 @@ pub(crate) fn before_copy(path: Path, dst: usize, src: *const u8, len: usize) {
             if !unsafe { crate::safecopy::copy(now.as_mut_ptr(), src.wrapping_add(from), n) } {
                 now[..n].fill(0);
             }
-            before_put_quiet(path, dst + from, &was[..n], &now[..n]);
+            before_put(path, dst + from, &was[..n], &now[..n]);
         }
         from += n;
-    }
-}
-
-/// [`before_put`] without noting the write for the watch (the caller did).
-fn before_put_quiet(path: Path, at: usize, was: &[u8], now: &[u8]) {
-    let mut i = at.wrapping_neg() & 7;
-    while i + 8 <= was.len() {
-        let w = u64::from_le_bytes(was[i..i + 8].try_into().unwrap_or_default());
-        let v = u64::from_le_bytes(now[i..i + 8].try_into().unwrap_or_default());
-        if w != v && smashes(w, v) {
-            note(Event { path, at: at + i, was: w, now: v, card: None, landing: landing_number(), frame: crate::frame::current(), ms: ms() });
-        }
-        i += 8;
     }
 }
 
 /// Before the low `bytes` (4 or 8) of `value` are stored at `at`
 /// (`crate::queue::Written::write`).
 pub(crate) fn before_value(at: usize, value: u64, bytes: usize) {
-    touched(Path::Value, at, bytes);
     let aligned = at & !7;
     let mut was = [0u8; 16];
     // SAFETY: into our own array; memory that is not there fails the copy.

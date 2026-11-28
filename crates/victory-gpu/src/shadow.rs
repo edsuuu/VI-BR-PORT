@@ -2253,6 +2253,7 @@ fn under_wide() -> bool {
 /// shortcut: a piece with very many runs has them joined over small gaps,
 /// where the old race is left.
 fn put_changed(at: usize, title: &[u8], merged: &[u8]) -> usize {
+    crate::smash::touched(crate::smash::Path::PutBack, at, merged.len());
     if crate::smash::checks() {
         crate::smash::before_put(crate::smash::Path::PutBack, at, title, merged);
     }

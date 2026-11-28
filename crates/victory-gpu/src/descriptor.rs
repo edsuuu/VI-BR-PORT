@@ -838,9 +838,12 @@ pub(crate) extern "system" fn create_rtv(
     };
     // Diagnostics (`VICTORY_SMASH_WATCH`): a title pointer this changes.
     #[cfg(windows)]
-    if crate::smash::checks() {
-        let bytes = std::ptr::from_ref(&record).cast::<u8>();
-        crate::smash::before_copy(crate::smash::Path::Descriptor, handle as usize, bytes, size_of::<RtvRecord>());
+    {
+        crate::smash::touched(crate::smash::Path::Descriptor, handle as usize, size_of::<RtvRecord>());
+        if crate::smash::checks() {
+            let bytes = std::ptr::from_ref(&record).cast::<u8>();
+            crate::smash::before_copy(crate::smash::Path::Descriptor, handle as usize, bytes, size_of::<RtvRecord>());
+        }
     }
     // SAFETY: the handle is a descriptor slot, at least 112 bytes.
     unsafe { (handle as *mut RtvRecord).write_unaligned(record) };
@@ -1355,9 +1358,12 @@ fn record(handle: u64, view: View) {
     let [i, generation] = words_for(view);
     // Diagnostics (`VICTORY_SMASH_WATCH`): a title pointer this changes.
     #[cfg(windows)]
-    if crate::smash::checks() {
-        let words = [VIEW_TAG, i, generation];
-        crate::smash::before_copy(crate::smash::Path::Descriptor, handle as usize, words.as_ptr().cast(), 12);
+    {
+        crate::smash::touched(crate::smash::Path::Descriptor, handle as usize, 12);
+        if crate::smash::checks() {
+            let words = [VIEW_TAG, i, generation];
+            crate::smash::before_copy(crate::smash::Path::Descriptor, handle as usize, words.as_ptr().cast(), 12);
+        }
     }
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
@@ -1577,8 +1583,11 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
     if dst != 0 && src != 0 {
         // Diagnostics (`VICTORY_SMASH_WATCH`): a title pointer this changes.
         #[cfg(windows)]
-        if crate::smash::checks() {
-            crate::smash::before_copy(crate::smash::Path::Descriptor, dst as usize, src as *const u8, len as usize);
+        {
+            crate::smash::touched(crate::smash::Path::Descriptor, dst as usize, len as usize);
+            if crate::smash::checks() {
+                crate::smash::before_copy(crate::smash::Path::Descriptor, dst as usize, src as *const u8, len as usize);
+            }
         }
         // SAFETY: both ranges are descriptor slots the title owns.
         #[cfg(windows)]

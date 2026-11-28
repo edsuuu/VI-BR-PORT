@@ -625,6 +625,7 @@ unsafe fn piece_at(
         }
         // Diagnostics (`VICTORY_SMASH_WATCH`): a title pointer this changes.
         // `take` is what a copy in the card's memory asks for (`land_card`).
+        crate::smash::touched(if take { crate::smash::Path::LandCard } else { crate::smash::Path::LandBack }, title + from, n);
         let keep = if crate::smash::on() {
             // SAFETY: the caller's.
             unsafe { crate::smash::before_merge(take, title + from, now.add(from), held.add(from), n) }
