@@ -261,6 +261,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// True the first time only. Where we knowingly differ from the documented
+/// behaviour in a way only some uses can notice, the first such use is
+/// said once (release logs included, with where it came from), so a run
+/// shows whether the difference can matter to the title at all.
+fn first(seen: &AtomicBool) -> bool {
+    !seen.swap(true, Ordering::Relaxed)
+}
+
 /// The process queue: `None` until first used (then a thread-pool queue),
 /// `Some(None)` once the title clears it.
 static PROCESS_QUEUE: Mutex<Option<Option<Arc<Queue>>>> = Mutex::new(None);
@@ -364,6 +372,21 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
         return false;
     };
     if port.mode != Mode::Manual {
+        // Documented: any port may be dispatched, the callback then running
+        // on the caller's thread, and the timeout is waited out when nothing
+        // is queued. Ours hand their callbacks to threads of their own, so
+        // there is never one to take here, and we do not wait: a title loop
+        // that dispatches such a port with a timeout spins instead of
+        // sleeping. https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueuedispatch
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if first(&SEEN) {
+            tracing::info!(
+                mode = ?port.mode,
+                timeout_ms,
+                from = %super::kernel::callers(),
+                "XTaskQueueDispatch on a port that is not manual: false at once, the timeout not waited out (said once)"
+            );
+        }
         return false;
     }
     match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
@@ -390,15 +413,34 @@ pub fn XTaskQueueSubmitDelayedCallback(
 
 /// Cancels what is still queued or waiting out a delay (callbacks see
 /// `canceled`), refuses new work, then calls `callback`.
+///
+/// Documented, every pending callback of both ports is dispatched as
+/// canceled where its port dispatches (a manual port by the title's
+/// dispatch calls), the terminated callback comes from the completion port
+/// at the end, and `wait` makes the call return only once all that is
+/// done. Here the canceled callbacks and the terminated callback run on the
+/// calling thread before it returns, whatever `wait` says; callbacks
+/// already handed to the thread pool are neither canceled nor waited for.
+/// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xtaskqueue/functions/xtaskqueueterminate
 pub fn XTaskQueueTerminate(
     handle: *const Queue,
-    _wait: bool,
+    wait: bool,
     context: *mut c_void,
     callback: Option<TerminatedCallback>,
 ) -> HRESULT {
     let Some(queue) = queue(handle) else {
         return E_INVALIDARG;
     };
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    if first(&SEEN) {
+        tracing::info!(
+            wait,
+            work = ?queue.ports[WORK as usize].mode,
+            completion = ?queue.ports[COMPLETION as usize].mode,
+            from = %super::kernel::callers(),
+            "XTaskQueueTerminate: queued callbacks run canceled on this thread, thread-pool ones are not canceled (said once)"
+        );
+    }
     queue.terminated.store(true, Ordering::Release);
     for port in &queue.ports {
         let pending: Vec<Task> = lock(&port.tasks).drain(..).collect();
@@ -724,12 +766,45 @@ pub fn XAsyncGetResultSize(block: *mut AsyncBlock, out: *mut usize) -> HRESULT {
 /// Asks the provider to cancel; the call fails with `E_ABORT` unless the
 /// provider completed it first. A completed call is left alone.
 pub fn XAsyncCancel(block: *mut AsyncBlock) {
+    cancel(block, cancel_by_provider());
+}
+
+/// `VICTORY_XASYNC_CANCEL=provider`: a cancel only asks the provider, and
+/// the call ends when the provider completes it, as documented: with
+/// `E_ABORT` if it can cancel, at once or later, else with its own result
+/// when its work is done. Off by default: the call then ends with `E_ABORT`
+/// right after the provider was asked, and the provider is cleaned up at
+/// once, even while work of its own is still under way (its later
+/// completion is dropped, or ends a call begun since on the same block).
+/// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasync/functions/xasynccancel
+/// https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/enums/xasyncop
+fn cancel_by_provider() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("VICTORY_XASYNC_CANCEL").is_ok_and(|v| v.trim() == "provider");
+        tracing::info!(on, "XAsyncCancel leaves the call to its provider (VICTORY_XASYNC_CANCEL=provider)");
+        on
+    })
+}
+
+/// [`XAsyncCancel`], the provider left to end the call or not.
+fn cancel(block: *mut AsyncBlock, by_provider: bool) {
     if let Some(call) = call(block) {
         if *lock(&call.done) {
             return;
         }
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if first(&SEEN) {
+            tracing::info!(
+                by_provider,
+                from = %super::kernel::callers(),
+                "XAsyncCancel on a call in flight (said once)"
+            );
+        }
         call.provider(OP_CANCEL, block, 0, std::ptr::null_mut());
-        complete_call(&call, block, E_ABORT, 0);
+        if !by_provider {
+            complete_call(&call, block, E_ABORT, 0);
+        }
     }
 }
 
@@ -757,6 +832,16 @@ pub fn XAsyncGetResult(
         return E_ILLEGAL_METHOD_CALL;
     };
     if call.identity != identity as usize {
+        // Documented as a call mismatch. Our result functions pass the
+        // identity their begin used, so for one of ours this is a mix-up of
+        // ours, not the title's.
+        static SEEN: AtomicBool = AtomicBool::new(false);
+        if first(&SEEN) {
+            tracing::warn!(
+                from = %super::kernel::callers(),
+                "XAsyncGetResult for another call than the block's: E_INVALIDARG (said once)"
+            );
+        }
         return E_INVALIDARG;
     }
     if buffer_size < size || buffer.is_null() {
@@ -835,50 +920,87 @@ pub fn finished_with(
 
 /// Like [`finished_with`], but the result comes from `work`, run on a
 /// thread of ours; the call stays pending until it returns (a dialog, say).
+///
+/// A cancel ends the call before the work returns, and the call's cleanup
+/// then frees the provider's state while the thread still runs. So the
+/// thread holds the result's slot by a reference of its own, and completes
+/// only the call it was started for: by then the title may have begun
+/// another call on the same block, which completing by block would end.
+/// The work itself cannot be stopped (a dialog waits for the user); what
+/// it returns after a cancel is dropped.
 pub fn pending_with(
     block: *mut AsyncBlock,
     identity: *const c_void,
     work: impl FnOnce() -> Result<Vec<u8>, HRESULT> + Send + 'static,
 ) -> HRESULT {
-    type Data = Mutex<(Option<Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>>, Vec<u8>)>;
+    type Work = Box<dyn FnOnce() -> Result<Vec<u8>, HRESULT> + Send>;
+    /// The provider's context: the work until the call begins, the call
+    /// once begun, and the result's bytes, which the thread fills before it
+    /// completes.
+    struct State {
+        work: Mutex<Option<Work>>,
+        call: Mutex<Option<Arc<Call>>>,
+        result: Arc<Mutex<Vec<u8>>>,
+    }
     extern "system" fn provider(op: u32, data: *const ProviderData) -> HRESULT {
         // SAFETY: the runtime passes valid provider data; the context is the
         // boxed state until cleanup frees it.
         let data = unsafe { &*data };
-        let state = data.context.cast::<Data>();
+        let state = data.context.cast::<State>();
         match op {
-            // SAFETY: boxed in `pending_with`; nothing runs after cleanup.
+            // SAFETY: boxed in `pending_with`; nothing here runs after
+            // cleanup, and the thread holds no reference to the box.
             OP_CLEANUP => drop(unsafe { Box::from_raw(state) }),
             OP_BEGIN => {
-                // SAFETY: as above; cleanup waits for completion.
-                let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
-                let (block, state) = (data.block as usize, state as usize);
+                // SAFETY: as above; the call has just begun.
+                let state = unsafe { &*state };
+                // `XAsyncBegin` files the call before it asks us to begin.
+                let Some(call) = call(data.block) else {
+                    return E_INVALIDARG;
+                };
+                *lock(&state.call) = Some(call.clone());
+                let work = lock(&state.work).take();
+                let result = state.result.clone();
+                let block = data.block as usize;
                 std::thread::spawn(move || {
-                    let result = work.map_or(Err(E_ABORT), |work| work());
-                    let (hr, len) = match &result {
+                    let outcome = work.map_or(Err(E_ABORT), |work| work());
+                    let (hr, len) = match &outcome {
                         Ok(bytes) => (S_OK, bytes.len()),
                         Err(hr) => (*hr, 0),
                     };
-                    if let Ok(bytes) = result {
-                        // SAFETY: the call is pending, so its state lives.
-                        let state = unsafe { &*(state as *const Data) };
-                        state.lock().unwrap_or_else(|e| e.into_inner()).1 = bytes;
+                    if let Ok(bytes) = outcome {
+                        *lock(&result) = bytes;
                     }
-                    XAsyncComplete(block as *mut AsyncBlock, hr, len);
+                    // Does nothing if the call is over (canceled), and then
+                    // never touches the block, which may be gone.
+                    complete_call(&call, block as *mut AsyncBlock, hr, len);
                 });
             }
-            // SAFETY: as above; the runtime checked the buffer's size.
-            OP_GET_RESULT => unsafe {
-                let state = (*state).lock().unwrap_or_else(|e| e.into_inner());
-                data.buffer
-                    .cast::<u8>()
-                    .copy_from(state.1.as_ptr(), state.1.len());
-            },
+            // The work goes on, but the call ends now, as a provider that
+            // can cancel ends it: this call, whatever the block holds.
+            OP_CANCEL => {
+                // SAFETY: as above; a call in flight is not cleaned up.
+                let call = lock(&unsafe { &*state }.call).clone();
+                if let Some(call) = call {
+                    complete_call(&call, data.block, E_ABORT, 0);
+                }
+            }
+            OP_GET_RESULT => {
+                // SAFETY: as above; the call is over but not cleaned up.
+                let result = lock(&unsafe { &*state }.result);
+                let buffer = data.buffer.cast::<u8>();
+                // SAFETY: the runtime checked the buffer's size.
+                unsafe { buffer.copy_from(result.as_ptr(), result.len()) }
+            }
             _ => {}
         }
         S_OK
     }
-    let state: Box<Data> = Box::new(Mutex::new((Some(Box::new(work)), Vec::new())));
+    let state = Box::new(State {
+        work: Mutex::new(Some(Box::new(work))),
+        call: Mutex::new(None),
+        result: Arc::default(),
+    });
     let context = Box::into_raw(state);
     let hr = XAsyncBegin(block, context.cast(), identity, std::ptr::null(), Some(provider));
     if hr < 0 {
@@ -1116,6 +1238,28 @@ mod tests {
             if canceled { 100 } else { context as u32 },
             Ordering::SeqCst,
         );
+    }
+
+    #[test]
+    fn a_difference_is_said_once() {
+        let seen = AtomicBool::new(false);
+        assert!(first(&seen));
+        assert!(!first(&seen));
+        assert!(!first(&seen));
+    }
+
+    /// What the first-use line says: a port that is not manual is never
+    /// dispatched here, and the timeout is not waited out.
+    #[test]
+    fn dispatching_a_thread_pool_port_returns_at_once() {
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 1, &mut q), S_OK);
+        let start = std::time::Instant::now();
+        for _ in 0..2 {
+            assert!(!XTaskQueueDispatch(q, WORK, 500));
+        }
+        assert!(start.elapsed() < Duration::from_millis(400));
+        XTaskQueueCloseHandle(q);
     }
 
     #[test]
@@ -1375,6 +1519,130 @@ mod tests {
         XAsyncCancel(&mut block);
         assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
         XTaskQueueCloseHandle(q);
+    }
+
+    fn fresh() -> AsyncBlock {
+        AsyncBlock {
+            queue: std::ptr::null(),
+            context: std::ptr::null_mut(),
+            callback: None,
+            internal: [0; 4],
+        }
+    }
+
+    #[test]
+    fn a_pending_call_returns_what_its_work_made() {
+        let identity = 0x7b as *const c_void;
+        let mut block = fresh();
+        assert_eq!(pending_with(&mut block, identity, || Ok(vec![1, 2, 3])), S_OK);
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+        let mut size = 0;
+        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_OK);
+        assert_eq!(size, 3);
+        let (mut out, mut used) = ([0u8; 3], 0);
+        let buffer = out.as_mut_ptr().cast();
+        assert_eq!(XAsyncGetResult(&mut block, identity, 3, buffer, &mut used), S_OK);
+        assert_eq!((out, used), ([1, 2, 3], 3));
+        assert!(call(&mut block).is_none(), "the call ends with its result");
+    }
+
+    /// A dialog's call canceled while its thread still waits for the user:
+    /// when the user answers, the thread ends the canceled call only, not
+    /// the call the title began next on the same block.
+    #[test]
+    fn a_canceled_pending_call_leaves_the_next_call_alone() {
+        /// Never completes by itself.
+        extern "system" fn idle(_: u32, _: *const ProviderData) -> HRESULT {
+            S_OK
+        }
+        let none = std::ptr::null_mut();
+        let identity = 0x7a as *const c_void;
+        let mut block = fresh();
+        let (answer, answered) = std::sync::mpsc::channel::<()>();
+        let (returning, returned) = std::sync::mpsc::channel::<()>();
+        let work = move || {
+            let _ = answered.recv();
+            let _ = returning.send(());
+            Ok(vec![7; 64])
+        };
+        assert_eq!(pending_with(&mut block, identity, work), S_OK);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING);
+        XAsyncCancel(&mut block);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        assert!(call(&mut block).is_none(), "canceled and cleaned up");
+
+        let next = XAsyncBegin(&mut block, none, identity, std::ptr::null(), Some(idle));
+        assert_eq!(next, S_OK);
+        answer.send(()).unwrap();
+        returned.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The thread completes right after its work returns.
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            XAsyncGetStatus(&mut block, false),
+            E_PENDING,
+            "the next call was ended by the canceled one"
+        );
+        XAsyncComplete(&mut block, E_ABORT, 0);
+    }
+
+    /// With the cancel left to the provider (`VICTORY_XASYNC_CANCEL=
+    /// provider`), the call ends as its provider ends it: one that cannot
+    /// cancel finishes with its own result, one that can with `E_ABORT`.
+    #[test]
+    fn a_cancel_left_to_the_provider_ends_the_call_as_the_provider_does() {
+        static CANCELS: AtomicU32 = AtomicU32::new(0);
+        static CLEANUPS: AtomicU32 = AtomicU32::new(0);
+        /// Goes on working when asked to cancel; its result is one byte.
+        extern "system" fn stubborn(op: u32, data: *const ProviderData) -> HRESULT {
+            match op {
+                OP_CANCEL => drop(CANCELS.fetch_add(1, Ordering::SeqCst)),
+                OP_CLEANUP => drop(CLEANUPS.fetch_add(1, Ordering::SeqCst)),
+                // SAFETY: the runtime passes valid provider data and checked
+                // the buffer holds the one byte.
+                OP_GET_RESULT => unsafe { (*data).buffer.cast::<u8>().write(0x42) },
+                _ => {}
+            }
+            S_OK
+        }
+        let (none, identity) = (std::ptr::null_mut(), 0x7c as *const c_void);
+        let begin_stubborn = |block: &mut AsyncBlock| {
+            XAsyncBegin(block, none, identity, std::ptr::null(), Some(stubborn))
+        };
+
+        let mut block = fresh();
+        assert_eq!(begin_stubborn(&mut block), S_OK);
+        cancel(&mut block, true);
+        assert_eq!(CANCELS.load(Ordering::SeqCst), 1);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_PENDING, "still working");
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 0, "cleaned up while working");
+        XAsyncComplete(&mut block, S_OK, 1);
+        let mut byte = 0u8;
+        assert_eq!(result(&mut block, identity, &mut byte), S_OK);
+        assert_eq!(byte, 0x42);
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 1);
+
+        // One that cancels.
+        let mut block = fresh();
+        assert_eq!(begin(&mut block, none, ends_itself), S_OK);
+        cancel(&mut block, true);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        assert!(call(&mut block).is_none());
+
+        // Ours, whose work cannot be stopped, ends its call itself.
+        let mut block = fresh();
+        let (answer, answered) = std::sync::mpsc::channel::<()>();
+        let work = move || answered.recv().map(|()| vec![1]).map_err(|_| E_ABORT);
+        assert_eq!(pending_with(&mut block, identity, work), S_OK);
+        cancel(&mut block, true);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        answer.send(()).unwrap();
+
+        // The default: E_ABORT and cleanup at once, whatever the provider does.
+        let mut block = fresh();
+        assert_eq!(begin_stubborn(&mut block), S_OK);
+        cancel(&mut block, false);
+        assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
+        assert_eq!(CLEANUPS.load(Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -156,6 +156,13 @@ pub(crate) fn listed(copy: &HostTexture) {
     }
 }
 
+/// Whether the upload of `resource`'s host copy is on its way here: a list
+/// that records an upload of it now waits for that one ([`listed`]), a second
+/// at most (`crate::bake`: a decoration bake about to sample it counts these).
+pub(crate) fn on_its_way(resource: This) -> bool {
+    crate::resource::made_copy(resource).is_some_and(|copy| copy.ahead.load(Relaxed) == PENDING)
+}
+
 /// The copy queue and its threads, made on first use.
 fn workers() -> Option<&'static ID3D12CommandQueue> {
     /// Free-threaded.

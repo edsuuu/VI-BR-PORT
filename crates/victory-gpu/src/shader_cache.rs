@@ -82,6 +82,8 @@ fn build() -> [u8; 32] {
             "VICTORY_WAVE_LOCAL",
             "VICTORY_GUARDED_DESCRIPTORS",
             "VICTORY_WAVE_WIDE_FOR",
+            "VICTORY_WAVE_PAIRED",
+            "VICTORY_WAVE_PAIRED_FOR",
             "VICTORY_WAVE_EARLY_OUTS",
             "VICTORY_WAVE_SELECTIVE_SKIPS",
             "VICTORY_WAVE_EARLY_OUTS_EXCHANGE",
@@ -97,6 +99,9 @@ fn build() -> [u8; 32] {
             // Opt-in Wave32 LDS hazard analysis and write-only compatibility switch.
             "VICTORY_LDS_ANALYZE",
             "VICTORY_LDS_WRITE_ONLY_OK",
+            // Which pixel programs declare the console's early depth test.
+            "VICTORY_EARLY_DEPTH",
+            "VICTORY_EARLY_DEPTH_FOR",
             // Whether the ray-tracing node test always misses.
             "VICTORY_RT_MISS",
         ] {
@@ -135,7 +140,13 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| {
-        victory_shader::emit::with_wide_first(wide_first(c), || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+        let paired = paired_first(c);
+        victory_shader::emit::with_early_depth_named(early_depth_named(c), || {
+            victory_shader::emit::with_paired_first(paired, || {
+                victory_shader::emit::with_wide_first(wide_first(c), || victory_shader::emit::translate(c))
+            })
+        })
+        .map_err(|e| e.to_string())
     };
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
@@ -161,6 +172,22 @@ fn wide_first(container: &[u8]) -> bool {
     }
     let hash = blake3::hash(container).to_hex();
     named.iter().any(|h| hash.starts_with(h.as_str()))
+}
+
+/// Whether `container` is one of the programs named in `VICTORY_WAVE_PAIRED_FOR` (as in
+/// `VICTORY_WAVE_WIDE_FOR`): those may take the paired form
+/// (`victory_shader::emit::with_paired_first`). Off unless named.
+fn paired_first(container: &[u8]) -> bool {
+    victory_shader::emit::paired_names_any() && victory_shader::emit::paired_named(&blake3::hash(container).to_hex())
+}
+
+/// Whether `container` is one of the programs named in `VICTORY_EARLY_DEPTH_FOR` (as in
+/// `VICTORY_WAVE_WIDE_FOR`): a pixel program among them that the console depth-tests before it
+/// runs declares that test on the host (`victory_shader::emit::with_early_depth_named`). None
+/// unless named.
+fn early_depth_named(container: &[u8]) -> bool {
+    victory_shader::emit::early_depth_names_any()
+        && victory_shader::emit::early_depth_named(&blake3::hash(container).to_hex())
 }
 
 /// The cache entry's converter: the build and the container in, the

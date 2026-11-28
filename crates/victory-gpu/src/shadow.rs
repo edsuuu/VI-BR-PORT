@@ -4973,10 +4973,13 @@ pub(crate) fn unregister(resource: usize, start: u64) {
 }
 
 /// The title buffer holding `address`, as (start, length), without making
-/// its copy (diagnostics: which buffer a dropped program's root view names).
-#[cfg(feature = "diagnostics")]
+/// its copy (which buffer a dropped program's root view names; how far a
+/// decoration bake's root view goes, `crate::bake`). Under the map's read
+/// lock: [`buffers`] would count the map as changed.
 pub(crate) fn extent(address: u64) -> Option<(u64, u64)> {
-    buffers()
+    BUFFERS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)

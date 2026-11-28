@@ -41,6 +41,12 @@
 //!
 //! `VICTORY_AMBIENT_OUTSIDE=<share>[:<least>]` keeps the constant inside rooms
 //! and gives the estimate outside them ([`outside`]).
+//! `VICTORY_AMBIENT_DAY=<from>:<to>` gives outside rooms back to the title by
+//! day ([`day`]). `VICTORY_AMBIENT_CONTRAST=<ratio>[:<most gain>]` raises a
+//! dark bulk under a few bright lights outside rooms ([`contrast`]).
+//! `VICTORY_AMBIENT_CUT=<factor>` follows a cut at once ([`cut`]).
+//! `VICTORY_AMBIENT_AIR_SOFT=1` bends the air's bound in ([`air_soft`]).
+//! `VICTORY_AMBIENT_EDGE=<pixels>` blends a room's edge ([`edge`]).
 
 use std::sync::{Mutex, OnceLock};
 
@@ -332,6 +338,161 @@ fn parse_outside(set: &str) -> [f32; 2] {
     }
 }
 
+/// `VICTORY_AMBIENT_DAY=<from>:<to>`, with `VICTORY_AMBIENT_OUTSIDE`: as the
+/// slow mean luminance of the light around goes from `<from>` to `<to>`,
+/// texels outside rooms go from the estimate to the title's own light (what
+/// its rays leave: the sky's light), never under the constant. Unset: the
+/// estimate at any hour, as before.
+///
+/// Why: by day the estimate is about the mean of what sunlit surfaces send
+/// out (slow mean 4-11 on the boat, run barco-ab-agua0), so every shade
+/// outdoors got nearly the light of the sunlit ground: the flat orange wash
+/// of the boat's cutscenes. Night scenes stay far below (the opening's
+/// street 0.002-0.03, the diner cutscene 0.1-0.25, the prison's rooms
+/// 0.1-0.2).
+fn day() -> [f32; 2] {
+    static SET: OnceLock<[f32; 2]> = OnceLock::new();
+    *SET.get_or_init(|| parse_day(&std::env::var("VICTORY_AMBIENT_DAY").unwrap_or_default()))
+}
+
+fn parse_day(set: &str) -> [f32; 2] {
+    let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 0.0);
+    let (from, to) = set.split_once(':').unwrap_or((set, ""));
+    match (number(from), number(to)) {
+        (Some(from), Some(to)) if to > from => [from, to],
+        _ => [0.0, 0.0],
+    }
+}
+
+/// How much of the title's own light a texel outside rooms keeps for a slow
+/// mean luminance `mean` (0: the estimate, 1: the title's). The raise pass
+/// does the same.
+fn day_share(mean: f32, [from, to]: [f32; 2]) -> f32 {
+    if to <= from {
+        return 0.0;
+    }
+    ((mean - from) / (to - from)).clamp(0.0, 1.0)
+}
+
+/// `VICTORY_AMBIENT_CONTRAST=<ratio>[:<most gain>]`, with
+/// `VICTORY_AMBIENT_OUTSIDE`: outside rooms the stand-in is raised, by at
+/// most `<most gain>` (default 8), while the mean of what visible surfaces
+/// send out is more than `<ratio>` times their log-average, until it is not
+/// (the gain follows that ratio over a few frames: [`contrast_step`]). Unset:
+/// no such gain, as before.
+///
+/// Why: the title meters its exposure on what it draws, and a night
+/// cutscene lit by a few strong lamps (the diner after the boat save: slow
+/// mean 0.12-0.23, log-average 0.011-0.03, runs barco-ab-agua0 and
+/// cena-hoje) is exposed for them, so the bulk lit by the stand-in alone
+/// (floor 0.16) sits at 3-10 of 255 on screen; the floor raised from yesterday's
+/// 0.1 changed it by one or two steps. The stencil does not mark that scene
+/// as a room, so the key does nothing there. The opening's night street,
+/// which a key outside rooms washed out (run intro-s-cand), is lit evenly by
+/// its lamps and the floor: its mean is 1.5-4 times its log-average (run
+/// intro-s-luz3), and with a ratio above that it gets no gain.
+fn contrast() -> [f32; 2] {
+    static SET: OnceLock<[f32; 2]> = OnceLock::new();
+    *SET.get_or_init(|| parse_contrast(&std::env::var("VICTORY_AMBIENT_CONTRAST").unwrap_or_default()))
+}
+
+fn parse_contrast(set: &str) -> [f32; 2] {
+    let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
+    let (ratio, most) = set.split_once(':').unwrap_or((set, ""));
+    match number(ratio) {
+        Some(ratio) => [ratio, number(most).unwrap_or(8.0).max(1.0)],
+        None => [0.0, 1.0],
+    }
+}
+
+/// One frame of the contrast gain, in the log, as the mean pass does it:
+/// a fifth of the way to the ratio of `mean` to `ratio` times `bulk` (the
+/// frame's log-average), as much as the screen is outside rooms, between
+/// no gain and `most`.
+#[cfg(test)]
+fn contrast_step(log_gain: f32, mean: f32, bulk: f32, [ratio, most]: [f32; 2], outside_share: f32) -> f32 {
+    let err = (mean.max(1e-6) / (ratio * bulk.max(1e-5))).ln();
+    (log_gain + 0.2 * err * outside_share.clamp(0.0, 1.0)).clamp(0.0, most.max(1.0).ln())
+}
+
+/// `VICTORY_AMBIENT_CUT=<factor>`: when a frame's log-average of what visible
+/// surfaces send out is more than `<factor>` times the slow one, or under it
+/// by as much (a cut to another scene), the slow measures (the mean, the
+/// log-averages, the rooms' measures and share) start over from that frame;
+/// the rooms' too when half the screen goes from street to room at once.
+/// The contrast gain then goes the whole way at once. Unset: they follow 4% a
+/// frame, as before.
+///
+/// Why: at 4% a frame (20 frames a second) a cut took 3-4 s to be followed:
+/// the cutscene after the boat save showed its first room 5-10 s with the
+/// rooms' share still rising (0.16 then 0.92, run barco-ab-agua0), and a
+/// room is raised by the gain of the last room seen, minutes before.
+fn cut() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| parse_cut(&std::env::var("VICTORY_AMBIENT_CUT").unwrap_or_default()))
+}
+
+/// The factor of `VICTORY_AMBIENT_CUT` as a distance in the log (0: off).
+fn parse_cut(set: &str) -> f32 {
+    set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 1.0).map_or(0.0, f32::ln)
+}
+
+/// Whether a frame's log-average `now` is a cut from the slow `was` (both in
+/// the log), as the mean pass tells it.
+#[cfg(test)]
+fn is_cut(was: f32, now: f32, cut: f32) -> bool {
+    cut > 0.0 && (now - was).abs() > cut
+}
+
+/// `VICTORY_AMBIENT_AIR_SOFT=1`: the bound on what the air scatters
+/// (`VICTORY_AMBIENT_AIR`) is taken between the four points around a cell
+/// of the volume, not at the nearest one, and bends in from half the bound
+/// instead of cutting off at it ([`soft_bound`]). Unset: as before.
+///
+/// Why (read from the code, not seen on this host): where the bound cuts
+/// off, the air of a cell of the volume (80x46, 16 pixels wide at 1280)
+/// takes the bound's level, flat, and the bound is read at the nearest of
+/// two points: a smooth glow on a wall becomes a few flat vertical steps.
+/// The key's word `air` divides the bound by the gain (2.3-3.5 in the
+/// prison), so it cuts off far more often than with the constant alone: the
+/// tester's banding on the prison corridor's wall came with the new set.
+fn air_soft() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| std::env::var("VICTORY_AMBIENT_AIR_SOFT").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// `VICTORY_AMBIENT_EDGE=<pixels>` (1-16): where the stencil plane's marking
+/// of a room stops, the room's light (the constant and the key's gain) and
+/// the light outside rooms (the estimate, `VICTORY_AMBIENT_OUTSIDE`) are
+/// mixed by the share of nine texels, the texel and eight `<pixels>` around
+/// it, marked inside. Unset: the texel's own bit, as before.
+///
+/// Why (read from the code): with the key's gain (2.3-3.5 in the prison)
+/// and the estimate outside rooms, a texel inside a room and its neighbour
+/// outside can get light several times apart; where the marking stops on a
+/// wall (a door's frame, a strip the title does not mark) that is a hard
+/// step the constant alone (the same light both sides) never had.
+fn edge() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| parse_edge(&std::env::var("VICTORY_AMBIENT_EDGE").unwrap_or_default()))
+}
+
+fn parse_edge(set: &str) -> f32 {
+    set.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v >= 1.0).map_or(0.0, |v| v.min(16.0))
+}
+
+/// The bound of `VICTORY_AMBIENT_AIR_SOFT`, as the air pass works it out:
+/// `has` itself up to half of `cap`, then bent towards `cap`, which it never
+/// reaches, with no corner.
+#[cfg(test)]
+fn soft_bound(has: f32, cap: f32) -> f32 {
+    let knee = 0.5 * cap;
+    if has <= knee || cap <= 0.0 {
+        return has.min(cap.max(0.0));
+    }
+    knee + (cap - knee) * (1.0 - (-(has - knee) / (cap - knee)).exp())
+}
+
 /// The word `tint`: the air's colour goes 60% of the way (times how much the
 /// key raises the room: none at a gain of 1, all from 2) to that of the light
 /// around. Its own switch word, since it changes colours, not levels.
@@ -375,7 +536,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=25, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
+#define RS "RootConstants(num32BitConstants=32, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(SRV(t1))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -389,6 +550,9 @@ const SOURCE: &str = r#"
 // the next).
 #define INSIDE (2 * CELLS + 3)
 #define INSIDE_MEAN (2 * CELLS + 4)
+// (VICTORY_AMBIENT_CONTRAST) The gain outside rooms (x, its log in y, the
+// last frame's error of the log in z).
+#define CONTRAST (2 * CELLS + 5)
 #define PX 160
 #define PY 90
 cbuffer Set : register(b0) {
@@ -401,6 +565,24 @@ cbuffer Set : register(b0) {
     // (VICTORY_AMBIENT_OUTSIDE) The estimate's share and least light outside
     // rooms with the constant; whether the stencil plane is bound.
     float outside_level; float outside_least; float has_stencil;
+    // (VICTORY_AMBIENT_DAY) The slow mean luminance over which the stand-in
+    // outside rooms starts to give way to the title's own light, and where
+    // it is all the title's (0: never).
+    float day_from; float day_to;
+    // (VICTORY_AMBIENT_CONTRAST) How many times the mean may be the bulk's
+    // log-average before the stand-in outside rooms is raised, and by how
+    // much at most (0: never).
+    float contrast; float contrast_most;
+    // (VICTORY_AMBIENT_CUT) How far, in the log, a frame's log-average is
+    // from the slow one for the slow measures to start over from it (0:
+    // never).
+    float cut;
+    // (VICTORY_AMBIENT_AIR_SOFT) Whether the air's bound is taken between
+    // the points and bends in instead of cutting off.
+    float air_soft;
+    // (VICTORY_AMBIENT_EDGE) How far, in pixels, a room's edge is blended
+    // (0: the texel's own bit).
+    float edge;
 };
 Texture2D<float> depth : register(t0);
 // The scene's stencil plane (the title's view of plane 1): bit 3 "inside a
@@ -449,14 +631,34 @@ float gain_whole(float4 mean_now) {
     return g;
 }
 
-// The same at a texel of the screen: with inside_only, 1 where the stencil
-// plane does not mark the texel inside a room (an exterior night keeps its
-// light; what a window shows of the outside too).
-float gain_at(float4 mean_now, int2 p) {
-    if (inside_only > 0.0 && (stencil.Load(int3(p, 0)).y & 8u) == 0u) return 1.0;
-    return gain_to_key(mean_now);
+// How much a texel of the screen is inside a room, by the stencil plane (the
+// key with inside_only gives no gain where it is not: an exterior night
+// keeps its light, what a window shows of the outside too): its own bit, or
+// (VICTORY_AMBIENT_EDGE) the share of it and eight texels `edge` pixels
+// around marked so, which the room's light and the light outside it are
+// mixed by. A texel's bit alone makes a hard step wherever the marking
+// stops on a wall.
+float inside_at(int2 p) {
+    if (edge <= 0.0) return (stencil.Load(int3(p, 0)).y & 8u) != 0u ? 1.0 : 0.0;
+    float n = 0.0;
+    for (int k = 0; k < 9; k++) {
+        float a = float(k) * 0.7853982;
+        int2 o = k == 0 ? int2(0, 0) : int2(round(float2(cos(a), sin(a)) * edge));
+        int2 q = clamp(p + o, int2(0, 0), int2(width, height) - 1);
+        n += (stencil.Load(int3(q, 0)).y & 8u) != 0u ? 1.0 : 0.0;
+    }
+    return n / 9.0;
 }
 
+
+// A bound that bends in (VICTORY_AMBIENT_AIR_SOFT): `has` itself up to half
+// of `cap`, then towards `cap` with the same slope where it starts. Its
+// Rust twin is `soft_bound`.
+float soft_bound(float has, float cap) {
+    float knee = 0.5 * cap;
+    if (has <= knee || cap <= 0.0) return min(has, max(cap, 0.0));
+    return knee + (cap - knee) * (1.0 - exp(-(has - knee) / (cap - knee)));
+}
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
@@ -501,17 +703,41 @@ void mean() {
     }
     float4 was = cells[CELLS];
     float3 now = sum / CELLS;
-    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, follow) : now, 1.0);
+    float4 geo_was = cells[GEO];
+    float geo_now = logs / CELLS;
+    // (VICTORY_AMBIENT_CUT) A cut to another scene: the bulk's log-average
+    // jumps by more than `cut` in the log. The slow measures then start over
+    // from this frame (a 4% step a frame took 3-4 s to follow a cut, the
+    // cutscene's first shots lit by the scene before); z of the log-average
+    // tells the rooms' measure of the resolve that follows.
+    bool cut_now = cut > 0.0 && geo_was.a > 0.0 && abs(geo_now - geo_was.y) > cut;
+    float f = cut_now ? 1.0 : follow;
+    cells[CELLS] = float4(was.a > 0.0 ? lerp(was.rgb, now, f) : now, 1.0);
     // The log-average (geometric mean) of the cells' luminance: it follows
     // the bulk of the picture, not a few windows and tubes (as the title's
     // own meter, a histogram, does), followed slowly in the log.
-    float4 geo_was = cells[GEO];
-    float geo_now = logs / CELLS;
-    float geo_log = geo_was.a > 0.0 ? lerp(geo_was.y, geo_now, follow) : geo_now;
-    cells[GEO] = float4(max(exp(geo_log) - 1e-3, 0.0), geo_log, 0.0, 1.0);
+    float geo_log = geo_was.a > 0.0 ? lerp(geo_was.y, geo_now, f) : geo_now;
+    cells[GEO] = float4(max(exp(geo_log) - 1e-3, 0.0), geo_log, cut_now ? 1.0 : 0.0, 1.0);
     float4 rgb_was = cells[GEO_RGB];
     float3 rgb_now = logs_rgb / CELLS;
-    cells[GEO_RGB] = float4(rgb_was.a > 0.0 ? lerp(rgb_was.rgb, rgb_now, follow) : rgb_now, 1.0);
+    cells[GEO_RGB] = float4(rgb_was.a > 0.0 ? lerp(rgb_was.rgb, rgb_now, f) : rgb_now, 1.0);
+    // (VICTORY_AMBIENT_CONTRAST) The gain outside rooms follows, in the log
+    // and a fifth of the way a frame, the ratio of this frame's mean to
+    // `contrast` times its bulk's log-average: up while a few bright lights
+    // stand far above a dark bulk, down to 1 when they do not. Its own light
+    // lifts the bulk, so it settles where the bulk is a `contrast`-th of the
+    // mean, not above. As much as the screen is outside rooms: a gain that
+    // acts on nothing there does not build up.
+    if (contrast > 0.0) {
+        float4 gain_was = cells[CONTRAST];
+        float g = gain_was.a > 0.0 ? gain_was.y : 0.0;
+        float bulk = max(exp(geo_now) - 1e-3, 1e-5);
+        float err = log(max(dot(now, LUMA), 1e-6) / (contrast * bulk));
+        float outside_share = cells[INSIDE_MEAN].y > 0.0 ? 1.0 - saturate(cells[INSIDE].z) : 1.0;
+        // (At a cut, the whole way at once.)
+        g = clamp(g + (cut_now ? 1.0 : 0.2) * err * outside_share, 0.0, log(max(contrast_most, 1.0)));
+        cells[CONTRAST] = float4(exp(g), g, err, 1.0);
+    }
 }
 #endif
 
@@ -542,12 +768,18 @@ void inside_share() {
     float4 was = cells[INSIDE];
     float4 mean_was = cells[INSIDE_MEAN];
     float share_now = n / float(CELLS);
-    float share = was.a > 0.0 ? lerp(was.z, share_now, follow) : share_now;
+    // (VICTORY_AMBIENT_CUT) A cut the mean pass saw, or one from the street
+    // into a room (or out of it): half the screen changes sides at once.
+    // The rooms' measures start over from this frame; they would otherwise
+    // begin from the last room's, seen minutes before.
+    float f = follow;
+    if (cut > 0.0 && (cells[GEO].z > 0.0 || (was.a > 0.0 && abs(share_now - was.z) > 0.5))) f = 1.0;
+    float share = was.a > 0.0 ? lerp(was.z, share_now, f) : share_now;
     float geo_log = was.y;
     float mean_luma = mean_was.x;
     if (n > 0) {
-        geo_log = was.a > 0.0 ? lerp(was.y, logs / n, follow) : logs / n;
-        mean_luma = was.a > 0.0 ? lerp(mean_was.x, sum / n, follow) : sum / n;
+        geo_log = was.a > 0.0 ? lerp(was.y, logs / n, f) : logs / n;
+        mean_luma = was.a > 0.0 ? lerp(mean_was.x, sum / n, f) : sum / n;
     }
     // (Valid once a room has been seen: before that the key gives nothing.)
     float seen_one = was.a > 0.0 || n > 0 ? 1.0 : 0.0;
@@ -604,6 +836,21 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     uint2 q = min(uint2((float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY)), uint2(PX - 1, PY - 1));
     uint at0 = (q.y * PX + q.x) * 3;
     float3 seen_there = float3(points[at0].w, points[at0 + 1].w, points[at0 + 2].w);
+    // (VICTORY_AMBIENT_AIR_SOFT) Between the four points around, not the
+    // nearest: a cell of the volume is two points wide, and the nearest one
+    // gave its column a level of its own.
+    if (air_soft > 0.0) {
+        float2 g = (float2(at.xy) + 0.5) / float2(w, h) * float2(PX, PY) - 0.5;
+        int2 g0 = int2(floor(g));
+        float2 t = g - float2(g0);
+        seen_there = 0;
+        for (int k = 0; k < 4; k++) {
+            int2 o = clamp(g0 + int2(k & 1, k >> 1), int2(0, 0), int2(PX, PY) - 1);
+            uint at1 = (uint(o.y) * PX + uint(o.x)) * 3;
+            float b = (k & 1 ? t.x : 1.0 - t.x) * (k >> 1 ? t.y : 1.0 - t.y);
+            seen_there += b * float3(points[at1].w, points[at1 + 1].w, points[at1 + 2].w);
+        }
+    }
     float far = float(at.z) / float(d);
     float cap = air * lerp(dot(cells[CELLS].rgb, LUMA), dot(seen_there, LUMA), far);
     // The light the key adds to surfaces does not raise what the air may
@@ -617,7 +864,16 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
     // night street, whose lamps light its fog.
     float bound_share = 1.0;
     if (outside_level > 0.0 && cells[INSIDE_MEAN].y > 0.0) bound_share = saturate(cells[INSIDE].z);
-    if (has > cap) c *= lerp(1.0, cap / has, bound_share);
+    if (air_soft > 0.0) {
+        // (VICTORY_AMBIENT_AIR_SOFT) Up to half the bound the title's own; above,
+        // bent towards the bound and never at it: what is cut off is flat
+        // (the bound's level, a column of the volume at a time), what bends
+        // keeps the title's gradient (the banding on the prison corridor's
+        // wall once the key's `air` lowered the bound).
+        c *= lerp(1.0, soft_bound(has, cap) / max(has, 1e-9), bound_share);
+    } else if (has > cap) {
+        c *= lerp(1.0, cap / has, bound_share);
+    }
     // (`tint`) Where the key raises a dark room, the air's colour goes part
     // of the way to that of the light its surfaces send out: without rays the
     // probes that light a hall's air hold the sky's light (a brown veil at
@@ -694,20 +950,29 @@ void raise(uint3 at : SV_DispatchThreadID) {
         open = saturate(1.0 - strength * 2.0 * sum / N);
     }
     float3 found;
-    // (VICTORY_AMBIENT_OUTSIDE) Outside rooms the estimate, not the constant.
-    bool outdoors = constant > 0.0 && outside_level > 0.0 && has_stencil > 0.0 &&
-        (stencil.Load(int3(p, 0)).y & 8u) == 0u;
+    // How much the texel is inside a room: its stencil bit, or (edge) the
+    // share of the texels around marked so. Without the stencil plane, all.
+    float inside = has_stencil > 0.0 ? inside_at(p) : 1.0;
+    // The key's gain here: with inside_only, none outside rooms (gain_at).
+    float key_here = lerp(1.0, gain_to_key(cells[CELLS]), inside_only > 0.0 ? inside : 1.0);
+    // (VICTORY_AMBIENT_OUTSIDE) Outside rooms the estimate, not the constant;
+    // at a room's edge (edge) some of both.
+    bool outdoors = constant > 0.0 && outside_level > 0.0 && has_stencil > 0.0 && inside < 1.0;
     float share_of_estimate = outdoors ? outside_level : level;
     float least_light = outdoors ? outside_least : least;
-    if (constant > 0.0 && !outdoors) {
+    float3 room_light = 0;
+    if (constant > 0.0 && (!outdoors || inside > 0.0)) {
         found = float3(1.0, 0.98, 0.94) * constant;
         // A share of the light around, where that is more than the constant.
         float4 mean_now = cells[CELLS];
         float3 part = around * mean_now.rgb;
         if (around > 0.0 && mean_now.a > 0.0 && dot(part, LUMA) > dot(found, LUMA)) found = part;
-        found *= open * gain_at(mean_now, p);
-        light[p] = pack(found);
-        return;
+        found *= open * key_here;
+        if (!outdoors) {
+            light[p] = pack(found);
+            return;
+        }
+        room_light = found;
     }
     // Between the four points around, those at its own depth first; which
     // four is dithered a little.
@@ -732,7 +997,7 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * share_of_estimate * open;
     // Never under the least light asked for (estimate:<share>:<least>).
-    float3 floor_light = float3(1.0, 0.98, 0.94) * least_light * open * gain_at(cells[CELLS], p);
+    float3 floor_light = float3(1.0, 0.98, 0.94) * least_light * open * key_here;
     // (VICTORY_AMBIENT_OUTSIDE) Outside rooms the constant's share of the
     // light around (`constant:<level>:<share>`) is a floor too: by day what
     // the sun does not reach on the boat keeps what the constant gave it.
@@ -747,16 +1012,31 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float top = max(dot(found, LUMA) * most, 1e-6);
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
-    light[p] = pack(max(was, found));
+    // (VICTORY_AMBIENT_CONTRAST) A dark bulk under a few bright lights (the
+    // diner cutscene: mean ten times the log-average) is raised outside
+    // rooms; the bound on what the title left stays where it was.
+    if (outdoors && contrast > 0.0 && cells[CONTRAST].a > 0.0) found *= cells[CONTRAST].x;
+    // (VICTORY_AMBIENT_DAY) By day, outside rooms, the title's own light: the
+    // estimate there is about the mean of what sunlit surfaces send out, so
+    // a shade got as much light as the sun gives (the boat's orange wash).
+    // What the title's rays leave outdoors is the sky's light, right by day.
+    // The constant stays a floor, so nothing gets darker than it was with
+    // the constant alone.
+    if (outdoors && day_to > 0.0 && cells[CELLS].a > 0.0) {
+        float day = saturate((dot(cells[CELLS].rgb, LUMA) - day_from) / max(day_to - day_from, 1e-6));
+        found = lerp(found, float3(1.0, 0.98, 0.94) * constant * open, day);
+    }
+    // (At a room's edge, with edge, between the room's light and this.)
+    light[p] = pack(lerp(max(was, found), room_light, outdoors ? inside : 0.0));
 }
 #endif
 "#;
 
 /// Bytes of the cells' buffer and of the points'.
 const CELLS: u64 = 64 * 36;
-const CELL_BYTES: u64 = (2 * CELLS + 5) * 16;
+const CELL_BYTES: u64 = (2 * CELLS + 6) * 16;
 /// The passes' root constants, in words (the `Set` buffer).
-const WORDS: usize = 25;
+const WORDS: usize = 32;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 
 struct Pass {
@@ -962,6 +1242,17 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[22] = outside_level.to_bits();
     words[23] = outside_least.to_bits();
     words[24] = if views.stencil.is_some() { 1.0f32 } else { 0.0 }.to_bits();
+    let [day_from, day_to] = day();
+    words[25] = day_from.to_bits();
+    words[26] = day_to.to_bits();
+    // (The gain is worked out by the mean pass, which has no stencil plane:
+    // it reads the rooms' share the resolve measured, none yet: all outside.)
+    let [contrast, contrast_most] = if outside_level > 0.0 { contrast() } else { [0.0, 1.0] };
+    words[27] = contrast.to_bits();
+    words[28] = contrast_most.to_bits();
+    words[29] = cut().to_bits();
+    words[30] = if air_soft() { 1.0f32 } else { 0.0 }.to_bits();
+    words[31] = edge().to_bits();
     let measure_rooms = ((key > 0.0 && key_room()) || outdoors) && views.stencil.is_some();
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
@@ -1027,7 +1318,7 @@ fn report_mean(list: &HostList, pass: &Pass) {
         // SAFETY: the copy was recorded 5 s ago and has run; 16 bytes mapped.
         unsafe {
             if pass.readback.Map(0, None, Some(&mut data)).is_ok() {
-                let m = std::slice::from_raw_parts(data.cast::<f32>(), 16).to_vec();
+                let m = std::slice::from_raw_parts(data.cast::<f32>(), 20).to_vec();
                 pass.readback.Unmap(0, None);
                 let luma = 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
                 let [key, most] = key();
@@ -1043,6 +1334,11 @@ fn report_mean(list: &HostList, pass: &Pass) {
                 let valid = if key_room() { room_seen } else { m[3] > 0.0 };
                 let gain = if valid { key_gain(key, most, measured) } else { 1.0 };
                 let air_gain = if key_room() { whole_gain(gain, if room_seen { room_share } else { 0.0 }) } else { gain };
+                // (VICTORY_AMBIENT_DAY: how much the title's own light is
+                // kept outside rooms.)
+                let day = day_share(luma, day());
+                // (VICTORY_AMBIENT_CONTRAST: the gain outside rooms.)
+                let contrast_gain = if m[19] > 0.0 { m[16] } else { 1.0 };
                 tracing::info!(
                     mean = ?[m[0], m[1], m[2]],
                     luma,
@@ -1053,6 +1349,8 @@ fn report_mean(list: &HostList, pass: &Pass) {
                     room_share,
                     room_geo,
                     room_mean,
+                    day,
+                    contrast_gain,
                     inside_only = key_inside(),
                     air_hold = key_air_hold(),
                     by_geo = key_geo(),
@@ -1077,6 +1375,8 @@ fn report_mean(list: &HostList, pass: &Pass) {
         l.CopyBufferRegion(&pass.readback, 16, &pass.cells, (2 * CELLS + 1) * 16, 16);
         // (The rooms' measures and share, and their mean.)
         l.CopyBufferRegion(&pass.readback, 32, &pass.cells, (2 * CELLS + 3) * 16, 32);
+        // (The contrast gain.)
+        l.CopyBufferRegion(&pass.readback, 64, &pass.cells, (2 * CELLS + 5) * 16, 16);
         l.ResourceBarrier(&[crate::host::transition(
             &pass.cells,
             D3D12_RESOURCE_STATE_COPY_SOURCE,
@@ -1170,12 +1470,148 @@ mod tests {
     }
 
     #[test]
+    fn day_settings_and_share() {
+        assert_eq!(parse_day(""), [0.0, 0.0]);
+        assert_eq!(parse_day("1"), [0.0, 0.0]);
+        assert_eq!(parse_day("2:1"), [0.0, 0.0]);
+        assert_eq!(parse_day("0.5:2"), [0.5, 2.0]);
+        let day = [0.5, 2.0];
+        // Unset: the estimate at any hour.
+        assert_eq!(day_share(9.0, [0.0, 0.0]), 0.0);
+        // The opening's street, the diner cutscene, a prison room: the estimate.
+        for night in [0.002, 0.03, 0.12, 0.25, 0.18] {
+            assert_eq!(day_share(night, day), 0.0);
+        }
+        // The boat by day (slow mean 4-11): the title's own light.
+        for sun in [2.0, 4.0, 11.0] {
+            assert_eq!(day_share(sun, day), 1.0);
+        }
+        assert!((day_share(1.25, day) - 0.5).abs() < 1e-6);
+    }
+
+    /// The contrast gain over frames, with a scene whose bulk is lit by the
+    /// stand-in alone (it rises with the gain, a frame late) under lamps
+    /// that are not: where it settles and how fast.
+    fn contrast_run(lamps: f32, bulk: f32, set: [f32; 2], frames: usize) -> Vec<f32> {
+        let mut log_gain = 0.0f32;
+        let mut gains = Vec::new();
+        for _ in 0..frames {
+            let gain = log_gain.exp();
+            let lit_bulk = bulk * gain;
+            log_gain = contrast_step(log_gain, lamps + lit_bulk, lit_bulk, set, 1.0);
+            gains.push(log_gain.exp());
+        }
+        gains
+    }
+
+    #[test]
+    fn contrast_settings_and_gain() {
+        assert_eq!(parse_contrast(""), [0.0, 1.0]);
+        assert_eq!(parse_contrast("x"), [0.0, 1.0]);
+        assert_eq!(parse_contrast("3"), [3.0, 8.0]);
+        assert_eq!(parse_contrast("3:4"), [3.0, 4.0]);
+        assert_eq!(parse_contrast("3:0.5"), [3.0, 1.0]);
+        let set = [4.0, 8.0];
+        // The diner cutscene (mean 0.15, bulk 0.012): it settles where the
+        // bulk is a fourth of the mean, 0.15 / (4 x 0.012 - 0.012) = 4.2,
+        // within a second at 20 frames a second, without overshooting.
+        let diner = contrast_run(0.15, 0.012, set, 40);
+        let settled = 0.15 / (4.0 * 0.012 - 0.012);
+        assert!((diner[19] - settled).abs() / settled < 0.05, "{diner:?}");
+        assert!(diner.iter().all(|&g| g <= settled * 1.05), "{diner:?}");
+        // The opening's street (mean 1.5-3.8 times the bulk, run intro-s-luz3): no gain.
+        for (lamps, bulk) in [(0.01, 0.01), (0.0055, 0.002), (0.014, 0.011)] {
+            assert!(contrast_run(lamps, bulk, set, 40).iter().all(|&g| g == 1.0));
+        }
+        // Never past the most.
+        assert!(contrast_run(1.0, 0.001, set, 60).iter().all(|&g| g <= 8.0 + 1e-4));
+        // Inside rooms it does not build up.
+        assert_eq!(contrast_step(0.0, 1.0, 0.001, set, 0.0), 0.0);
+    }
+
+    #[test]
+    fn soft_air_bound() {
+        let cap = 0.2;
+        // Below half the bound: the title's own.
+        assert_eq!(soft_bound(0.05, cap), 0.05);
+        assert_eq!(soft_bound(0.1, cap), 0.1);
+        // Above: under the bound, never at it, and still rising, so a
+        // glow that the hard bound made flat keeps a gradient (up to three
+        // times the bound; far above it rounds to the bound in f32).
+        let mut last = soft_bound(0.1, cap);
+        for i in 1..=10 {
+            let now = soft_bound(0.1 + 0.05 * i as f32, cap);
+            assert!(now > last && now < cap, "{i}: {now}");
+            last = now;
+        }
+        // No corner at the knee: the slope just above it is about 1.
+        let slope = (soft_bound(0.1001, cap) - soft_bound(0.1, cap)) / 0.0001;
+        assert!((slope - 1.0).abs() < 0.01, "{slope}");
+        assert_eq!(soft_bound(1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn edge_settings() {
+        assert_eq!(parse_edge(""), 0.0);
+        assert_eq!(parse_edge("0"), 0.0);
+        assert_eq!(parse_edge("0.5"), 0.0);
+        assert_eq!(parse_edge("4"), 4.0);
+        assert_eq!(parse_edge("40"), 16.0);
+    }
+
+    #[test]
+    fn cuts() {
+        assert_eq!(parse_cut(""), 0.0);
+        assert_eq!(parse_cut("1"), 0.0);
+        assert_eq!(parse_cut("0.5"), 0.0);
+        let cut = parse_cut("3");
+        assert!((cut - 3.0f32.ln()).abs() < 1e-6);
+        let log = |v: f32| (v + 1e-3).ln();
+        // Off: never.
+        assert!(!is_cut(log(0.01), log(3.0), 0.0));
+        // From the loading screen into the diner (log-average 0.0007 to 0.012),
+        // and from the diner out to the sun (0.06 to 2.4): cuts.
+        assert!(is_cut(log(0.0007), log(0.012), cut));
+        assert!(is_cut(log(0.06), log(2.4), cut));
+        // Walking down the prison's corridor into the common room
+        // (log-average 0.06-0.09 against 0.05-0.07): not.
+        assert!(!is_cut(log(0.09), log(0.05), cut));
+    }
+
+    #[test]
     fn roles_by_name() {
         assert_eq!(role(b"..CS_ScreenProbes_TemporalResolve_a911b49c_Wrapped.."), Some(Role::Resolve));
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"..CS_DenoiseShadowMaskLDSPacked_113e2add_Wrapped.."), Some(Role::LampShadows));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+    }
+
+    /// Every pass compiles, without a device (the test above returns early
+    /// where there is none): each part of the source as `make` builds it.
+    /// The switches are root constants, read at run time, so these are all
+    /// the variants there are.
+    #[test]
+    fn every_pass_compiles() {
+        let passes = [
+            ("KEEP", "keep"),
+            ("KEEP", "mean"),
+            ("PLACE", "place"),
+            ("PLACE", "inside_share"),
+            ("GATHER", "gather"),
+            ("RAISE", "raise"),
+            ("AIR", "clear_air"),
+            ("UNSHADOW", "unshadow"),
+        ];
+        for (part, entry) in passes {
+            let source = format!("#define {part}\n{SOURCE}");
+            let entry_z = format!("{entry}\0");
+            let code = crate::host::compile(&source, windows::core::PCSTR(entry_z.as_ptr()), s!("cs_5_1"))
+                .unwrap_or_else(|e| panic!("{part} {entry}: {e}"));
+            assert!(!code.is_empty(), "{part} {entry}");
+        }
+        // The root constants the passes declare are the words they are given.
+        assert!(SOURCE.contains(&format!("RootConstants(num32BitConstants={WORDS}, b0)")));
     }
 
     /// The passes compile with the system's compiler and the host takes them.

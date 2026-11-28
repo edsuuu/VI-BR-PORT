@@ -484,6 +484,99 @@ pub fn with_wide_first<R>(on: bool, f: impl FnOnce() -> R) -> R {
     r
 }
 
+thread_local! {
+    /// See [`with_paired_first`].
+    static PAIRED_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the paired form ([`emit_paired`]) tried for this program before
+/// any other form, exact ones included: for the programs named in `VICTORY_WAVE_PAIRED_FOR`
+/// ([`paired_named`]). (`VICTORY_WAVE_PAIRED=1` tries it for every program, but only after the
+/// exact forms.)
+pub fn with_paired_first<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = PAIRED_FIRST.replace(on);
+    let r = f();
+    PAIRED_FIRST.set(was);
+    r
+}
+
+/// Whether the program whose container's hash (blake3, in hex, as the log names shaders) is
+/// `hash` is one of those named in `VICTORY_WAVE_PAIRED_FOR`: hashes or their beginnings,
+/// separated by commas, as `VICTORY_WAVE_WIDE_FOR` names them. Unset: none.
+pub fn paired_named(hash: &str) -> bool {
+    static FOR: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let named = FOR.get_or_init(|| {
+        std::env::var("VICTORY_WAVE_PAIRED_FOR")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    let hash = hash.to_lowercase();
+    // (a tool that has only the hash's first 16 digits still knows a name of all 64)
+    named.iter().any(|h| hash.starts_with(h.as_str()) || hash.len() >= 16 && h.starts_with(hash.as_str()))
+}
+
+/// Whether some program is named in `VICTORY_WAVE_PAIRED_FOR` ([`paired_named`]): a caller
+/// hashes containers only then.
+pub fn paired_names_any() -> bool {
+    std::env::var_os("VICTORY_WAVE_PAIRED_FOR").is_some_and(|v| !v.is_empty())
+}
+
+thread_local! {
+    /// See [`with_early_depth_named`].
+    static EARLY_DEPTH_NAMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the program taken as one named in
+/// `VICTORY_EARLY_DEPTH_FOR` ([`early_depth_named`]) when `on`: a pixel program the console
+/// tests depth for before it runs then declares that test on the host too, unless
+/// `VICTORY_EARLY_DEPTH=0` (see `lower::EarlyDepth`).
+pub fn with_early_depth_named<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    let was = EARLY_DEPTH_NAMED.replace(on);
+    let r = f();
+    EARLY_DEPTH_NAMED.set(was);
+    r
+}
+
+/// Whether the program whose container's hash (blake3, in hex, as the log names shaders) is
+/// `hash` is one of those named in `VICTORY_EARLY_DEPTH_FOR`: hashes or their beginnings,
+/// separated by commas, as `VICTORY_WAVE_PAIRED_FOR` names them. Unset: none.
+pub fn early_depth_named(hash: &str) -> bool {
+    static FOR: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let named = FOR.get_or_init(|| {
+        std::env::var("VICTORY_EARLY_DEPTH_FOR")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    hash_named(named, hash)
+}
+
+/// Whether `hash` is one of `named` (lower case): a name is the hash or its beginning, and a
+/// hash of at least 16 digits (what a replay knows) is the beginning of a longer name.
+fn hash_named(named: &[String], hash: &str) -> bool {
+    let hash = hash.to_lowercase();
+    named.iter().any(|h| hash.starts_with(h.as_str()) || hash.len() >= 16 && h.starts_with(hash.as_str()))
+}
+
+/// Whether some program is named in `VICTORY_EARLY_DEPTH_FOR` ([`early_depth_named`]): a
+/// caller hashes containers only then.
+pub fn early_depth_names_any() -> bool {
+    std::env::var_os("VICTORY_EARLY_DEPTH_FOR").is_some_and(|v| !v.is_empty())
+}
+
+/// Whether the paired form is tried for the program being translated: `VICTORY_WAVE_PAIRED=1`
+/// (every program), or [`with_paired_first`]. Off by default: each host lane does the work of
+/// two console lanes, and the form is new.
+fn paired_on() -> bool {
+    static ALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    PAIRED_FIRST.get() || *ALL.get_or_init(|| std::env::var_os("VICTORY_WAVE_PAIRED").is_some_and(|v| v == "1"))
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -568,6 +661,19 @@ pub fn emit(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        // A program named in `VICTORY_WAVE_PAIRED_FOR` ([`with_paired_first`]) tries the paired
+        // form before any other: the forms the chain counts as exact may still be the wrong
+        // ones for it (the water's tile list, `CS_TransmissionVolumetrics_GenerateTiles`, ends
+        // in one whose exchanges where not every lane runs a run cannot see).
+        if PAIRED_FIRST.get() {
+            let again = emit_paired(c, native, p, st);
+            lower::take_needs();
+            lower::take_meets();
+            report("paired, named", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -822,6 +928,20 @@ pub fn emit(
                         return again.map(|(shader, _)| shader);
                     }
                 }
+                // The paired form ([`emit_paired`]): exact, without barriers inside branches,
+                // each host lane doing the work of two. Only when asked for
+                // (`VICTORY_WAVE_PAIRED=1`; a program named in `VICTORY_WAVE_PAIRED_FOR` tried it first):
+                // here, past every exact form the program had before, so a program it takes
+                // is one that would have ended wave-wide, approximate or refused.
+                if paired_on() && !PAIRED_FIRST.get() {
+                    let again = emit_paired(c, native, p, st);
+                    lower::take_needs();
+                    lower::take_meets();
+                    report("paired", &again);
+                    if done(&again) {
+                        return again.map(|(shader, _)| shader);
+                    }
+                }
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
@@ -1036,6 +1156,49 @@ fn widen_from(
         }
         wide.extend(more);
     }
+}
+
+/// `p` (a console wave64 compute program on a host of 32-lane waves) in the paired form: each
+/// host lane carries two console lanes, and one host wave of 32 runs a whole console wave
+/// (`bitcode::paired`). Every branch on a lane mask is taken wave-wide
+/// ([`structure::structure_wide`]), as the console takes it: what is left per lane are the
+/// guards of single instructions. The program is then lowered as for a host wave of 64 lanes
+/// (`lower::with_paired`), whose wave operations, lane reads and lane masks are the console's,
+/// and each of its instructions is written for both halves. `st` is the program's structure,
+/// which names the branches on lane masks ([`structure::Structured::wave_any`]).
+///
+/// Exact where the other forms are not: a wave reduction, a first-lane read or a wave OR used
+/// as data where not every lane runs, a lane read across the halves, LDS shared within the
+/// console wave, groups of several console waves (whose barriers stay where the console has
+/// them). It costs: each host lane runs the vector code of two console lanes, one after the
+/// other (code with the same operands in both halves, as scalar code, once).
+fn emit_paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let not = |what| Err(ShaderError::Unsupported { offset: 0, what });
+    if native.stage != HwStage::Cs || !native.wave64 || lower::host_max_wave() != 32 {
+        return not("paired: not a console wave64 compute program on a host of 32-lane waves");
+    }
+    let wide: std::collections::HashSet<usize> =
+        st.wave_any.iter().enumerate().filter_map(|(b, kind)| kind.map(|_| b)).collect();
+    let st = structure::structure_wide(p, &wide)?;
+    for (b, exit) in st.exits.iter().enumerate() {
+        match *exit {
+            structure::LaneExit::Branch { when, .. }
+                if !wide.contains(&b) && st.bools.support(when).iter().any(|a| !matches!(a, structure::Atom::Uniform(_))) =>
+            {
+                return not("paired: a branch per lane that is not on a lane mask");
+            }
+            structure::LaneExit::Indirect => return not("paired: an indirect jump"),
+            _ => {}
+        }
+    }
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    lower::with_paired(|| emit_program(c, native, p, &st, &io, &res))
 }
 
 /// The translated program, and the wave size it requires of the host.
@@ -3316,5 +3479,144 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+}
+
+#[cfg(test)]
+mod early_depth_tests {
+    use super::container::SigElement;
+    use super::*;
+    use crate::native::StageIo;
+    use lower::EarlyDepth;
+
+    fn element(name: &str, kind: u8, cols: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            // A render target has a register; depth and stencil do not.
+            row: (kind == 16).then_some(0),
+            col: 0,
+            cols,
+            usage: (1 << cols) - 1,
+            half: false,
+        }
+    }
+
+    fn ps(db: u32) -> StageIo {
+        StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: db, patches: vec![] }
+    }
+
+    /// The DXIL of a pixel program of `words` with the one output `out` and
+    /// the console's `DB_SHADER_CONTROL` `db`, early depth in `mode` and the
+    /// program `named` in `VICTORY_EARLY_DEPTH_FOR` or not.
+    fn emitted(words: &[u32], out: SigElement, db: u32, mode: EarlyDepth, named: bool) -> Vec<u8> {
+        let native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 1,
+            layout: vec![],
+            used: vec![],
+            io: ps(db),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = container::signature(&[out], false);
+        let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        lower::TEST_EARLY_DEPTH.set(Some(mode));
+        let dxil = with_early_depth_named(named, || emit(&c, &native, &p, &st, &io, &res)).unwrap().dxil;
+        lower::TEST_EARLY_DEPTH.set(None);
+        dxil
+    }
+
+    // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
+    const COLOR: [u32; 4] = [0x7E00_02F2, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+
+    /// By default (`VICTORY_EARLY_DEPTH` and `VICTORY_EARLY_DEPTH_FOR` unset)
+    /// no program declares early depth, not even one with the console's bit:
+    /// the module is the one of the same program without the bit, and the one
+    /// `VICTORY_EARLY_DEPTH=0` gives. (Given to every program with the bit, the
+    /// opening's cutscene came out wrong in the game, 27 Nov.)
+    #[test]
+    fn by_default_no_program_declares_early_depth() {
+        let target = || element("SV_Target", 16, 4);
+        let without_bit = emitted(&COLOR, target(), 0x0450, EarlyDepth::Named, false);
+        let default = emitted(&COLOR, target(), 0x1450, EarlyDepth::Named, false);
+        let off = emitted(&COLOR, target(), 0x1450, EarlyDepth::Off, false);
+        assert_eq!(default, without_bit, "the default declared early depth");
+        assert_eq!(default, off);
+        // A program that writes no view is not picked by the rule either.
+        assert_eq!(emitted(&COLOR, target(), 0x1450, EarlyDepth::Rule, false), without_bit);
+    }
+
+    /// A pixel program the console tests depth for before it runs
+    /// (`DB_SHADER_CONTROL` 0x1450, as the title's glass prepass has it)
+    /// declares ForceEarlyDepthStencil when it is named in
+    /// `VICTORY_EARLY_DEPTH_FOR`, or with `VICTORY_EARLY_DEPTH=1`: the module
+    /// differs from the same program without the bit, `=0` declares nothing
+    /// even for a named one, and the validator, where there is one, accepts it.
+    /// With a depth output nothing is declared (the host cannot test before a
+    /// shader that writes the depth).
+    #[test]
+    fn a_pixel_program_tested_before_it_runs_declares_early_depth() {
+        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
+        let color = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
+        // v_mov_b32 v0, 1.0; exp mrtz v0, off, off, off done vm; s_endpgm
+        let depth = [0x7E00_02F2u32, 0xF800_1881, 0x0000_0000, 0xBF81_0000];
+        let target = || element("SV_Target", 16, 4);
+        let late = emitted(&color, target(), 0x0450, EarlyDepth::Wide, true);
+        let early = emitted(&color, target(), 0x1450, EarlyDepth::Named, true);
+        let off = emitted(&color, target(), 0x1450, EarlyDepth::Off, true);
+        assert_ne!(late, early, "the early-depth flag changed nothing");
+        assert_eq!(late, off, "VICTORY_EARLY_DEPTH=0 still declared early depth");
+        assert_eq!(emitted(&color, target(), 0x1450, EarlyDepth::Wide, false), early);
+        assert_eq!(emitted(&color, target(), 0x1450, EarlyDepth::Rule, true), early);
+        #[cfg(windows)]
+        if let Ok(mut v) = super::validator::Validator::load(super::validator::Validator::default_path().as_deref()) {
+            v.validate(&mut early.clone()).unwrap();
+        }
+        let late = emitted(&depth, element("SV_Depth", 17, 1), 0x0451, EarlyDepth::Wide, true);
+        let early = emitted(&depth, element("SV_Depth", 17, 1), 0x1451, EarlyDepth::Wide, true);
+        assert_eq!(late, early, "early depth declared for a depth export");
+    }
+
+    /// The rule alone: the bit, and no export of depth, stencil or coverage.
+    #[test]
+    fn early_depth_needs_the_bit_and_no_depth_stencil_or_coverage_export() {
+        assert!(lower::early_depth(&ps(0x1450), &[]));
+        assert!(lower::early_depth(&ps(0x1010), &[]));
+        assert!(!lower::early_depth(&ps(0x0450), &[]));
+        assert!(!lower::early_depth(&ps(0x1012), &[]));
+        assert!(!lower::early_depth(&ps(0x1150), &[]));
+        assert!(!lower::early_depth(&ps(0x1050), &[element("SV_StencilRef", 20, 1)]));
+        assert!(!lower::early_depth(&ps(0x1050), &[element("SV_Coverage", 14, 1)]));
+        assert!(!lower::early_depth(&StageIo::None, &[]));
+    }
+
+    /// `VICTORY_EARLY_DEPTH=rule` picks pixel programs that write views, and
+    /// nothing else.
+    #[test]
+    fn the_rule_picks_pixel_programs_that_write_views() {
+        assert!(lower::early_depth_rule(&ps(0x1450), true));
+        assert!(!lower::early_depth_rule(&ps(0x1450), false));
+        assert!(!lower::early_depth_rule(&StageIo::None, true));
+    }
+
+    /// A name in `VICTORY_EARLY_DEPTH_FOR` matches the container's hash by
+    /// its beginning, as the logs (all 64 digits) and the replay (16) give it.
+    #[test]
+    fn names_match_hashes_by_their_beginning() {
+        let named = ["d16aa6328e7f5025".to_owned(), "00ae3e9b98a0ae26ab".to_owned()];
+        assert!(hash_named(&named, "D16AA6328E7F5025aa"));
+        assert!(hash_named(&named, "00ae3e9b98a0ae26"));
+        assert!(!hash_named(&named, "00ae3e9b"));
+        assert!(!hash_named(&named, "088013d3dd53cab2"));
+        assert!(!hash_named(&[], "d16aa6328e7f5025"));
     }
 }

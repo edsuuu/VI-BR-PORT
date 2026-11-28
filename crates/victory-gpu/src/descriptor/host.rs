@@ -1898,6 +1898,21 @@ impl HostHeap {
         textures.recheck(index, write, due, at, print, looks, uploaded);
     }
 
+    /// Title slots a draw of the title's decoration bake samples
+    /// (`crate::bake`): each due now as if written now, with the write the
+    /// pass hands back ([`TextureQueue::changed`]), whatever the queue knew of
+    /// it (out of it as up to date, held back for room, due later).
+    pub(crate) fn texture_slots_now(&self, slots: &[u32], frame: u64) -> Vec<(u32, u64)> {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        slots
+            .iter()
+            .map(|&index| {
+                textures.changed(index, frame, frame);
+                (index, textures.writes)
+            })
+            .collect()
+    }
+
     /// See [`TextureQueue::checked`].
     pub(crate) fn texture_slot_checked(&self, index: u32) -> Option<(u64, u64, u64, u8, u64)> {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).checked(index)
@@ -5813,6 +5828,33 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     /// slot whose memory is not there is looked at again after
     /// 1, 2, 4 frames up to the limit; and what the pass reports about a
     /// slot written again meanwhile is dropped.
+    /// A slot a bake samples is due at the bake whatever the queue knew of
+    /// it (`HostHeap::texture_slots_now`): out of the queue as up to date,
+    /// held back for room until later, or waiting for its next look.
+    #[test]
+    fn a_slot_a_bake_samples_is_due_at_the_bake() {
+        let mut q = TextureQueue::default();
+        q.written(7, 9, 10, false);
+        q.written(8, 9, 10, false);
+        q.written(9, 9, 10, false);
+        let due = q.due(10, 10);
+        let write = |i: u32| due.iter().find(|d| d.0 == i).unwrap().1;
+        // 7 up to date, 8 held back for room for a while, 9 looked at in 14.
+        q.done(7, write(7));
+        q.hold(8, write(8), 200);
+        q.recheck(9, write(9), 14, (0x1000, 64), 99, 0, 10);
+        assert!(q.due(12, 10).is_empty());
+        for i in [7, 8, 9] {
+            q.changed(i, 12, 12);
+        }
+        let now = q.due(12, 10);
+        assert_eq!(now.iter().map(|d| d.0).collect::<std::collections::BTreeSet<_>>(), [7, 8, 9].into());
+        // The look after an upload starts again from what the pass does.
+        assert_eq!(q.checked(9), None);
+        // The room coming back later does not hand the held write out again.
+        assert_eq!(q.room(13), 0);
+    }
+
     #[test]
     fn the_texture_queue_serves_the_newest_writes_first() {
         let mut q = TextureQueue::default();
