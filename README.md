@@ -2,6 +2,36 @@
 
 **English** | [Português](README.pt-BR.md)
 
+## How to use
+
+Two downloads, each its own release on the [Releases page](https://github.com/edsuuu/VI-BR-PORT/releases):
+
+| What | Release | File | Inside |
+|---|---|---|---|
+| **Launcher** | `v<version>` | `VI-BR-PORT-<version>-windows-x64.zip` | `vi-launcher.exe` |
+| **Engine** | `engine-v<version>` | `VIctory-<version>-windows-x64.zip` | `victory.exe` |
+
+Releases whose names start with `dev-` (`dev-v<version>`, `dev-engine-v<version>`) are
+test builds, marked as pre-releases; the plain ones are the stable builds.
+
+1. Have **your own copy of the game** (the Xbox Series build): a folder holding
+   `game_scarlett_master.exe`.
+2. Download the latest **launcher** and **engine** releases and put `vi-launcher.exe` and
+   `victory.exe` in the same folder (anywhere else works too: the launcher's settings choose
+   the engine).
+3. Open `vi-launcher.exe`.
+4. Click **CHOOSE THE GAME FOLDER** and pick the folder of your copy.
+5. If the engine is not next to the launcher, the button says **CHOOSE THE ENGINE**: pick
+   `victory.exe`.
+6. Click **PLAY**. The first time the shaders are translated and the pipelines warmed (a few
+   minutes, with the per cent shown); then the game opens and the launcher waits in the tray.
+7. **More options**: the saves folder, mouse and keyboard (Esc frees the cursor for the menus),
+   extra flags, clearing the compiled shaders, checking for updates.
+
+Needs Windows 10 or 11 (x64), a CPU with AVX2 and a Direct3D 12 card with shader model 6.6 and
+mesh shaders (tested on an 8 GB NVIDIA card), and about 2 GB of disk for the shader cache.
+Without the launcher, `victory.exe` runs with `scriptsplay.ps1` (see below).
+
 A compatibility layer that runs, natively on Windows, the **Xbox Series X|S** build
 (the *Scarlett* platform, titles made with the **GDK**) of a title, from the user's own
 files. The console's x86-64 code runs unchanged inside our process; underneath it are the

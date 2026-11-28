@@ -112,7 +112,7 @@ jobs:
           out=bundle/linux-x64
           mkdir -p "$out"
           cp target/release/vi-launcher "$out/"
-          cp victory.example.toml LICENSE README.md "$out/"
+          cp LICENSE "$out/"
           (cd "$out" && zip -r "../${PREFIX}VI-BR-PORT-$VERSION-linux-x64.zip" .)
       - uses: actions/upload-artifact@v4
         with:
