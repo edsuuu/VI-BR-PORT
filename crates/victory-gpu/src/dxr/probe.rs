@@ -27,6 +27,14 @@
 //! beside the pictures lists every ray. What moves between the frames of the
 //! rounds (a refit bottom level) differs by that much.
 //!
+//! The agreement: besides the grid, [`AIMED`] rays from the eye at the
+//! places of instances go to both sides (the probe's program fires them after
+//! the picture's), and a line says of how many rays the two answers agree
+//! (both miss, or both hit at the same distance; strictly, in the same
+//! instance index and primitive too), what the others are (and how many of
+//! the console's own hits fall in instances whose bottom level the host has
+//! not got: coverage, not a wrong structure), and the same since the start.
+//!
 //! The critic's item 3 (the console's bottom levels lie in a frame of their
 //! own, turned and scaled against the title's object space): of the hits
 //! both sides make at the same distance in the same instance, the line also
@@ -60,6 +68,13 @@ const HEIGHT: u32 = 180;
 const RAYS: u32 = WIDTH * HEIGHT;
 /// The rays also fired at the console's structure: a grid over the picture.
 const GRID: (u32, u32) = (24, 12);
+/// And rays from the eye at the places of so many of the instances (spread
+/// over the active ones), fired at both after the picture's: a panorama from
+/// one eye sees few of the bottom levels, and many rays of it see sky; these
+/// meet as many different bottom levels as they can.
+const AIMED: u32 = 256;
+/// Rays the probe's program fires.
+const SHOT: u32 = RAYS + AIMED;
 /// The console's memory is read back in pages of this size (`crate::memory`).
 const PAGE: u64 = 1 << 16;
 /// Pages read back at most a round, and rounds at most a probe.
@@ -207,7 +222,7 @@ fn make_kit() -> Option<Kit> {
     ];
     let desc = D3D12_ROOT_SIGNATURE_DESC { NumParameters: params.len() as u32, pParameters: params.as_ptr(), ..Default::default() };
     let (mut blob, mut errors): (Option<ID3DBlob>, Option<ID3DBlob>) = (None, None);
-    let dxil = ray_query_probe(RAYS);
+    let dxil = ray_query_probe(SHOT);
     // SAFETY: the descriptions, the blob and the code outlive the calls.
     let (root, pso) = unsafe {
         D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, Some(&mut errors)).ok()?;
@@ -223,7 +238,7 @@ fn make_kit() -> Option<Kit> {
             .ok()?;
         (root, pso)
     };
-    let hit_bytes = u64::from(RAYS * PROBE_HIT_DWORDS * 4);
+    let hit_bytes = u64::from(SHOT * PROBE_HIT_DWORDS * 4);
     let hits = buffer(device, hit_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
     let hits_back = buffer(device, hit_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
     let pages_back = buffer(device, ROUND_PAGES as u64 * PAGE, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
@@ -243,6 +258,8 @@ struct Sent {
     eye: [f32; 3],
     /// The instance descriptions the host's top level was built from.
     instances: Vec<u8>,
+    /// The directions of the rays aimed at instances ([`AIMED`] at most).
+    aimed: Vec<[f32; 3]>,
 }
 
 /// Pages asked for in one round, each with whether it has a place on the
@@ -377,7 +394,7 @@ pub(super) fn after_top(host: &HostList, list: &ID3D12GraphicsCommandList4, dest
         return;
     }
     let Some(kit) = kit() else { return };
-    let Some((rays_gpu, rays_cpu)) = host.scratch(u64::from(RAYS * PROBE_RAY_DWORDS * 4)) else { return };
+    let Some((rays_gpu, rays_cpu)) = host.scratch(u64::from(SHOT * PROBE_RAY_DWORDS * 4)) else { return };
     let sent = Arc::new(Mutex::new(None));
     {
         let (sent, rays) = (sent.clone(), rays_cpu as usize);
@@ -387,32 +404,43 @@ pub(super) fn after_top(host: &HostList, list: &ID3D12GraphicsCommandList4, dest
             // at this submission by the rewrite.
             let instances = unsafe { std::slice::from_raw_parts(descs as *const u8, count as usize * INSTANCE) }.to_vec();
             let eye = eye_asked().unwrap_or_else(|| middle(&instances));
-            // SAFETY: the list's upload memory of `RAYS` rays.
-            let out = unsafe { std::slice::from_raw_parts_mut(rays as *mut u32, (RAYS * PROBE_RAY_DWORDS) as usize) };
+            // SAFETY: the list's upload memory of `SHOT` rays.
+            let out = unsafe { std::slice::from_raw_parts_mut(rays as *mut u32, (SHOT * PROBE_RAY_DWORDS) as usize) };
+            let ray = |out: &mut [u32], k: u32, d: [f32; 3], mask: u32| {
+                let at = (k * PROBE_RAY_DWORDS) as usize;
+                out[at..at + 12].copy_from_slice(&[
+                    eye[0].to_bits(),
+                    eye[1].to_bits(),
+                    eye[2].to_bits(),
+                    0f32.to_bits(),
+                    d[0].to_bits(),
+                    d[1].to_bits(),
+                    d[2].to_bits(),
+                    T_MAX.to_bits(),
+                    mask,
+                    !0,
+                    0,
+                    0,
+                ]);
+            };
             for y in 0..HEIGHT {
                 for x in 0..WIDTH {
-                    let d = direction(x, y);
-                    let at = ((y * WIDTH + x) * PROBE_RAY_DWORDS) as usize;
-                    out[at..at + 12].copy_from_slice(&[
-                        eye[0].to_bits(),
-                        eye[1].to_bits(),
-                        eye[2].to_bits(),
-                        0f32.to_bits(),
-                        d[0].to_bits(),
-                        d[1].to_bits(),
-                        d[2].to_bits(),
-                        T_MAX.to_bits(),
-                        0xff,
-                        !0,
-                        0,
-                        0,
-                    ]);
+                    ray(out, y * WIDTH + x, direction(x, y), 0xff);
                 }
             }
-            *sent.lock().unwrap_or_else(|e| e.into_inner()) = Some(Sent { frame: crate::frame::current().max(1), eye, instances });
+            let aimed = aim(&instances, eye);
+            for k in 0..AIMED {
+                // Past the instances aimed at: a ray of mask 0 meets nothing.
+                match aimed.get(k as usize) {
+                    Some(&d) => ray(out, RAYS + k, d, 0xff),
+                    None => ray(out, RAYS + k, [0.0, 0.0, 1.0], 0),
+                }
+            }
+            *sent.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Sent { frame: crate::frame::current().max(1), eye, instances, aimed });
         });
     }
-    let bytes = u64::from(RAYS * PROBE_HIT_DWORDS * 4);
+    let bytes = u64::from(SHOT * PROBE_HIT_DWORDS * 4);
     // SAFETY: an open list; the root signature, pipeline and buffers are ours
     // (statics) or the list's (the rays, the structure it holds); the hits
     // buffer is in the unordered access state between probes.
@@ -422,7 +450,7 @@ pub(super) fn after_top(host: &HostList, list: &ID3D12GraphicsCommandList4, dest
         list.SetComputeRootShaderResourceView(u32::from(PROBE_RAYS), rays_gpu);
         list.SetComputeRootShaderResourceView(u32::from(PROBE_STRUCTURE), top.gpu());
         list.SetComputeRootUnorderedAccessView(u32::from(PROBE_HITS), kit.hits.GetGPUVirtualAddress());
-        list.Dispatch(RAYS.div_ceil(PROBE_GROUP), 1, 1);
+        list.Dispatch(SHOT.div_ceil(PROBE_GROUP), 1, 1);
         list.ResourceBarrier(&[crate::host::transition(&kit.hits, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
         list.CopyBufferRegion(&kit.hits_back, 0, &kit.hits, 0, bytes);
         list.ResourceBarrier(&[crate::host::transition(&kit.hits, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
@@ -461,6 +489,45 @@ fn middle(instances: &[u8]) -> [f32; 3] {
     })
 }
 
+/// Unit directions from `eye` to the places of at most [`AIMED`] of the
+/// instances the title made active, spread evenly over them in their order
+/// (an instance at the eye itself is skipped). Those the host made inactive
+/// for want of their bottom level (mask 0 and no structure, `super::top`)
+/// are aimed at too: the console's walk meets them, and the line counts
+/// what the host lacks.
+fn aim(instances: &[u8], eye: [f32; 3]) -> Vec<[f32; 3]> {
+    let f = |d: &[u8], k: usize| f32::from_le_bytes(d[4 * k..4 * k + 4].try_into().unwrap_or_default());
+    let active: Vec<&[u8]> = instances.chunks_exact(INSTANCE).filter(|d| d[51] != 0 || d[56..64] == [0; 8]).collect();
+    let step = active.len().div_ceil(AIMED as usize).max(1);
+    active
+        .iter()
+        .step_by(step)
+        .filter_map(|d| {
+            let to: [f32; 3] = std::array::from_fn(|axis| f(d, 4 * axis + 3) - eye[axis]);
+            let len = (to[0] * to[0] + to[1] * to[1] + to[2] * to[2]).sqrt();
+            (len.is_finite() && len > 1e-3).then(|| to.map(|c| c / len))
+        })
+        .take(AIMED as usize)
+        .collect()
+}
+
+/// One ray compared: the slot of the host's hit, its direction (from the
+/// probe's eye) and whether it is aimed at an instance.
+#[derive(Clone, Copy)]
+struct Shot {
+    slot: usize,
+    direction: [f32; 3],
+    aimed: bool,
+}
+
+/// The rays walked through the console's structure and compared: the grid
+/// over the picture, then those aimed at instances.
+fn shots(aimed: &[[f32; 3]]) -> Vec<Shot> {
+    let grid = grid().into_iter().map(|(x, y)| Shot { slot: (y * WIDTH + x) as usize, direction: direction(x, y), aimed: false });
+    let at = aimed.iter().enumerate().map(|(k, &d)| Shot { slot: RAYS as usize + k, direction: d, aimed: true });
+    grid.chain(at).collect()
+}
+
 /// Once a frame: what came back is taken, walked and compared.
 pub(super) fn tick() {
     if !on() {
@@ -482,8 +549,8 @@ pub(super) fn tick() {
         if !ready {
             return;
         }
-        // SAFETY: the readback mapping of `RAYS` hits, written frames ago.
-        let all = unsafe { std::slice::from_raw_parts(kit.hits_data, (RAYS * PROBE_HIT_DWORDS) as usize) };
+        // SAFETY: the readback mapping of `SHOT` hits, written frames ago.
+        let all = unsafe { std::slice::from_raw_parts(kit.hits_data, (SHOT * PROBE_HIT_DWORDS) as usize) };
         let hits = all.to_vec();
         pictures(run, &hits);
         run.host = Some(hits);
@@ -509,11 +576,9 @@ pub(super) fn tick() {
     }
     let guard = run.sent.lock().unwrap_or_else(|e| e.into_inner());
     let Some(sent) = guard.as_ref() else { return };
-    let rays = grid();
-    let walked: Vec<Walked> = rays
-        .iter()
-        .map(|&(x, y)| walk::walk(&run.cache, run.dest, sent.eye, direction(x, y), 0.0, T_MAX, 0xff))
-        .collect();
+    let rays = shots(&sent.aimed);
+    let walked: Vec<Walked> =
+        rays.iter().map(|s| walk::walk(&run.cache, run.dest, sent.eye, s.direction, 0.0, T_MAX, 0xff)).collect();
     let missing: BTreeSet<u64> = walked
         .iter()
         .filter_map(|w| match *w {
@@ -675,7 +740,127 @@ fn facing(c: &walk::Hit, instance: &[u8]) -> Facing {
     Facing { frame, mirrored, flip: c.roles & ROLES_FLIP != 0, front: c.clockwise ^ mirrored ^ counterclockwise }
 }
 
-fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits: &[u32]) {
+/// How one ray's answers from the host's top level and the console's walk
+/// stand to each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Verdict {
+    /// Both miss, or both hit at the same distance; `strict`: a miss, or a
+    /// hit of the same instance (its index) and primitive as well.
+    Agree { strict: bool },
+    /// Both hit, at other distances.
+    Distance,
+    HostOnly,
+    /// Only the console hit; `no_bottom`: in an instance the host made
+    /// inactive, having no bottom level for it (`super::top`): coverage,
+    /// not a wrong structure.
+    ConsoleOnly { no_bottom: bool },
+    /// The console's walk did not finish (a page not read, or one with no
+    /// place on the card, or a structure it cannot walk): not compared.
+    Unfinished,
+}
+
+/// The [`Verdict`] of one ray: the host's hit, the console's walk, the
+/// host's instance description of an index (as rewritten at submission:
+/// bottom level 0 if the host had none).
+fn judge<'a>(host: Option<HostHit>, console: &Walked, instance: impl Fn(u32) -> Option<&'a [u8]>) -> Verdict {
+    match (host, console) {
+        (None, Walked::Miss) => Verdict::Agree { strict: true },
+        (Some(h), Walked::Hit(c)) if near(h.t, c.t) => Verdict::Agree { strict: h.index == c.index && h.primitive == c.primitive },
+        (Some(_), Walked::Hit(_)) => Verdict::Distance,
+        (Some(_), Walked::Miss) => Verdict::HostOnly,
+        (None, Walked::Hit(c)) => {
+            let no_bottom = instance(c.index).is_some_and(|d| d[56..64] == [0; 8]);
+            Verdict::ConsoleOnly { no_bottom }
+        }
+        (_, Walked::Missing(_) | Walked::Broken(_)) => Verdict::Unfinished,
+    }
+}
+
+/// The rays of one probe by [`Verdict`], the picture's grid and the aimed
+/// ones apart.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
+struct Agreement {
+    /// [grid, aimed] each.
+    compared: [u32; 2],
+    agree: [u32; 2],
+    strict: [u32; 2],
+    distance: u32,
+    host_only: u32,
+    console_only: u32,
+    no_bottom: u32,
+    unfinished: u32,
+}
+
+/// Since the start: rays compared, agreeing, agreeing strictly.
+static AGREED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+impl Agreement {
+    fn add(&mut self, v: Verdict, aimed: bool) {
+        let k = usize::from(aimed);
+        if v != Verdict::Unfinished {
+            self.compared[k] += 1;
+        }
+        match v {
+            Verdict::Agree { strict } => {
+                self.agree[k] += 1;
+                self.strict[k] += u32::from(strict);
+            }
+            Verdict::Distance => self.distance += 1,
+            Verdict::HostOnly => self.host_only += 1,
+            Verdict::ConsoleOnly { no_bottom } => {
+                self.console_only += 1;
+                self.no_bottom += u32::from(no_bottom);
+            }
+            Verdict::Unfinished => self.unfinished += 1,
+        }
+    }
+
+    fn line(&self, number: u64, since: [u64; 3]) -> String {
+        let pc = |a: u64, b: u64| if b > 0 { 100.0 * a as f64 / b as f64 } else { 0.0 };
+        let (compared, agree, strict) = (
+            u64::from(self.compared[0] + self.compared[1]),
+            u64::from(self.agree[0] + self.agree[1]),
+            u64::from(self.strict[0] + self.strict[1]),
+        );
+        format!(
+            "host ray tracing agreement (VICTORY_DXR_PROBE) probe {number}: the host's top level and the console's walk agree on {agree} \
+             of {compared} rays ({:.1} %; the picture's grid {} of {}, aimed at instances {} of {}), {strict} the same instance and \
+             primitive too ({:.1} %); they differ in {} (other distances {}, only the host hit {}, only the console {}, {} of them in an \
+             instance whose bottom level the host has not got); {} not compared (the console's walk unfinished); since the start {} of {} \
+             ({:.1} %), strictly {} ({:.1} %)",
+            pc(agree, compared),
+            self.agree[0],
+            self.compared[0],
+            self.agree[1],
+            self.compared[1],
+            pc(strict, compared),
+            compared - agree,
+            self.distance,
+            self.host_only,
+            self.console_only,
+            self.no_bottom,
+            self.unfinished,
+            since[1],
+            since[0],
+            pc(since[1], since[0]),
+            since[2],
+            pc(since[2], since[0]),
+        )
+    }
+
+    /// Adds to the counts since the start and says the line.
+    fn say(&self, number: u64) {
+        let add = |k: usize, n: u32| AGREED[k].fetch_add(u64::from(n), Relaxed) + u64::from(n);
+        let since = [
+            add(0, self.compared[0] + self.compared[1]),
+            add(1, self.agree[0] + self.agree[1]),
+            add(2, self.strict[0] + self.strict[1]),
+        ];
+        tracing::info!("{}", self.line(number, since));
+    }
+}
+
+fn compare(run: &Run, sent: &Sent, rays: &[Shot], walked: &[Walked], hits: &[u32]) {
     let instance = |index: u32| sent.instances.get(index as usize * INSTANCE..index as usize * INSTANCE + INSTANCE);
     let contribution = |index: u32| instance(index).map(|d| u32::from_le_bytes(d[52..56].try_into().unwrap_or_default()) & 0xff_ffff);
     let [mut both, mut neither, mut host_only, mut console_only, mut unfinished, mut absent] = [0u32; 6];
@@ -690,9 +875,15 @@ fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits:
     let mut frame_words: BTreeMap<u32, u32> = BTreeMap::new();
     let mut listing = String::new();
     let mut first = Vec::new();
-    for (k, (&(x, y), w)) in rays.iter().zip(walked).enumerate() {
-        let i = (y * WIDTH + x) as usize;
-        let h = host_hit(hits, i);
+    let mut agreement = Agreement::default();
+    for (k, (shot, w)) in rays.iter().zip(walked).enumerate() {
+        let h = host_hit(hits, shot.slot);
+        agreement.add(judge(h, w, instance), shot.aimed);
+        let place = if shot.aimed {
+            format!("aimed {}", shot.slot - RAYS as usize)
+        } else {
+            format!("pixel {}, {}", shot.slot as u32 % WIDTH, shot.slot as u32 / WIDTH)
+        };
         if let Walked::Hit(c) = w {
             *frame_words.entry(c.frame_word).or_insert(0) += 1;
         }
@@ -747,7 +938,7 @@ fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits:
                     c.clockwise, c.roles, c.instance, c.instance_flags, c.frame_word
                 );
                 if (face_differs || same.iter().any(|s| !s)) && first.len() < 8 {
-                    first.push(format!("ray {k} ({x}, {y}): {text}"));
+                    first.push(format!("ray {k} ({place}): {text}"));
                 }
                 text
             }
@@ -759,7 +950,7 @@ fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits:
                 host_only += 1;
                 let text = format!("host only: t {t} instance {index} id {id}");
                 if first.len() < 8 {
-                    first.push(format!("ray {k} ({x}, {y}): {text}"));
+                    first.push(format!("ray {k} ({place}): {text}"));
                 }
                 text
             }
@@ -767,7 +958,7 @@ fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits:
                 console_only += 1;
                 let text = format!("console only: t {} id {} geometry {} primitive {}", c.t, c.id, c.geometry, c.primitive);
                 if first.len() < 8 {
-                    first.push(format!("ray {k} ({x}, {y}): {text}"));
+                    first.push(format!("ray {k} ({place}): {text}"));
                 }
                 text
             }
@@ -785,9 +976,10 @@ fn compare(run: &Run, sent: &Sent, rays: &[(u32, u32)], walked: &[Walked], hits:
                 format!("console walk broken: {why}")
             }
         };
-        let d = direction(x, y);
-        let _ = writeln!(listing, "ray {k} pixel ({x}, {y}) direction ({:.4} {:.4} {:.4}): {line}", d[0], d[1], d[2]);
+        let d = shot.direction;
+        let _ = writeln!(listing, "ray {k} {place} direction ({:.4} {:.4} {:.4}): {line}", d[0], d[1], d[2]);
     }
+    agreement.say(run.number);
     let host_facing = if host_faced > 0 {
         format!("; the host's query says front-facing {host_front} of {host_faced}, the same as from the console's winding {face_same}")
     } else {
@@ -939,6 +1131,7 @@ mod tests {
             clockwise: true,
             roles: ROLES_FLIP | 0x9,
             instance: 0,
+            index: 0,
             turn: Some(swap),
             frame_word: 0,
         };
@@ -962,6 +1155,84 @@ mod tests {
         assert_eq!((h.t, h.index, h.id, h.primitive, h.geometry, h.uv), (2.0, 3, 7, 11, 1, [0.5, 0.25]));
         assert_eq!(h.front.is_some(), HIT > 8);
         assert_eq!(host_hit(&hits, 2), None);
+    }
+
+    fn console(t: f32, index: u32, primitive: u32) -> Walked {
+        Walked::Hit(walk::Hit {
+            t,
+            barycentrics: [0.25, 0.25],
+            id: 0,
+            contribution: 0,
+            instance_flags: 0,
+            geometry: 0,
+            geometry_flags: 0,
+            primitive,
+            clockwise: true,
+            roles: 0,
+            instance: 0,
+            index,
+            turn: None,
+            frame_word: 0,
+        })
+    }
+
+    fn host(t: f32, index: u32, primitive: u32) -> Option<HostHit> {
+        Some(HostHit { t, index, id: 0, primitive, geometry: 0, uv: [0.25, 0.25], front: None })
+    }
+
+    #[test]
+    fn rays_agree_on_a_miss_or_a_hit_at_the_same_distance() {
+        // Instance 0 has the host's bottom level, instance 1 was made inactive.
+        let mut d = [0u8; 2 * INSTANCE];
+        d[56..64].copy_from_slice(&0xa_0000u64.to_le_bytes());
+        let instance = |k: u32| d.get(k as usize * INSTANCE..(k as usize + 1) * INSTANCE);
+        assert_eq!(judge(None, &Walked::Miss, instance), Verdict::Agree { strict: true });
+        assert_eq!(judge(host(5.0, 0, 3), &console(5.0, 0, 3), instance), Verdict::Agree { strict: true });
+        // The same distance on another primitive (a pair's other half, or
+        // two triangles at one place): agree, not strictly.
+        assert_eq!(judge(host(5.0, 0, 3), &console(5.000_001, 0, 4), instance), Verdict::Agree { strict: false });
+        assert_eq!(judge(host(5.0, 0, 3), &console(7.0, 0, 3), instance), Verdict::Distance);
+        assert_eq!(judge(host(5.0, 0, 3), &Walked::Miss, instance), Verdict::HostOnly);
+        assert_eq!(judge(None, &console(5.0, 1, 3), instance), Verdict::ConsoleOnly { no_bottom: true });
+        assert_eq!(judge(None, &console(5.0, 0, 3), instance), Verdict::ConsoleOnly { no_bottom: false });
+        assert_eq!(judge(None, &Walked::Missing(0x1_0000), instance), Verdict::Unfinished);
+        assert_eq!(judge(host(1.0, 0, 0), &Walked::Broken("x"), instance), Verdict::Unfinished);
+        // The tally: unfinished rays are not compared.
+        let mut a = Agreement::default();
+        for (v, aimed) in [
+            (Verdict::Agree { strict: true }, false),
+            (Verdict::Agree { strict: false }, true),
+            (Verdict::ConsoleOnly { no_bottom: true }, true),
+            (Verdict::Unfinished, false),
+        ] {
+            a.add(v, aimed);
+        }
+        assert_eq!((a.compared, a.agree, a.strict, a.no_bottom, a.unfinished), ([1, 2], [1, 1], [1, 0], 1, 1));
+        let line = a.line(7, [3, 2, 1]);
+        assert!(line.contains("agree on 2 of 3 rays (66.7 %"), "{line}");
+        assert!(line.contains("since the start 2 of 3"), "{line}");
+    }
+
+    #[test]
+    fn rays_are_aimed_at_the_active_instances_places() {
+        let mut d = vec![0u8; 3 * INSTANCE];
+        for (k, x) in [10.0f32, 20.0, 30.0].iter().enumerate() {
+            d[k * INSTANCE + 12..k * INSTANCE + 16].copy_from_slice(&x.to_le_bytes());
+            d[k * INSTANCE + 51] = 0xff;
+            d[k * INSTANCE + 56] = 1;
+        }
+        // The second has no bottom level on the host (made inactive): aimed
+        // at still; the third the title made inactive: not.
+        d[INSTANCE + 51] = 0;
+        d[INSTANCE + 56] = 0;
+        d[2 * INSTANCE + 51] = 0;
+        d[2 * INSTANCE + 12..2 * INSTANCE + 16].copy_from_slice(&(-30f32).to_le_bytes());
+        let a = aim(&d, [0.0, 0.0, 0.0]);
+        assert_eq!(a, vec![[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]);
+        // The shots: the grid, then the aimed ones after the picture's rays.
+        let s = shots(&a);
+        assert_eq!(s.len(), (GRID.0 * GRID.1) as usize + 2);
+        assert!(s[s.len() - 1].aimed && s[s.len() - 1].slot == RAYS as usize + 1);
     }
 
     #[test]

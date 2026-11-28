@@ -14,7 +14,8 @@
 //! - an instance node (kind 6) holds the instance id and mask at `+48`, the
 //!   hit group contribution and the instance flags at `+52`, the bottom
 //!   level's root pointer at `+56` (30 bits; `0x3fffffff`: none) and the
-//!   bottom level's address in 256-byte units at `+60`; the ray goes into the
+//!   bottom level's address in 256-byte units at `+60`, the instance's index
+//!   in the top level's descriptions at `+112`; the ray goes into the
 //!   bottom level's own space by the 3x3 at `+76..+111` (rows of three) and
 //!   the translation at `+64`, added after it: `o' = M o + T`, `d' = M d`,
 //!   where a pointer at `+56` with its top bit set has no `M` (the identity);
@@ -70,8 +71,11 @@ pub(crate) struct Hit {
     /// triangle's roles byte (its winding bits).
     pub clockwise: bool,
     pub roles: u32,
-    /// The instance node's address.
+    /// The instance node's address, and the index its `+112` keeps: the
+    /// instance's place in the descriptions the top level was built from
+    /// (what a program reads as `InstanceIndex`).
     pub instance: u64,
+    pub index: u32,
     /// The 3x3 (rows of three) the instance node turned the ray by into the
     /// bottom level's own space; `None`: it has none (the identity).
     pub turn: Option<[f32; 9]>,
@@ -85,6 +89,7 @@ pub(crate) struct Hit {
 /// The mask byte of an instance, its id and the rest of its node.
 struct Instance {
     id: u32,
+    index: u32,
     contribution: u32,
     flags: u32,
     address: u64,
@@ -188,6 +193,7 @@ fn walk_inner(
                     clockwise: den > 0.0,
                     roles: w[15] >> (8 * k) & 0xff,
                     instance: inst.address,
+                    index: inst.index,
                     turn: inst.turn,
                     frame_word: inst.frame_word,
                 });
@@ -196,7 +202,7 @@ fn walk_inner(
                 if instance.is_some() {
                     return Err(Ok("an instance inside a bottom level"));
                 }
-                let w = words::<28>(pages, at).map_err(Err)?;
+                let w = words::<32>(pages, at).map_err(Err)?;
                 if (w[12] >> 24) & mask == 0 {
                     continue;
                 }
@@ -219,6 +225,7 @@ fn walk_inner(
                 let [frame_word] = words::<1>(pages, base + 60).map_err(Err)?;
                 let inst = Instance {
                     id: w[12] & 0xff_ffff,
+                    index: w[28],
                     contribution: w[13] & 0xff_ffff,
                     flags: w[13] >> 24,
                     address: at,
@@ -301,7 +308,8 @@ mod tests {
         i0[13] = 3;
         i0[14] = 1 << 31 | (2 << 3 | 5);
         i0[15] = (BLAS >> 8) as u32;
-        // Translation (0, 0, 0).
+        // Translation (0, 0, 0); its index 4 at +112.
+        i0.extend([4, 0, 0, 0]);
         m.put(TOP + 2 * 64, &i0);
         // Instance 1 (node 4): id 9, mask 0x02, contribution 5; turned:
         // x' = 2 y, y' = 2 x, z' = 2 z - 10 (so z' = 5 at z = 7.5).
@@ -347,7 +355,7 @@ mod tests {
         let Walked::Hit(h) = walk(&m, TOP, [1.0, 1.0, 0.0], [0.0, 0.0, 1.0], 0.0, 100.0, 0xff) else { panic!() };
         assert_eq!((h.t, h.id, h.contribution, h.geometry, h.geometry_flags, h.primitive), (5.0, 7, 3, 2, 1, 11));
         assert!((h.barycentrics[0] - 0.25).abs() < 1e-6 && (h.barycentrics[1] - 0.25).abs() < 1e-6);
-        assert_eq!(h.instance, TOP + 2 * 64);
+        assert_eq!((h.instance, h.index), (TOP + 2 * 64, 4));
         assert_eq!((h.turn, h.frame_word), (None, 0x0a7f_7f7f));
         // Mask 2 only: the turned instance, met at z = 7.5 (t = 7.5 along the
         // world direction although its space is scaled by 2). At (0.5, 0.5)
