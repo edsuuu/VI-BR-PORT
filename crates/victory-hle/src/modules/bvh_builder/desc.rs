@@ -53,14 +53,17 @@ pub const PREFER_FAST_TRACE: u32 = 0x4;
 pub const PREFER_FAST_BUILD: u32 = 0x8;
 pub const MINIMIZE_MEMORY: u32 = 0x10;
 pub const PERFORM_UPDATE: u32 = 0x20;
+/// The console's own: build a structure to be shipped and unpacked later.
+pub const DEHYDRATE: u32 = 0x4000_0000;
 
-const BUILD_FLAGS: [(u32, &str); 6] = [
+const BUILD_FLAGS: [(u32, &str); 7] = [
     (ALLOW_UPDATE, "ALLOW_UPDATE"),
     (ALLOW_COMPACTION, "ALLOW_COMPACTION"),
     (PREFER_FAST_TRACE, "PREFER_FAST_TRACE"),
     (PREFER_FAST_BUILD, "PREFER_FAST_BUILD"),
     (MINIMIZE_MEMORY, "MINIMIZE_MEMORY"),
     (PERFORM_UPDATE, "PERFORM_UPDATE"),
+    (DEHYDRATE, "DEHYDRATE"),
 ];
 
 // D3D12_ELEMENTS_LAYOUT.
@@ -1233,6 +1236,7 @@ mod tests {
             "ALLOW_COMPACTION|PREFER_FAST_TRACE"
         );
         assert_eq!(build_flags(0), "NONE");
+        assert_eq!(build_flags(DEHYDRATE | ALLOW_COMPACTION), "ALLOW_COMPACTION|DEHYDRATE");
         assert_eq!(
             build_flags(PERFORM_UPDATE | ALLOW_UPDATE | 0x100),
             "ALLOW_UPDATE|PERFORM_UPDATE|0x100"
