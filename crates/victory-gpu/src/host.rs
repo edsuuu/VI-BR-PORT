@@ -10076,6 +10076,7 @@ impl Meter {
         crate::copystat::presented();
         self.frames += 1;
         crate::rtcalls::frame();
+        crate::dxr::frame();
         mesh_dip_check();
         #[cfg(feature = "diagnostics")]
         {
@@ -10211,6 +10212,7 @@ impl Meter {
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             crate::rtcalls::line();
+            crate::dxr::line();
             tracing::info!(
                 "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
@@ -10803,6 +10805,12 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
 }
 
 impl Host {
+    /// Ticks per second of the queue's timestamps (0 if it does not say).
+    pub(crate) fn timestamp_frequency(&self) -> u64 {
+        // SAFETY: a plain query.
+        unsafe { self.queue.GetTimestampFrequency() }.unwrap_or(0)
+    }
+
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does

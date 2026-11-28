@@ -842,6 +842,25 @@ pub(crate) fn asked_sizes<'a>(lists: impl Iterator<Item = &'a HostList>) -> bool
     asked
 }
 
+/// Where the shaders that find title memory by address find `address`: the
+/// buffer of the copy holding its 64 KiB page, the byte offset of `address`
+/// in that buffer, and whether the copy is one of our arenas (whose pages
+/// the card alone holds whole: what shaders store there comes back nowhere).
+/// `None` if its page has no place. For the host's own ray tracing
+/// (`crate::dxr`): the console's structures read back to be walked on the
+/// CPU, and vertex data only the card holds.
+pub(crate) fn home(address: u64) -> Option<(ID3D12Resource, u64, bool)> {
+    let guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let m = guard.as_ref()?;
+    let page = address / PAGE;
+    let n = m.copy_of(page)?;
+    // SAFETY: an entry of the directory, under the mutex.
+    let offset = u64::from(unsafe { m.entry(page).add(1).read() });
+    let shadow = m.copies.get(n)?;
+    let at = shadow.offset(shadow.span().0 + offset) + address % PAGE;
+    Some((shadow.buffer.clone(), at, m.arenas.iter().any(|&(k, _)| k == n)))
+}
+
 /// [`fill`] of a page stores by address do not reach.
 fn close(entry: *mut u32, n: usize, offset: u64) {
     fill(entry, n | MEMORY_READ_ONLY as usize, offset);

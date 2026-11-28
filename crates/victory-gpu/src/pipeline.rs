@@ -401,9 +401,13 @@ fn ray_programs_are_known_by_name() {
 /// `VICTORY_ACTIVATE_RAYS=1`.
 #[cfg(windows)]
 pub(crate) fn skips_rt_skin(this: This) -> bool {
+    // The host's own structures (`VICTORY_DXR_NATIVE`, `crate::dxr`) are a
+    // builder too: what the skinning writes is what they are built from.
+    // (`VICTORY_RT_MISS=1` turns them off, so today this changes nothing.)
     fn off(switch: &str) -> bool {
         victory_shader::emit::rt_miss()
             && std::env::var_os("VICTORY_BVH_BUILDER").is_none_or(|v| v != "1")
+            && !crate::dxr::native_on()
             && std::env::var_os(switch).is_none_or(|v| v != "1")
     }
     static SKIN: OnceLock<bool> = OnceLock::new();

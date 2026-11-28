@@ -5303,6 +5303,32 @@ fn longest_tail(windows: impl Iterator<Item = (u64, u64)>, address: u64, end: u6
         .min()
 }
 
+/// Every host copy made so far that holds all of `[address, address + len)`:
+/// the title buffers' (innermost first), the copies of views' own bytes
+/// ([`exact`]) and the windows outside buffers. A host build of a
+/// ray-tracing structure (`crate::dxr`) must read the copy shaders wrote
+/// the vertices into: another copy of the same bytes does not see what a
+/// submission's shaders wrote until it has run.
+pub(crate) fn copies_over(address: u64, len: u64) -> Vec<Arc<Shadow>> {
+    let Some(end) = address.checked_add(len.max(1)) else { return Vec::new() };
+    let mut out: Vec<Arc<Shadow>> = buffers_read()
+        .range(..=(address, usize::MAX))
+        .rev()
+        .take(64)
+        .filter(|(_, e)| e.end >= end)
+        .filter_map(|(_, e)| e.shadow.clone())
+        .collect();
+    {
+        let exact = EXACT.lock().unwrap_or_else(|e| e.into_inner());
+        let held = exact.1.range(..=(address, u64::MAX)).rev().take(64);
+        out.extend(held.filter(|&(&(start, bytes), _)| start + bytes >= end).map(|(_, (shadow, _))| shadow.clone()));
+    }
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    let held = loose.range(..=(address, u64::MAX)).rev().take(64);
+    out.extend(held.filter(|&(&(start, bytes), _)| start + bytes >= end).map(|(_, shadow)| shadow.clone()));
+    out
+}
+
 /// Whether `[address, address + len)` lies in one title buffer.
 pub(crate) fn in_buffer(address: u64, len: u64) -> Option<(u64, u64)> {
     let end = address.checked_add(len)?;

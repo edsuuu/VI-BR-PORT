@@ -1,0 +1,344 @@
+//! A walk of the **console's** structures on the CPU, for the probe to fire
+//! the same rays at them as at the host's (`super::probe`) and compare ray by
+//! ray: whether the host's structure answers what the title's programs
+//! would find in the console's.
+//!
+//! The node test is the console instruction's own (`victory_shader::bvh`);
+//! the rules around it are what the title's walks do, read in their code
+//! (`CS_PPR_Raytrace`, the per-lane form; the ray-tracing work's notes
+//! `nativo-programas.md` 2.1):
+//!
+//! - a structure's header holds its root node's pointer at `+48`; a pointer
+//!   is a kind in its low three bits and the node at `base + (pointer >> 3)
+//!   * 64`;
+//! - an instance node (kind 6) holds the instance id and mask at `+48`, the
+//!   hit group contribution and the instance flags at `+52`, the bottom
+//!   level's root pointer at `+56` (30 bits; `0x3fffffff`: none) and the
+//!   bottom level's address in 256-byte units at `+60`; the ray goes into the
+//!   bottom level's own space by the 3x3 at `+76..+111` (rows of three) and
+//!   the translation at `+64`, added after it: `o' = M o + T`, `d' = M d`,
+//!   where a pointer at `+56` with its top bit set has no `M` (the identity);
+//! - a triangle node keeps two triangles: the geometry index above the
+//!   geometry flags at `+48`, the primitive index of triangle `k` at `+52 +
+//!   4k`, the triangle's vertex roles in byte `k` of `+60`.
+//!
+//! The walk takes every triangle the ray meets (no culling, no judging, as
+//! the probe's ray queries do) and keeps the nearest. The bottom level's own
+//! space is rotated and scaled against the title's object space (the
+//! critic's item 3), so only what does not depend on the space is compared:
+//! the distance along the world ray (the direction goes through `M` without
+//! being normalized), the barycentrics, and the ids.
+
+use victory_shader::bvh;
+
+/// Bytes of title memory, or the page (its address) that is not there yet.
+pub(crate) trait Pages {
+    fn read(&self, address: u64, out: &mut [u8]) -> Result<(), u64>;
+}
+
+/// What the walk found for one ray.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Walked {
+    Hit(Hit),
+    Miss,
+    /// A page the walk needs is not read yet.
+    Missing(u64),
+    /// The structure is not what the walk takes it for.
+    Broken(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Hit {
+    pub t: f32,
+    /// The weights of the input triangle's second and third vertices.
+    pub barycentrics: [f32; 2],
+    pub id: u32,
+    pub contribution: u32,
+    pub instance_flags: u32,
+    pub geometry: u32,
+    pub geometry_flags: u32,
+    pub primitive: u32,
+    /// The denominator's sign (positive: clockwise from the origin), and the
+    /// triangle's roles byte (its winding bits).
+    pub clockwise: bool,
+    pub roles: u32,
+    /// The instance node's address.
+    pub instance: u64,
+}
+
+/// The mask byte of an instance, its id and the rest of its node.
+struct Instance {
+    id: u32,
+    contribution: u32,
+    flags: u32,
+    address: u64,
+    origin: [f32; 3],
+    direction: [f32; 3],
+}
+
+/// Nodes walked at most a ray.
+const STEPS: usize = 1 << 20;
+
+fn words<const N: usize>(pages: &dyn Pages, address: u64) -> Result<[u32; N], u64> {
+    let mut bytes = vec![0u8; 4 * N];
+    pages.read(address, &mut bytes)?;
+    Ok(std::array::from_fn(|i| u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().unwrap_or_default())))
+}
+
+fn node(base: u64, pointer: u32) -> u64 {
+    base.wrapping_add(u64::from(pointer >> 3) << 6)
+}
+
+/// The nearest hit of the ray `origin + t direction`, `t_min <= t < t_max`,
+/// in the console's top level at `top`, through instances whose mask meets
+/// `mask`.
+pub(crate) fn walk(pages: &dyn Pages, top: u64, origin: [f32; 3], direction: [f32; 3], t_min: f32, t_max: f32, mask: u32) -> Walked {
+    match walk_inner(pages, top, origin, direction, t_min, t_max, mask) {
+        Ok(Some(hit)) => Walked::Hit(hit),
+        Ok(None) => Walked::Miss,
+        Err(Err(page)) => Walked::Missing(page),
+        Err(Ok(why)) => Walked::Broken(why),
+    }
+}
+
+type Failed = Result<&'static str, u64>;
+
+fn walk_inner(
+    pages: &dyn Pages,
+    top: u64,
+    origin: [f32; 3],
+    direction: [f32; 3],
+    t_min: f32,
+    t_max: f32,
+    mask: u32,
+) -> Result<Option<Hit>, Failed> {
+    let [root] = words::<1>(pages, top + 48).map_err(Err)?;
+    // (base, pointer, the instance whose bottom level it is in)
+    let mut stack: Vec<(u64, u32, Option<std::rc::Rc<Instance>>)> = vec![(top, root, None)];
+    let mut best: Option<Hit> = None;
+    let mut steps = 0;
+    while let Some((base, pointer, instance)) = stack.pop() {
+        steps += 1;
+        if steps > STEPS {
+            return Err(Ok("too many nodes for one ray"));
+        }
+        let at = node(base, pointer);
+        let (o, d) = instance.as_ref().map_or((origin, direction), |i| (i.origin, i.direction));
+        let far = best.map_or(t_max, |b| b.t);
+        match pointer & 7 {
+            kind @ (4 | 5) => {
+                let w = words::<28>(pages, at).map_err(Err)?;
+                let ray = bvh::Ray::new(o, d, far);
+                for child in bvh::intersect(&w, kind, &ray, false) {
+                    if child != bvh::NONE {
+                        stack.push((base, child, instance.clone()));
+                    }
+                }
+            }
+            k @ 0..=3 => {
+                let Some(inst) = instance.as_ref() else {
+                    return Err(Ok("a triangle in the top level"));
+                };
+                let w = words::<28>(pages, at).map_err(Err)?;
+                let ray = bvh::Ray::new(o, d, far);
+                let [num, den, i, j] = bvh::triangle(&bvh::triangle_vertices(&w, k), &ray);
+                if num == f32::INFINITY {
+                    continue;
+                }
+                let t = num / den;
+                if !(t >= t_min && t < far) {
+                    continue;
+                }
+                best = Some(Hit {
+                    t,
+                    barycentrics: [i / den, j / den],
+                    id: inst.id,
+                    contribution: inst.contribution,
+                    instance_flags: inst.flags,
+                    geometry: w[12] >> 8,
+                    geometry_flags: w[12] & 0xff,
+                    primitive: w[13 + (k as usize & 1)],
+                    clockwise: den > 0.0,
+                    roles: w[15] >> (8 * k) & 0xff,
+                    instance: inst.address,
+                });
+            }
+            6 => {
+                if instance.is_some() {
+                    return Err(Ok("an instance inside a bottom level"));
+                }
+                let w = words::<28>(pages, at).map_err(Err)?;
+                if (w[12] >> 24) & mask == 0 {
+                    continue;
+                }
+                let blas_root = w[14] & 0x3fff_ffff;
+                if blas_root == 0x3fff_ffff {
+                    continue;
+                }
+                let f = |k: usize| f32::from_bits(w[k]);
+                let translation = [f(16), f(17), f(18)];
+                let turned = (w[14] as i32) >= 0;
+                let apply = |v: [f32; 3]| -> [f32; 3] {
+                    if !turned {
+                        return v;
+                    }
+                    std::array::from_fn(|r| f(19 + 3 * r) * v[0] + f(20 + 3 * r) * v[1] + f(21 + 3 * r) * v[2])
+                };
+                let mut o2 = apply(o);
+                for (c, t) in o2.iter_mut().zip(translation) {
+                    *c += t;
+                }
+                let inst = Instance {
+                    id: w[12] & 0xff_ffff,
+                    contribution: w[13] & 0xff_ffff,
+                    flags: w[13] >> 24,
+                    address: at,
+                    origin: o2,
+                    direction: apply(d),
+                };
+                stack.push((u64::from(w[15]) << 8, blas_root, Some(std::rc::Rc::new(inst))));
+            }
+            // Procedural boxes: the program's own code judges them.
+            _ => {}
+        }
+    }
+    Ok(best)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// Memory of the test's own, in pages of 4 KiB that may be held back.
+    #[derive(Default)]
+    struct Fake {
+        bytes: BTreeMap<u64, u8>,
+        absent: Option<u64>,
+    }
+
+    impl Fake {
+        fn put(&mut self, at: u64, words: &[u32]) {
+            for (i, w) in words.iter().enumerate() {
+                for (k, b) in w.to_le_bytes().into_iter().enumerate() {
+                    self.bytes.insert(at + 4 * i as u64 + k as u64, b);
+                }
+            }
+        }
+    }
+
+    impl Pages for Fake {
+        fn read(&self, address: u64, out: &mut [u8]) -> Result<(), u64> {
+            for (i, o) in out.iter_mut().enumerate() {
+                let a = address + i as u64;
+                if self.absent == Some(a & !0xfff) {
+                    return Err(a & !0xfff);
+                }
+                *o = self.bytes.get(&a).copied().unwrap_or(0);
+            }
+            Ok(())
+        }
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|f| f.to_bits()).collect()
+    }
+
+    const TOP: u64 = 0x10_0000;
+    const BLAS: u64 = 0x20_0000;
+
+    /// A top level of one 32-bit box node over two instance nodes of the
+    /// same bottom level: one where it is, one turned (x and y swapped,
+    /// scaled by 2) and moved, so the walk works in two spaces. The bottom
+    /// level: one triangle node with two triangles in the plane z = 5 of its
+    /// own space.
+    fn scene() -> Fake {
+        let mut m = Fake::default();
+        // Top header: the root pointer (a box32 at node 1).
+        m.put(TOP + 48, &[1 << 3 | 5]);
+        let wide = [-100.0, -100.0, -100.0, 100.0, 100.0, 100.0];
+        let off = [f32::NAN; 6];
+        let mut root = vec![2 << 3 | 6, 4 << 3 | 6, bvh::NONE, bvh::NONE];
+        root.extend(bits(&wide));
+        root.extend(bits(&wide));
+        root.extend(bits(&off));
+        root.extend(bits(&off));
+        m.put(TOP + 64, &root);
+        // Instance 0 (node 2): id 7, mask 0x01, contribution 3, no turn.
+        let mut i0 = vec![0u32; 28];
+        i0[12] = 7 | 0x01 << 24;
+        i0[13] = 3;
+        i0[14] = 1 << 31 | (2 << 3 | 5);
+        i0[15] = (BLAS >> 8) as u32;
+        // Translation (0, 0, 0).
+        m.put(TOP + 2 * 64, &i0);
+        // Instance 1 (node 4): id 9, mask 0x02, contribution 5; turned:
+        // x' = 2 y, y' = 2 x, z' = 2 z - 10 (so z' = 5 at z = 7.5).
+        let mut i1 = vec![0u32; 28];
+        i1[12] = 9 | 0x02 << 24;
+        i1[13] = 5 | 0x01 << 24;
+        i1[14] = 2 << 3 | 5;
+        i1[15] = (BLAS >> 8) as u32;
+        i1[16..19].copy_from_slice(&bits(&[0.0, 0.0, -10.0]));
+        i1[19..28].copy_from_slice(&bits(&[0.0, 2.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0]));
+        m.put(TOP + 4 * 64, &i1);
+        // The bottom level's triangle node (node 1): vertices 0-3, the
+        // geometry 2 with flags 1 at +48, primitives 11 and 12.
+        let v = [[0.0, 0.0, 5.0], [4.0, 0.0, 5.0], [0.0, 4.0, 5.0], [4.0, 4.0, 5.0]];
+        let mut t = vec![0u32; 16];
+        for (n, p) in v.iter().enumerate() {
+            t[3 * n..3 * n + 3].copy_from_slice(&bits(p));
+        }
+        t[12] = 2 << 8 | 1;
+        t[13] = 11;
+        t[14] = 12;
+        // Triangle 0: roles I = 1, J = 2; triangle 1 (node vertices 1, 3, 2): the same.
+        t[15] = (1 | 2 << 2) | (1 | 2 << 2) << 8;
+        m.put(BLAS + 64, &t);
+        // Its root (node 2): a box node naming triangles 0 and 1 of node 1.
+        let around = [-1.0, -1.0, 4.0, 5.0, 5.0, 6.0];
+        let mut b = vec![1 << 3, 1 << 3 | 1, bvh::NONE, bvh::NONE];
+        b.extend(bits(&around));
+        b.extend(bits(&around));
+        b.extend(bits(&off));
+        b.extend(bits(&off));
+        m.put(BLAS + 2 * 64, &b);
+        m
+    }
+
+    #[test]
+    fn the_walk_takes_the_nearest_triangle_through_the_instances_spaces() {
+        let m = scene();
+        // Down +z at (1, 1): instance 0's triangle 0 at z = 5, t = 5; the
+        // turned one is at z = 7.5, further.
+        let Walked::Hit(h) = walk(&m, TOP, [1.0, 1.0, 0.0], [0.0, 0.0, 1.0], 0.0, 100.0, 0xff) else { panic!() };
+        assert_eq!((h.t, h.id, h.contribution, h.geometry, h.geometry_flags, h.primitive), (5.0, 7, 3, 2, 1, 11));
+        assert!((h.barycentrics[0] - 0.25).abs() < 1e-6 && (h.barycentrics[1] - 0.25).abs() < 1e-6);
+        assert_eq!(h.instance, TOP + 2 * 64);
+        // Mask 2 only: the turned instance, met at z = 7.5 (t = 7.5 along the
+        // world direction although its space is scaled by 2). At (0.5, 0.5)
+        // its space has (1, 1): triangle 0 again.
+        let Walked::Hit(h) = walk(&m, TOP, [0.5, 0.5, 0.0], [0.0, 0.0, 1.0], 0.0, 100.0, 0x02) else { panic!() };
+        assert_eq!((h.id, h.contribution, h.instance_flags, h.primitive), (9, 5, 1, 11));
+        assert!((h.t - 7.5).abs() < 1e-5, "{}", h.t);
+        // At (1.75, 0.5) world, the turned space has (1, 3.5): x + y > 4 is
+        // triangle 1 (primitive 12).
+        let Walked::Hit(h) = walk(&m, TOP, [1.75, 0.5, 0.0], [0.0, 0.0, 1.0], 0.0, 100.0, 0x02) else { panic!() };
+        assert_eq!(h.primitive, 12);
+        // Too short to reach either, or beside both.
+        assert_eq!(walk(&m, TOP, [1.0, 1.0, 0.0], [0.0, 0.0, 1.0], 0.0, 4.0, 0xff), Walked::Miss);
+        assert_eq!(walk(&m, TOP, [50.0, 50.0, 0.0], [0.0, 0.0, 1.0], 0.0, 100.0, 0xff), Walked::Miss);
+        // Starting past the first: the second.
+        let Walked::Hit(h) = walk(&m, TOP, [1.0, 1.0, 0.0], [0.0, 0.0, 1.0], 6.0, 100.0, 0xff) else { panic!() };
+        assert_eq!(h.id, 9);
+    }
+
+    #[test]
+    fn a_page_not_read_yet_is_named() {
+        let mut m = scene();
+        m.absent = Some(BLAS);
+        assert_eq!(walk(&m, TOP, [1.0, 1.0, 0.0], [0.0, 0.0, 1.0], 0.0, 100.0, 0xff), Walked::Missing(BLAS));
+        // A ray that meets no instance never needs it.
+        assert_eq!(walk(&m, TOP, [500.0, 1.0, 0.0], [0.0, 0.0, 1.0], 0.0, 100.0, 0xff), Walked::Miss);
+    }
+}
