@@ -159,6 +159,11 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
     })
 }
 
+/// For the PC memory line: the bytes kept for the next submissions.
+pub(super) fn kept_bytes() -> u64 {
+    SPARE.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|m| m.size).sum()
+}
+
 /// The submission has run.
 pub(super) fn give_back(memory: Memory) {
     let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());

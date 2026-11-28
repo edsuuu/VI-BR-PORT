@@ -5280,9 +5280,31 @@ pub(crate) fn window_cover() -> u64 {
     cover(loose.keys().copied())
 }
 
+/// For the PC memory line (`crate::ram`, release builds too): windows alive
+/// and their bytes, the bytes of title memory they lie over (each byte
+/// once), and those a descriptor slot holds (a slot keeps the host buffer
+/// it views, `HostHeap::kept`) and their bytes. Under the read lock: the
+/// lookups go on meanwhile.
+pub(crate) fn ram_windows() -> [u64; 5] {
+    let loose = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+    let mut out = [loose.len() as u64, 0, cover(loose.keys().copied()), 0, 0];
+    for s in loose.values() {
+        out[1] += s.len;
+        if crate::host::references(&s.buffer) > 1 {
+            out[3] += 1;
+            out[4] += s.len;
+        }
+    }
+    out
+}
+
+/// Host copies alive and the bytes of title memory they copy ([`LIVE`]).
+pub(crate) fn alive() -> [u64; 2] {
+    [LIVE[0].load(Ordering::Relaxed), LIVE[1].load(Ordering::Relaxed)]
+}
+
 /// The bytes `windows` (start, bytes; in order of start) lie over, each
 /// byte once.
-#[cfg_attr(not(any(test, feature = "diagnostics")), allow(dead_code))]
 fn cover(windows: impl Iterator<Item = (u64, u64)>) -> u64 {
     let (mut covered, mut reached) = (0, 0);
     for (start, bytes) in windows {
