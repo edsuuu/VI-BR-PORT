@@ -444,6 +444,23 @@ pub(crate) fn line() {
         timed,
         if timed > 0.0 { c[C::CardNanos as usize] / 1e6 / timed } else { 0.0 },
     );
+    if super::expand::on() {
+        let _ = write!(
+            text,
+            "; expanded (VICTORY_DXR_EXPAND) {:.1} index-53 lists ({:.0} triangles) and {:.1} quantized position lists \
+             ({:.0} vertices), {:.2} MB of upload memory, {:.1} in pages of by-address memory the card holds; at submission \
+             {:.2} not readable, {:.0} triangles made degenerate, {:.0} positions not finite",
+            per(C::ExpandedIndexLists),
+            per(C::ExpandedTriangles),
+            per(C::ExpandedPositionLists),
+            per(C::ExpandedVertices),
+            per(C::ExpandedBytes) / f64::from(1 << 20),
+            per(C::ExpandedByAddress),
+            per(C::ExpandedUnreadable),
+            per(C::ExpandedDegenerate),
+            per(C::ExpandedNotFinite),
+        );
+    }
     if c[C::ShadersCopy as usize] > 0.0 {
         let _ = write!(text, "; {:.1} reads from the copy shaders wrote, not the one a draw takes", per(C::ShadersCopy));
     }

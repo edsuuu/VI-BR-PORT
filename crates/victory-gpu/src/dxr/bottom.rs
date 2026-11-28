@@ -10,6 +10,7 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
 use super::count::{C, REBUILT, Refusal, add};
 use super::native::{Held, Refused, Structure, lease_scratch, lease_structure, prebuild};
+use super::packed;
 use super::stamps::Gpu;
 use super::table::{self, Decision, GeometryShape, PERFORM_UPDATE, Shape, Table, Why};
 use super::{Build, Geometry, Level, Origin, Triangles};
@@ -78,19 +79,52 @@ fn resolve(host: &HostList, address: u64, len: u64) -> Result<u64, Refused> {
     Ok(copy.gpu(address))
 }
 
-/// The host's description of a triangle geometry, and its shape.
-fn triangles(host: &HostList, t: &Triangles) -> Result<(D3D12_RAYTRACING_GEOMETRY_DESC, GeometryShape), Refused> {
-    let (size, align) = vertex_format(t.vertex_format)
-        .ok_or_else(|| (Refusal::VertexFormat, crate::dxr::format_name(t.vertex_format)))?;
+/// Where a triangle geometry's data come from, and what the host builds it
+/// as ([`plan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Plan {
+    /// The positions are quantized and expanded (`super::expand`); else read
+    /// from a host copy, `size` bytes of position `stride` apart.
+    quantized: bool,
+    size: u64,
+    stride: u64,
+    /// The indices are packed (format 53) and expanded; else `index` bytes
+    /// each in a host copy (0: none).
+    packed: bool,
+    index: u64,
+    /// What the host's description says.
+    index_format: u32,
+    vertex_format: u32,
+    index_count: u32,
+    vertex_stride: u64,
+}
+
+/// `DXGI_FORMAT_R32G32B32_FLOAT` and `_R32_UINT`: what expansions make.
+const FLOAT3: u32 = 6;
+const UINT32: u32 = 42;
+
+/// How the host builds the triangles `t`; refused if it does not. With
+/// `expand` (`VICTORY_DXR_EXPAND`) the console's packed indices and
+/// quantized positions are expanded ([`super::packed`]) and bit 15 of the
+/// stride, which is not part of it, is dropped; without it, as before.
+fn plan(t: &Triangles, expand: bool) -> Result<Plan, Refused> {
+    let quantized = expand && t.vertex_format == packed::QUANTIZED;
+    let packed = expand && t.index_format == packed::INDEX_53;
+    let stride = if expand { t.vertex_stride & packed::STRIDE } else { t.vertex_stride };
+    let (size, align) = if quantized {
+        (packed::POSITION, 1)
+    } else {
+        vertex_format(t.vertex_format).ok_or_else(|| (Refusal::VertexFormat, crate::dxr::format_name(t.vertex_format)))?
+    };
     let index = match t.index_format {
         0 => 0,
         57 => 2,
         42 => 4,
+        packed::INDEX_53 if packed => 4,
         f => return Err((Refusal::IndexFormat, crate::dxr::format_name(f))),
     };
-    let unaligned = !t.vertex_stride.is_multiple_of(align)
-        || !t.vertex_buffer.is_multiple_of(align)
-        || (index > 0 && !t.index_buffer.is_multiple_of(index))
+    let unaligned = (!quantized && (!stride.is_multiple_of(align) || !t.vertex_buffer.is_multiple_of(align)))
+        || (index > 0 && !packed && !t.index_buffer.is_multiple_of(index))
         || !t.transform.is_multiple_of(16);
     if unaligned {
         return Err((
@@ -98,11 +132,41 @@ fn triangles(host: &HostList, t: &Triangles) -> Result<(D3D12_RAYTRACING_GEOMETR
             format!("vertices {:#x} stride {}, indices {:#x}, transform {:#x}", t.vertex_buffer, t.vertex_stride, t.index_buffer, t.transform),
         ));
     }
-    let vertices = match t.vertex_count {
-        0 => 0,
-        n => resolve(host, t.vertex_buffer, t.vertex_stride * u64::from(n - 1) + size)?,
+    Ok(Plan {
+        quantized,
+        size,
+        stride,
+        packed,
+        index,
+        index_format: if packed { UINT32 } else { t.index_format },
+        vertex_format: if quantized { FLOAT3 } else { t.vertex_format },
+        index_count: match (index, packed) {
+            (0, _) => 0,
+            (_, true) => t.index_count / 3 * 3,
+            (_, false) => t.index_count,
+        },
+        vertex_stride: if quantized { 12 } else { stride },
+    })
+}
+
+/// The host's description of a triangle geometry, and its shape; what its
+/// expansions add to the line goes into `tally`.
+fn triangles(
+    host: &HostList,
+    t: &Triangles,
+    tally: &mut super::expand::Tally,
+) -> Result<(D3D12_RAYTRACING_GEOMETRY_DESC, GeometryShape), Refused> {
+    let p = plan(t, super::expand::on())?;
+    let vertices = match (t.vertex_count, p.quantized) {
+        (0, _) => 0,
+        (_, true) => super::expand::positions(host, t, tally)?,
+        (n, false) => resolve(host, t.vertex_buffer, p.stride * u64::from(n - 1) + p.size)?,
     };
-    let indices = if index > 0 && t.index_count > 0 { resolve(host, t.index_buffer, index * u64::from(t.index_count))? } else { 0 };
+    let indices = match (p.index > 0 && t.index_count > 0, p.packed) {
+        (false, _) => 0,
+        (true, true) => super::expand::indices(host, t, tally)?,
+        (true, false) => resolve(host, t.index_buffer, p.index * u64::from(t.index_count))?,
+    };
     let transform = if t.transform != 0 { resolve(host, t.transform, 48)? } else { 0 };
     let desc = D3D12_RAYTRACING_GEOMETRY_DESC {
         Type: D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES,
@@ -110,12 +174,12 @@ fn triangles(host: &HostList, t: &Triangles) -> Result<(D3D12_RAYTRACING_GEOMETR
         Anonymous: D3D12_RAYTRACING_GEOMETRY_DESC_0 {
             Triangles: D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC {
                 Transform3x4: transform,
-                IndexFormat: DXGI_FORMAT(t.index_format as i32),
-                VertexFormat: DXGI_FORMAT(t.vertex_format as i32),
-                IndexCount: if index > 0 { t.index_count } else { 0 },
+                IndexFormat: DXGI_FORMAT(p.index_format as i32),
+                VertexFormat: DXGI_FORMAT(p.vertex_format as i32),
+                IndexCount: p.index_count,
                 VertexCount: t.vertex_count,
                 IndexBuffer: indices,
-                VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE { StartAddress: vertices, StrideInBytes: t.vertex_stride },
+                VertexBuffer: D3D12_GPU_VIRTUAL_ADDRESS_AND_STRIDE { StartAddress: vertices, StrideInBytes: p.vertex_stride },
             },
         },
     };
@@ -177,13 +241,14 @@ pub(super) fn bottom(
     if !whole {
         return Err((Refusal::NotWhole, format!("{} geometries read", geometries.len())));
     }
+    let mut tally = super::expand::Tally::default();
     let mut descs = Vec::with_capacity(geometries.len());
     let mut shapes = Vec::with_capacity(geometries.len());
     let (mut tris, mut boxes) = (0u64, 0u64);
     for g in geometries {
         match *g {
             Geometry::Triangles(t) => {
-                let (desc, shape) = triangles(host, &t)?;
+                let (desc, shape) = triangles(host, &t, &mut tally)?;
                 tris += triangle_count(&t);
                 descs.push(desc);
                 shapes.push(shape);
@@ -261,6 +326,7 @@ pub(super) fn bottom(
     // until it is reset (the copies by their refresh, ours by `held`), each in
     // the state a build needs.
     unsafe { list.BuildRaytracingAccelerationStructure(&desc, None) };
+    tally.count();
     held.leases.push(scratch);
     match (decision, made) {
         (Decision::Refit { in_place: true }, _) => {
@@ -331,5 +397,55 @@ mod tests {
         assert_eq!(crate::dxr::format_name(2), "R32G32B32A32_FLOAT");
         assert_eq!(triangle_count(&Triangles { index_format: 57, index_count: 300, vertex_count: 7, ..Default::default() }), 100);
         assert_eq!(triangle_count(&Triangles { vertex_count: 9, ..Default::default() }), 3);
+    }
+
+    fn geometry(index_format: u32, vertex_format: u32, vertex_stride: u64) -> Triangles {
+        Triangles {
+            flags: 1,
+            index_format,
+            vertex_format,
+            index_count: 301,
+            vertex_count: 50,
+            index_buffer: 0x1_0004,
+            vertex_buffer: 0x2_0020,
+            vertex_stride,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn packed_geometry_is_expanded_only_with_the_switch() {
+        // Without VICTORY_DXR_EXPAND, as before: format 53 refused, format 16
+        // taken as two floats, the stride as the title gives it.
+        assert_eq!(plan(&geometry(53, 16, 8), false).unwrap_err().0, Refusal::IndexFormat);
+        let two = plan(&geometry(57, 16, 8 | packed::FLIP), false).unwrap();
+        assert!(!two.quantized && !two.packed);
+        assert_eq!((two.vertex_format, two.vertex_stride, two.index_count), (16, 8 | packed::FLIP, 301));
+        // With it: both expanded; indices as R32_UINT, whole triangles; the
+        // positions as three floats 12 bytes apart. The packed index buffer
+        // need not be on 4 bytes (it is read by the CPU).
+        let both = plan(&Triangles { index_buffer: 0x1_0002, ..geometry(53, 16, 8 | packed::FLIP) }, true).unwrap();
+        assert!(both.quantized && both.packed);
+        assert_eq!((both.index_format, both.vertex_format, both.vertex_stride), (42, 6, 12));
+        assert_eq!((both.index, both.index_count), (4, 300));
+        // Packed indices over three floats: the positions read from the
+        // copy, bit 15 (the winding) not part of the stride.
+        let indices = plan(&geometry(53, 6, 12 | packed::FLIP), true).unwrap();
+        assert!(indices.packed && !indices.quantized);
+        assert_eq!((indices.vertex_format, indices.stride, indices.vertex_stride, indices.size), (6, 12, 12, 12));
+        // Quantized positions under 16-bit indices: the indices from the copy.
+        let positions = plan(&geometry(57, 16, 8), true).unwrap();
+        assert!(positions.quantized && !positions.packed);
+        assert_eq!((positions.index_format, positions.index, positions.index_count), (57, 2, 301));
+        // The switch changes nothing else: unpacked formats as before (a
+        // stride of 12 with bit 15 now 12), unknown ones refused.
+        let plain = plan(&geometry(42, 6, 12 | packed::FLIP), true).unwrap();
+        assert_eq!((plain.index_format, plain.vertex_format, plain.vertex_stride), (42, 6, 12));
+        assert_eq!(plan(&geometry(42, 6, 12), true), plan(&geometry(42, 6, 12), false));
+        assert_eq!(plan(&geometry(0, 2, 16), true).unwrap_err().0, Refusal::VertexFormat);
+        assert_eq!(plan(&geometry(20, 6, 12), true).unwrap_err().0, Refusal::IndexFormat);
+        // A 16-bit index buffer off 2 bytes is still refused.
+        let odd = Triangles { index_buffer: 0x1_0001, ..geometry(57, 6, 12) };
+        assert_eq!(plan(&odd, true).unwrap_err().0, Refusal::Unaligned);
     }
 }

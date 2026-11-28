@@ -22,7 +22,9 @@
 //! - `native`: the recording at the title list's place (barriers, copies of
 //!   structures, what a list holds) and the five-second line;
 //! - `bottom`: bottom levels, from the geometry found in the host copies of
-//!   title memory; `top`: top levels, their instances rewritten at
+//!   title memory (`expand`, with `VICTORY_DXR_EXPAND=1`: the console's
+//!   packed indices and quantized positions expanded first, see
+//!   [`packed`]); `top`: top levels, their instances rewritten at
 //!   submission to name the host's bottom levels;
 //! - `count`: what the line counts, and why builds were refused; `stamps`:
 //!   the device's ray-tracing interface and the card's time of the builds;
@@ -48,6 +50,7 @@ use windows::Win32::Graphics::Direct3D12::{
 
 mod bottom;
 mod count;
+mod expand;
 mod native;
 pub mod packed;
 mod pool;

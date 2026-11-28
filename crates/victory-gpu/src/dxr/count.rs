@@ -35,10 +35,17 @@ pub(super) enum Refusal {
     CopySource,
     /// A copy mode other than a clone or a compaction.
     CopyMode,
+    /// Packed data to expand (`VICTORY_DXR_EXPAND`) the CPU cannot read.
+    PackedUnreadable,
+    /// Packed data in a host copy shaders write: what the CPU sees may be
+    /// old there (a compute pass would expand it; not made).
+    PackedWritten,
+    /// Packed data off the layout the builder's stages read.
+    PackedLayout,
 }
 
 impl Refusal {
-    pub(super) const ALL: [Refusal; 15] = [
+    pub(super) const ALL: [Refusal; 18] = [
         Refusal::NoList,
         Refusal::NoDevice,
         Refusal::CopyList,
@@ -54,6 +61,9 @@ impl Refusal {
         Refusal::InstanceLayout,
         Refusal::CopySource,
         Refusal::CopyMode,
+        Refusal::PackedUnreadable,
+        Refusal::PackedWritten,
+        Refusal::PackedLayout,
     ];
 
     pub(super) fn name(self) -> &'static str {
@@ -73,6 +83,9 @@ impl Refusal {
             Refusal::InstanceLayout => "instances as an array of pointers",
             Refusal::CopySource => "a copy of a structure the host has not",
             Refusal::CopyMode => "a copy mode other than clone or compact",
+            Refusal::PackedUnreadable => "packed data the CPU cannot read",
+            Refusal::PackedWritten => "packed data in a host copy shaders write (a compute pass would expand it)",
+            Refusal::PackedLayout => "packed data off the layout the builder's stages read",
         }
     }
 }
@@ -107,6 +120,22 @@ pub(super) enum C {
     ByAddress,
     CardNanos,
     Timed,
+    /// Expansions (`VICTORY_DXR_EXPAND`, `super::expand`) of the builds
+    /// recorded: index-53 lists and their triangles, quantized position
+    /// lists and their vertices, the upload memory they take, and those
+    /// reading pages of by-address memory the card holds.
+    ExpandedIndexLists,
+    ExpandedTriangles,
+    ExpandedPositionLists,
+    ExpandedVertices,
+    ExpandedBytes,
+    ExpandedByAddress,
+    /// At submission: expansions whose data the CPU could not read then
+    /// (written so that nothing is hit), triangles made degenerate,
+    /// positions not finite.
+    ExpandedUnreadable,
+    ExpandedDegenerate,
+    ExpandedNotFinite,
     Swept,
 }
 

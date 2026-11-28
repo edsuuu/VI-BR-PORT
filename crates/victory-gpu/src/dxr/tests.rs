@@ -308,6 +308,115 @@ fn the_empty_top_level_is_built_on_its_own_queue_and_every_ray_misses() {
     }
 }
 
+/// The console's packed geometry, expanded as the host's builds expand it
+/// (`super::expand`, `super::packed`), is what the host's driver builds
+/// from: rays at the triangles the stages would decode hit them, in the
+/// order of their records, with the winding the stride's bit 15 asks for.
+///
+/// Seven vertices quantized with scale 0.25, offset 2 on the first field and
+/// axis order 0 (the third field is x, the first z): a unit square of two
+/// triangles at z = 2, and a third triangle beside it. Packed indices of two
+/// blocks (the second's base at vertex 4), the stride's flip bit set.
+#[test]
+fn packed_geometry_expanded_is_built_and_hit_where_the_stages_decode_it() {
+    use super::packed::{BLOCK, FLIP, HEADER, QUANTIZATION, expand_indices, expand_positions, indices_span, positions_span};
+    let Some(gpu) = Gpu::new() else {
+        eprintln!("no hardware adapter with ray tracing tier 1.1; skipped");
+        return;
+    };
+    let put = |b: &mut Vec<u8>, w: u32| b.extend_from_slice(&w.to_le_bytes());
+    // The quantization, then the positions 8 bytes apart.
+    let mut vertices = Vec::new();
+    for w in [2.0f32, 0.0, 0.0] {
+        put(&mut vertices, w.to_bits());
+    }
+    put(&mut vertices, 0);
+    for w in [0.25f32, 0.25, 0.25] {
+        put(&mut vertices, w.to_bits());
+    }
+    put(&mut vertices, 0);
+    let corners: [(f32, f32); 7] = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (3.0, 0.0), (4.0, 0.0), (3.0, 1.0)];
+    for (x, y) in corners {
+        // z = 2: the first field 0; y in the second, x in the third.
+        let (q0, q1, q2) = (0u32, (y * 4.0) as u32, (x * 4.0) as u32);
+        put(&mut vertices, q0 << 8 | (q1 & 0xff));
+        put(&mut vertices, q2 << 16 | q1 >> 8);
+    }
+    let stride = 8 | FLIP;
+    assert_eq!(positions_span(stride, 7), vertices.len() as u64);
+    assert_eq!(QUANTIZATION, 32);
+    let mut indices = Vec::new();
+    put(&mut indices, 2);
+    put(&mut indices, 3);
+    put(&mut indices, 0);
+    for (e0, e1) in [(0u32, 0u32), (0, 4)] {
+        for w in [e0, e1, 0, 0] {
+            put(&mut indices, w);
+        }
+    }
+    let rec = |block: u32, l: [u32; 3]| block << 21 | l[2] << 14 | l[1] << 7 | l[0];
+    put(&mut indices, rec(0, [0, 1, 2]));
+    put(&mut indices, rec(0, [1, 3, 2]));
+    put(&mut indices, rec(1, [0, 1, 2]));
+    for k in 0u16..7 {
+        indices.extend_from_slice(&k.to_le_bytes());
+    }
+    assert_eq!(indices_span(&indices, 3), Some(indices.len() as u64));
+    assert_eq!(HEADER + 2 * BLOCK + 12 + 14, indices.len() as u64);
+
+    let mut positions = vec![0f32; 3 * 7];
+    assert_eq!(expand_positions(&vertices, stride, 7, &mut positions), Default::default());
+    let mut triangles_out = vec![0u32; 9];
+    assert_eq!(expand_indices(&indices, 3, true, 7, &mut triangles_out), Default::default());
+    // The flip: each triangle's first and third corners swapped.
+    assert_eq!(triangles_out, [2, 1, 0, 2, 3, 1, 6, 5, 4]);
+    assert_eq!(&positions[..6], &[0.0, 0.0, 2.0, 1.0, 0.0, 2.0]);
+
+    let v = gpu.resident(&f32s(&positions));
+    let i = gpu.resident(&triangles_out.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>());
+    // SAFETY: plain queries of buffers of ours.
+    let (v, i) = unsafe { (v.GetGPUVirtualAddress(), i.GetGPUVirtualAddress()) };
+    let bottom = gpu.bottom(
+        vec![triangles(v, 7, Some((i, 9)), D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE)],
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+    );
+    let instances = gpu.resident(&instance(moved(0.0, 0.0, 0.0), 7, 0xff, 0, bottom.address()));
+    // SAFETY: as above.
+    let top = gpu.top(
+        unsafe { instances.GetGPUVirtualAddress() },
+        1,
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE,
+    );
+    let up = [0.0, 0.0, 1.0];
+    let cases = [
+        // The square's first triangle (2, 1, 0): the weights of vertices 1 and 0.
+        Case { want: Some((2.0, 0, 7, 0, 0, [0.25, 0.5])), ..case([0.25, 0.25, 0.0], up) },
+        // Its second (2, 3, 1).
+        Case { want: Some((2.0, 0, 7, 1, 0, [0.5, 0.25])), ..case([0.75, 0.75, 0.0], up) },
+        // The third (6, 5, 4): unflipped (4, 5, 6) it would be (0.25, 0.25).
+        Case { want: Some((2.0, 0, 7, 2, 0, [0.25, 0.5])), ..case([3.25, 0.25, 0.0], up) },
+        // Between them: nothing.
+        case([2.0, 0.5, 0.0], up),
+    ];
+    let hits = shoot(&gpu, top.address(), &cases, |list| {
+        bottom.record(list, false);
+        top.record(list, false);
+    });
+    for (n, (c, hit)) in cases.iter().zip(&hits).enumerate() {
+        let f = f32::from_bits;
+        eprintln!("ray {n}: status {} t {} primitive {} barycentrics {} {}", hit[0], f(hit[1]), hit[4], f(hit[6]), f(hit[7]));
+        match c.want {
+            None => assert_eq!(hit[0], COMMITTED_NOTHING, "ray {n}"),
+            Some((t, index, id, primitive, geometry, [u, w])) => {
+                assert_eq!(hit[0], COMMITTED_TRIANGLE_HIT, "ray {n}");
+                assert!((f(hit[1]) - t).abs() < 1e-5, "ray {n}: t {}", f(hit[1]));
+                assert_eq!([hit[2], hit[3], hit[4], hit[5]], [index, id, primitive, geometry], "ray {n}");
+                assert!((f(hit[6]) - u).abs() < 1e-5 && (f(hit[7]) - w).abs() < 1e-5, "ray {n}: barycentrics");
+            }
+        }
+    }
+}
+
 /// A grid of `quads` squares (two triangles each) in the plane z = `z`, as
 /// vertices and `u32` indices.
 fn grid(quads: u32, z: f32) -> (Vec<f32>, Vec<u32>) {
