@@ -36,6 +36,7 @@ pub(crate) const INSTANCE: usize = 64;
 /// put after the bottom levels), and the rewrite of its instances at
 /// submission. The structure built and where its instances go (the upload
 /// memory's CPU address).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn top(
     host: &HostList,
     list: &ID3D12GraphicsCommandList4,
@@ -44,6 +45,7 @@ pub(super) fn top(
     b: &Build,
     frame: u64,
     held: &mut Held,
+    scratch: &mut super::scratch::Scratch,
 ) -> Result<(Arc<Structure>, usize), Refused> {
     let Level::Top { instances, count, layout } = b.level else {
         return Err((Refusal::OtherGeometry, "not a top level".into()));
@@ -70,7 +72,7 @@ pub(super) fn top(
     };
     let sizes = native::prebuild(gpu, &inputs)?;
     let s = Structure::new(native::lease_structure(sizes.ResultDataMaxSizeInBytes)?);
-    let scratch = native::lease_scratch(sizes.ScratchDataSizeInBytes)?;
+    let scratch = scratch.take(list, sizes.ScratchDataSizeInBytes, held)?;
     if count > 0 {
         let top = s.clone();
         host.defer_host_read(instances as usize, bytes, move || rewrite(instances, count as usize, cpu, &top));
@@ -79,14 +81,13 @@ pub(super) fn top(
         DestAccelerationStructureData: s.gpu(),
         Inputs: inputs,
         SourceAccelerationStructureData: 0,
-        ScratchAccelerationStructureData: scratch.gpu,
+        ScratchAccelerationStructureData: scratch,
     };
     // SAFETY: an open list; the instances are upload memory the list holds,
     // written at its submission; the structure and scratch are held by the
     // list (`held`).
     unsafe { list.BuildRaytracingAccelerationStructure(&desc, None) };
     table.built(b.dest, flags, Shape::Top(count), s.clone(), frame);
-    held.leases.push(scratch);
     held.made.push(s.clone());
     add(C::TopBuilt, 1);
     add(C::Instances, u64::from(count));

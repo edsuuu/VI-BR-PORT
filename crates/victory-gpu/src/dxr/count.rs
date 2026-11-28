@@ -140,6 +140,9 @@ pub(super) enum C {
     ExpandedUnreadable,
     ExpandedDegenerate,
     ExpandedNotFinite,
+    /// Barriers recorded for builds to take the scratch memory of builds
+    /// before them again (`super::scratch`).
+    ScratchWaits,
     Swept,
 }
 

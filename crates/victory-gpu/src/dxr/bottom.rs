@@ -9,7 +9,8 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
 use super::count::{C, REBUILT, Refusal, add};
-use super::native::{Held, Refused, Structure, lease_scratch, lease_structure, prebuild};
+use super::native::{Held, Refused, Structure, lease_structure, prebuild};
+use super::scratch::Scratch;
 use super::packed;
 use super::stamps::Gpu;
 use super::table::{self, Decision, GeometryShape, PERFORM_UPDATE, Shape, Table, Why};
@@ -243,6 +244,7 @@ pub(super) fn bottom(
     origin: Origin,
     frame: u64,
     held: &mut Held,
+    scratch: &mut Scratch,
 ) -> Result<(), Refused> {
     let Level::Bottom { geometries, whole } = &b.level else {
         return Ok(());
@@ -323,12 +325,12 @@ pub(super) fn bottom(
         }
     };
     let scratch_len = if refit { sizes.UpdateScratchDataSizeInBytes } else { sizes.ScratchDataSizeInBytes };
-    let scratch = lease_scratch(scratch_len)?;
+    let scratch = scratch.take(list, scratch_len, held)?;
     let desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
         DestAccelerationStructureData: dest,
         Inputs: inputs,
         SourceAccelerationStructureData: source,
-        ScratchAccelerationStructureData: scratch.gpu,
+        ScratchAccelerationStructureData: scratch,
     };
     // SAFETY: an open list; the description and the geometry descriptions it
     // points at outlive the call; every address is of a buffer the list holds
@@ -336,7 +338,6 @@ pub(super) fn bottom(
     // the state a build needs.
     unsafe { list.BuildRaytracingAccelerationStructure(&desc, None) };
     tally.count();
-    held.leases.push(scratch);
     match (decision, made) {
         (Decision::Refit { in_place: true }, _) => {
             table.refit_in_place(b.dest, frame);

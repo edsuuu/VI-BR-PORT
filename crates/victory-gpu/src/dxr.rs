@@ -31,6 +31,8 @@
 //! - `table`: the title's destination address to the host structure, with
 //!   generations and the refit-or-rebuild decision;
 //! - `pool`: the card memory structures and scratch memory are cut from;
+//! - `scratch` (`VICTORY_DXR_SCRATCH_MB`): the builds of one list sharing
+//!   their scratch memory;
 //! - `probe` (`VICTORY_DXR_PROBE=1`): a picture of a host top level made with
 //!   ray queries of our own writer, and the same rays walked on the CPU
 //!   through the console's structure read back from the card (`walk`),
@@ -55,6 +57,7 @@ mod native;
 pub mod packed;
 mod pool;
 mod probe;
+mod scratch;
 pub(crate) mod query;
 mod stamps;
 mod table;

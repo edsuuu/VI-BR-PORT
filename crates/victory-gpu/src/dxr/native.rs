@@ -191,20 +191,22 @@ pub(crate) fn record(list: This, origin: Origin, builds: Vec<Build>) {
 pub(super) struct Held {
     pub(super) leases: Vec<Arc<Lease>>,
     pub(super) made: Vec<Arc<Structure>>,
+    /// The scratch memory the list's builds share (`super::scratch`).
+    pub(super) pieces: Vec<Arc<Mutex<super::scratch::Pieces>>>,
 }
 
 impl Held {
     /// The list holds what it recorded until it is reset, and its builds are
     /// there for what is submitted after it once it is submitted.
     fn give(self, host: &HostList) {
-        if self.leases.is_empty() && self.made.is_empty() {
+        if self.leases.is_empty() && self.made.is_empty() && self.pieces.is_empty() {
             return;
         }
         host.defer_host(move || {
             for s in &self.made {
                 s.submitted.store(true, Relaxed);
             }
-            let _ = &self.leases;
+            let _ = (&self.leases, &self.pieces);
         });
     }
 }
@@ -232,6 +234,7 @@ fn record_on(host: &HostList, origin: Origin, builds: &[Build]) -> bool {
     };
     let frame = crate::frame::current();
     let mut held = Held::default();
+    let mut scratch = super::scratch::Scratch::new(host, &mut held);
     let slot = gpu.begin(&list);
     // What wrote the inputs before (the skinning, the title's copies) is done.
     wait_all(&list);
@@ -242,7 +245,7 @@ fn record_on(host: &HostList, origin: Origin, builds: &[Build]) -> bool {
     {
         let mut table = TABLE.lock().unwrap_or_else(|e| e.into_inner());
         for b in builds.iter().filter(|b| matches!(b.level, Level::Bottom { .. })) {
-            if let Err((r, why)) = super::bottom::bottom(host, &list, gpu, &mut table, b, origin, frame, &mut held) {
+            if let Err((r, why)) = super::bottom::bottom(host, &list, gpu, &mut table, b, origin, frame, &mut held, &mut scratch) {
                 refuse(r, || format!("dest {:#x}: {why}", b.dest));
                 // What the host had there is not what the title has now.
                 table.forget(b.dest);
@@ -251,6 +254,7 @@ fn record_on(host: &HostList, origin: Origin, builds: &[Build]) -> bool {
         if builds.iter().any(|b| matches!(b.level, Level::Top { .. })) {
             // The top levels read the bottom levels' boxes.
             wait_all(&list);
+            scratch.waited();
             // Their instances are rewritten at submission to name the newest
             // bottom levels already submitted (`super::top`): the ones built
             // just above are, for a top level after them in the same list, so
@@ -261,7 +265,7 @@ fn record_on(host: &HostList, origin: Origin, builds: &[Build]) -> bool {
             std::mem::take(&mut held).give(host);
         }
         for b in builds.iter().filter(|b| matches!(b.level, Level::Top { .. })) {
-            match super::top::top(host, &list, gpu, &mut table, b, frame, &mut held) {
+            match super::top::top(host, &list, gpu, &mut table, b, frame, &mut held, &mut scratch) {
                 Ok((s, descs)) => tops.push((b, s, descs)),
                 Err((r, why)) => {
                     refuse(r, || format!("dest {:#x}: {why}", b.dest));
@@ -374,7 +378,7 @@ fn copy_on(host: &HostList, dest: u64, source: u64, mode: i32) -> bool {
     table.built(dest, flags, shape, made.clone(), crate::frame::current());
     drop(table);
     add(C::Copies, 1);
-    Held { leases: vec![src.lease.clone()], made: vec![made] }.give(host);
+    Held { leases: vec![src.lease.clone()], made: vec![made], ..Held::default() }.give(host);
     true
 }
 
@@ -465,6 +469,13 @@ pub(crate) fn line() {
             per(C::ExpandedUnreadable),
             per(C::ExpandedDegenerate),
             per(C::ExpandedNotFinite),
+        );
+    }
+    if c[C::ScratchWaits as usize] > 0.0 {
+        let _ = write!(
+            text,
+            "; {:.2} barriers for builds to take shared scratch memory again (VICTORY_DXR_SCRATCH_MB)",
+            per(C::ScratchWaits)
         );
     }
     if c[C::ShadersCopy as usize] > 0.0 {
