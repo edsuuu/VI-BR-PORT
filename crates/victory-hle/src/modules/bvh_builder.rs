@@ -35,6 +35,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod desc;
+pub mod packed;
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -354,6 +355,8 @@ struct Seen {
     /// What the geometries' data holds ([`Peeks`]), of builds and of
     /// unpackings.
     peeks: [Peeks; 2],
+    /// The packed data decoded ([`Decoded`]), of builds and of unpackings.
+    decoded: [Decoded; 2],
 }
 
 /// The +60 words told apart at most, and those the summary names.
@@ -378,6 +381,172 @@ struct Peeks {
 /// Geometries tested at most in a run (each test reads title memory).
 const PEEKS: u64 = 50_000;
 static TESTED: AtomicU64 = AtomicU64::new(0);
+
+/// What decoding the packed data of a sample of geometries gives
+/// ([`packed`]): for index format 53, the geometries and triangles decoded,
+/// their indices and how many fall below the vertex count, the geometries
+/// whose stride flips the winding, and those not readable; for quantized
+/// positions, the geometries and vertices decoded, how many are finite,
+/// how many were checked against the structure's box (an unpacking's, of
+/// a geometry without a transform) and lie inside it, the geometries by
+/// axis order (0, 1, other), and those not readable.
+#[derive(Clone, Copy, Default)]
+struct Decoded {
+    packed: u64,
+    triangles: u64,
+    indices: u64,
+    below: u64,
+    flipped: u64,
+    packed_unread: u64,
+    quantized: u64,
+    vertices: u64,
+    finite: u64,
+    boxed: u64,
+    inside: u64,
+    orders: [u64; 3],
+    quantized_unread: u64,
+}
+
+/// Geometries decoded at most in a run, and triangles (or, without packed
+/// indices, vertices) of each.
+const DECODES: u64 = 5_000;
+const DECODED_EACH: u32 = 16;
+static DECODING: AtomicU64 = AtomicU64::new(0);
+
+/// Decodes a sample of `geometries`' packed data (see [`Decoded`]), outside
+/// the summary's lock; `bounds` is the structure's box, when known.
+fn decode(geometries: &[Geometry], bounds: Option<([f32; 3], [f32; 3])>) -> Decoded {
+    let mut d = Decoded::default();
+    for g in geometries {
+        let Geometry::Triangles {
+            transform,
+            index_format,
+            vertex_format,
+            index_count,
+            vertex_count,
+            index_buffer,
+            vertex_buffer,
+            vertex_stride,
+            ..
+        } = *g
+        else {
+            continue;
+        };
+        let packed = index_format == packed::INDEX_53 && index_buffer != 0;
+        // (The stages take format 16 as quantized whatever the stride.)
+        let quantized = vertex_format == packed::QUANTIZED;
+        if !(packed || quantized) {
+            continue;
+        }
+        if DECODING.fetch_add(1, Relaxed) >= DECODES {
+            break;
+        }
+        let mut corners = Vec::new();
+        if packed {
+            d.packed += 1;
+            let flip = vertex_stride & packed::FLIP != 0;
+            d.flipped += u64::from(flip);
+            match packed::Indices53::read(&Process, index_buffer) {
+                Some(p) => {
+                    for t in 0..(index_count / 3).min(DECODED_EACH) {
+                        let Some(tri) = p.triangle(&Process, t, flip) else {
+                            d.packed_unread += 1;
+                            break;
+                        };
+                        d.triangles += 1;
+                        d.indices += 3;
+                        d.below += tri.iter().filter(|&&i| i < vertex_count).count() as u64;
+                        corners.extend(tri.into_iter().filter(|&i| i < vertex_count));
+                    }
+                }
+                None => d.packed_unread += 1,
+            }
+        }
+        if quantized {
+            d.quantized += 1;
+            let Some(q) = packed::Quantization::read(&Process, vertex_buffer) else {
+                d.quantized_unread += 1;
+                continue;
+            };
+            d.orders[(q.order as usize).min(2)] += 1;
+            if corners.is_empty() {
+                corners = (0..vertex_count.min(DECODED_EACH)).collect();
+            }
+            let boxed = bounds.filter(|_| transform == 0);
+            for i in corners {
+                let Some(p) = q.vertex(&Process, vertex_buffer, vertex_stride, i) else {
+                    d.quantized_unread += 1;
+                    break;
+                };
+                d.vertices += 1;
+                d.finite += u64::from(p.iter().all(|x| x.is_finite()));
+                if let Some((low, high)) = boxed {
+                    d.boxed += 1;
+                    // A thousandth of the box's size of slack (quantization).
+                    let inside = (0..3).all(|k| {
+                        let slack = (high[k] - low[k]).abs() * 1e-3 + 1e-3;
+                        p[k] >= low[k] - slack && p[k] <= high[k] + slack
+                    });
+                    d.inside += u64::from(inside);
+                }
+            }
+        }
+    }
+    d
+}
+
+impl Decoded {
+    fn add(&mut self, o: &Decoded) {
+        self.packed += o.packed;
+        self.triangles += o.triangles;
+        self.indices += o.indices;
+        self.below += o.below;
+        self.flipped += o.flipped;
+        self.packed_unread += o.packed_unread;
+        self.quantized += o.quantized;
+        self.vertices += o.vertices;
+        self.finite += o.finite;
+        self.boxed += o.boxed;
+        self.inside += o.inside;
+        for (a, b) in self.orders.iter_mut().zip(o.orders) {
+            *a += b;
+        }
+        self.quantized_unread += o.quantized_unread;
+    }
+
+    fn describe(&self) -> String {
+        let pc = |n: u64, of: u64| {
+            if of == 0 {
+                0.0
+            } else {
+                100.0 * n as f64 / of as f64
+            }
+        };
+        format!(
+            "index format 53 in {} geometries ({} with the stride's flip bit, {} not readable): {} triangles, {} of {} \
+             indices below the vertex count ({:.1} %); quantized positions in {} geometries (axis order 0 {}, 1 {}, other \
+             {}; {} not readable): {} vertices, {} finite ({:.1} %), {} of {} checked inside the structure's box ({:.1} %)",
+            self.packed,
+            self.flipped,
+            self.packed_unread,
+            self.triangles,
+            self.below,
+            self.indices,
+            pc(self.below, self.indices),
+            self.quantized,
+            self.orders[0],
+            self.orders[1],
+            self.orders[2],
+            self.quantized_unread,
+            self.vertices,
+            self.finite,
+            pc(self.finite, self.vertices),
+            self.inside,
+            self.boxed,
+            pc(self.inside, self.boxed),
+        )
+    }
+}
 
 /// Tests `geometries` (see [`Peeks`]), outside the summary's lock.
 fn peek(geometries: &[Geometry]) -> Peeks {
@@ -562,7 +731,7 @@ impl Seen {
              geometries built: {bo} opaque triangle lists, {bt} other triangle lists, {bb} box lists, {bx} of other kinds; \
              unpacked: {uo} opaque triangle lists, {ut} other triangle lists, {ub} box lists, {ux} of other kinds; the +60 \
              word of the unpacked: none (0x7f7f7f) {pn}, rotated {pr}, centred {pc}, scaled {ps}, another word that changes \
-             nothing {pi}; {}; in the builds' data: {}; in the unpackings' data: {}",
+             nothing {pi}; {}; in the builds' data: {}; in the unpackings' data: {}; decoded in the builds' data: {}; decoded in the unpackings' data: {}",
             self.entries,
             self.listed,
             self.prebuilds_listed,
@@ -582,6 +751,8 @@ impl Seen {
             self.common(),
             self.peeks[0].describe(),
             self.peeks[1].describe(),
+            self.decoded[0].describe(),
+            self.decoded[1].describe(),
         )
     }
 }
@@ -658,9 +829,11 @@ fn say_build(
         );
         rtcalls::add(Count::Aabbs, geometries.iter().map(|g| g.aabbs()).sum());
         let p = peek(geometries);
+        let d = decode(geometries, None);
         seen(|s| {
             Seen::kinds(&mut s.built, geometries);
             s.peeks[0].add(&p);
+            s.decoded[0].add(&d);
         });
     }
     if !say {
@@ -1080,9 +1253,11 @@ unsafe extern "system" fn rehydrate_batched(
             // of (what a host build of it would need), and how much.
             let (g, whole) = desc::geometries(&Process, &d.inputs);
             let p = peek(&g);
+            let sample = decode(&g, data.map(|h| (h.low, h.high)));
             seen(|s| {
                 s.shipped(data.as_ref(), &g);
                 s.peeks[1].add(&p);
+                s.decoded[1].add(&sample);
             });
             if say && k < LISTED {
                 describe_unpacking(&mut text, k, &d, at, data.as_ref(), &g, whole);
@@ -1506,6 +1681,91 @@ mod tests {
         assert_eq!(
             none.fit53[0] + none.floats[0] + none.placed[0] + none.placed[1],
             0
+        );
+    }
+
+    #[test]
+    fn a_sample_of_packed_data_is_decoded_from_memory() {
+        let put = |b: &mut Vec<u8>, w: u32| b.extend_from_slice(&w.to_le_bytes());
+        // Packed indices: one block from index 0, two triangles (offsets
+        // 0 1 2 and 1 2 3), the 16-bit indices 0..4.
+        let mut indices = Vec::new();
+        put(&mut indices, 1);
+        put(&mut indices, 2);
+        put(&mut indices, 0);
+        for _ in 0..4 {
+            put(&mut indices, 0);
+        }
+        put(&mut indices, 2 << 14 | 1 << 7);
+        put(&mut indices, 3 << 14 | 2 << 7 | 1);
+        for i in 0u16..4 {
+            indices.extend_from_slice(&i.to_le_bytes());
+        }
+        // Quantized positions after their header (offsets 0, order 2,
+        // scales 1): (0 0 0), (10 0 0), (0 10 0), (0 0 10).
+        let mut vertices = Vec::new();
+        for w in [0.0f32, 0.0, 0.0] {
+            put(&mut vertices, w.to_bits());
+        }
+        put(&mut vertices, 2);
+        for w in [1.0f32, 1.0, 1.0, 0.0] {
+            put(&mut vertices, w.to_bits());
+        }
+        for (x, y, z) in [(0u32, 0u32, 0u32), (10, 0, 0), (0, 10, 0), (0, 0, 10)] {
+            put(&mut vertices, x << 8 | (y & 0xff));
+            put(&mut vertices, z << 16 | y >> 8);
+        }
+        let g = Geometry::Triangles {
+            flags: 1,
+            transform: 0,
+            index_format: packed::INDEX_53,
+            vertex_format: packed::QUANTIZED,
+            index_count: 6,
+            vertex_count: 4,
+            index_buffer: indices.as_ptr() as u64,
+            vertex_buffer: vertices.as_ptr() as u64 + 32,
+            vertex_stride: 8 | packed::FLIP,
+        };
+        let d = decode(&[g], Some(([0.0; 3], [10.0; 3])));
+        assert_eq!(
+            (
+                d.packed,
+                d.flipped,
+                d.packed_unread,
+                d.triangles,
+                d.indices,
+                d.below
+            ),
+            (1, 1, 0, 2, 6, 6)
+        );
+        assert_eq!(
+            (
+                d.quantized,
+                d.orders,
+                d.vertices,
+                d.finite,
+                d.boxed,
+                d.inside
+            ),
+            (1, [0, 0, 1], 6, 6, 6, 6)
+        );
+        // A box that holds only the first vertex (0 0 0): of the corners
+        // 2 1 0 and 3 2 1, one.
+        let small = decode(&[g], Some(([0.0; 3], [1.0; 3])));
+        assert_eq!((small.boxed, small.inside), (6, 1));
+        let mut s = Seen::default();
+        s.decoded[1].add(&d);
+        let text = s.describe();
+        assert!(
+            text.contains(
+                "decoded in the unpackings' data: index format 53 in 1 geometries (1 with the stride's flip bit, 0 not \
+                 readable): 2 triangles, 6 of 6 indices below the vertex count (100.0 %)"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("6 of 6 checked inside the structure's box (100.0 %)"),
+            "{text}"
         );
     }
 
