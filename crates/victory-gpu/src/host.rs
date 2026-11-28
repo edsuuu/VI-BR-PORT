@@ -1951,7 +1951,8 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                spare.give(chunk, size, if keep_freed() { SPARE_KEPT } else { SPARE_MOST })
+                // (`VICTORY_SCRATCH_KEPT_MB`, `VICTORY_LOW_RAM`: less.)
+                spare.give(chunk, size, crate::ram::kept_scratch(if keep_freed() { SPARE_KEPT } else { SPARE_MOST }))
             } else {
                 Some(chunk)
             };

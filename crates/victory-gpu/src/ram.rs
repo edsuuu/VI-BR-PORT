@@ -17,6 +17,89 @@ fn on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_RAM_LOG").is_none_or(|v| v != "0"))
 }
 
+/// Whether the caps of what is kept for reuse are those for a PC with little
+/// memory (`VICTORY_LOW_RAM=1`; `=auto`: when the PC has 20 GiB or less;
+/// unset or `0`: off, the caps as before). Each cap can be set on its own,
+/// which wins over this: [`kept_scratch`] (`VICTORY_SCRATCH_KEPT_MB`, 1024
+/// with `VICTORY_KEEP_FREED` on, 128 without; 256 here), the send memory's
+/// (`VICTORY_SEND_KEPT_MB`, 768; 128 here), the blocks of texture staging's
+/// (`VICTORY_STAGING_BLOCKS_KEPT`, 8; 2 here) and the idle host lists'
+/// (`VICTORY_IDLE_LISTS_MAX`, 512; 256 here). What is kept is what a run
+/// on the 64 GB machine never gave back: 0.8 to 0.9 GB of scratch chunks
+/// spare, 0.7 to 0.9 GB of staging blocks (diagnostics runs of 2026-11-27
+/// and 28). Given back past the caps, it is made again when a burst needs
+/// it: what the caps cost is that making, and the risk `VICTORY_KEEP_FREED`
+/// names (memory given back while something still read it).
+pub(crate) fn low() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let setting = std::env::var("VICTORY_LOW_RAM").ok();
+        low_for(setting.as_deref(), total_physical_ram())
+    })
+}
+
+fn low_for(setting: Option<&str>, total: Option<u64>) -> bool {
+    match setting.map(str::trim) {
+        Some("auto") => total.is_some_and(|t| t <= 20 << 30),
+        Some(v) => v != "0",
+        None => false,
+    }
+}
+
+/// The PC's physical memory, in bytes.
+fn total_physical_ram() -> Option<u64> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: plain data the call fills in.
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+    // SAFETY: a sized structure.
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) } != 0;
+    ok.then_some(m.ullTotalPhys)
+}
+
+/// A whole number a switch is set to.
+fn number(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
+}
+
+/// A cap: what the switch `name` says, else `low` with [`low`], else
+/// `normal`.
+fn cap(name: &str, low: u64, normal: u64) -> u64 {
+    pick(number(name), self::low(), low, normal)
+}
+
+fn pick(set: Option<u64>, is_low: bool, low: u64, normal: u64) -> u64 {
+    set.unwrap_or(if is_low { low } else { normal })
+}
+
+/// The most bytes of scratch chunks kept while no list holds them, given
+/// what was kept before (`normal`).
+pub(crate) fn kept_scratch(normal: u64) -> u64 {
+    static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *MB.get_or_init(|| number("VICTORY_SCRATCH_KEPT_MB"));
+    pick(set.map(|mb| mb << 20), low(), 256 << 20, normal)
+}
+
+/// The most bytes of send memory kept for the next submissions, given what
+/// was kept before (`normal`).
+pub(crate) fn kept_send(normal: u64) -> u64 {
+    static MB: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *MB.get_or_init(|| number("VICTORY_SEND_KEPT_MB"));
+    pick(set.map(|mb| mb << 20), low(), (128 << 20).min(normal), normal)
+}
+
+/// The most empty blocks of texture staging kept.
+pub(crate) fn kept_staging_blocks(normal: usize) -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| cap("VICTORY_STAGING_BLOCKS_KEPT", 2, normal as u64) as usize)
+}
+
+/// The most host lists kept idle.
+pub(crate) fn idle_lists(normal: usize) -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| cap("VICTORY_IDLE_LISTS_MAX", 256, normal as u64) as usize)
+}
+
 /// Seconds between two lines.
 const EVERY_S: u64 = 60;
 
@@ -71,11 +154,12 @@ fn line() {
     let (working, private) = process_memory();
     let free = crate::host::available_physical_ram().unwrap_or(0);
     tracing::info!(
-        "PC memory we hold (VICTORY_RAM_LOG=0: no line), MB: windows of title memory {} ({windows}, over {} of title memory, \
+        "PC memory we hold (VICTORY_RAM_LOG=0: no line; the caps of what is kept for reuse {}), MB: windows of title memory {} ({windows}, over {} of title memory, \
          {slot_held} of them {} held by descriptor slots); title buffers' copies {} ({} copies in all); lists' scratch {} \
          ({} of it kept spare), lists' other upload buffers {} ({}); blocks of texture staging {}; textures' own staging {} \
          ({stagings}); kept for submissions' sends {}; host lists {}; sum {}; shared with the card as the system counts it {}; \
          the process: private {}, working set {}; the PC's memory free as our caches see it (VICTORY_RAM_ASSUME_FREE_MB) {}",
+        if low() { "for little memory (VICTORY_LOW_RAM)" } else { "as before, unless set one by one" },
         mb(window_bytes),
         mb(cover),
         mb(slot_bytes),
@@ -95,4 +179,24 @@ fn line() {
         mb(working),
         mb(free),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_memory_caps_are_asked_for_or_found() {
+        let gib = 1u64 << 30;
+        assert!(!low_for(None, Some(8 * gib)));
+        assert!(!low_for(Some("0"), Some(8 * gib)));
+        assert!(low_for(Some("1"), Some(64 * gib)));
+        assert!(low_for(Some("auto"), Some(16 * gib)));
+        assert!(!low_for(Some("auto"), Some(64 * gib)));
+        assert!(!low_for(Some("auto"), None));
+        // A cap set on its own wins; else the low one with the profile.
+        assert_eq!(pick(Some(300), true, 2, 8), 300);
+        assert_eq!(pick(None, true, 2, 8), 2);
+        assert_eq!(pick(None, false, 2, 8), 8);
+    }
 }
