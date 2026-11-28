@@ -474,7 +474,8 @@ impl App {
             Ok(p) if needs(p, StepId::Build) => (self.t("play.status.build"), "gold"),
             Ok(p) if needs(p, StepId::Shaders) => (self.t("play.status.prepare"), "gold"),
             Ok(_) => (self.t("play.status.ready"), "gold"),
-            Err(PlanProblem::NoGame) => (self.t("play.status.no_game"), "rose"),
+            // No game folder yet: the button itself asks for it, nothing to say.
+            Err(PlanProblem::NoGame) => (String::new(), "rose"),
             Err(PlanProblem::NoVictory(_)) => (self.t("build.missing_short"), "rose"),
         };
         let missing = match &plan {
@@ -487,19 +488,29 @@ impl App {
         };
         ui.scope_builder(UiBuilder::new().max_rect(scene).layout(Layout::bottom_up(egui::Align::Min)), |ui| {
             ui.spacing_mut().item_spacing.y = 14.0;
-            let status_row = ui.horizontal(|ui| {
-                ui.set_max_width(num("layout", "statusWidth"));
-                theme::dot(ui, dot);
-                ui.label(theme::small(&status, "textSoft"));
-            });
-            if let Some(m) = missing {
-                status_row.response.on_hover_text(m);
+            if !status.is_empty() {
+                let status_row = ui.horizontal(|ui| {
+                    ui.set_max_width(num("layout", "statusWidth"));
+                    theme::dot(ui, dot);
+                    ui.label(theme::small(&status, "textSoft"));
+                });
+                if let Some(m) = missing {
+                    status_row.response.on_hover_text(m);
+                }
             }
             let size = vec2(num("size", "playWidth"), num("size", "playHeight"));
             let font = FontId::new(theme::type_size("play"), FontFamily::Name("display".into()));
-            let text = self.t("play.button").to_uppercase();
-            if theme::gradient_button(ui, &text, size, font, true, true, plan.is_ok()).clicked() {
-                self.play(ctx);
+            // Without a game folder the same button chooses it, then it is Play.
+            let no_game = matches!(plan, Err(PlanProblem::NoGame));
+            let text = if no_game { self.t("play.choose_game") } else { self.t("play.button") }.to_uppercase();
+            if theme::gradient_button(ui, &text, size, font, true, true, plan.is_ok() || no_game).clicked() {
+                if no_game {
+                    if let Some(dir) = rfd::FileDialog::new().set_title(self.t("game.choose")).pick_folder() {
+                        self.pick_game(dir);
+                    }
+                } else {
+                    self.play(ctx);
+                }
             }
         });
     }

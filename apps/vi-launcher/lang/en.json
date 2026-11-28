@@ -6,7 +6,7 @@
   "game.folder.hint": "The folder you extracted the game to. It has to hold {0}.",
   "game.ok": "Game found: {0}",
   "game.choose": "Choose the folder",
-  "play.status.no_game": "Choose the game's folder in More options.",
+  "play.choose_game": "Choose the game folder",
   "game.problem.no_folder": "The folder {0} does not exist.",
   "game.problem.no_exe": "There is no {1} in {0}. Choose the folder the game was extracted to.",
   "game.problem.not_exe": "{0} is not a valid executable (an unfinished copy?).",

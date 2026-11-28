@@ -6,7 +6,7 @@
   "game.folder.hint": "A pasta onde você extraiu o jogo. Ela precisa ter o {0}.",
   "game.ok": "Jogo encontrado: {0}",
   "game.choose": "Escolher a pasta",
-  "play.status.no_game": "Escolha a pasta do jogo em Mais opções.",
+  "play.choose_game": "Escolher pasta do jogo",
   "game.problem.no_folder": "A pasta {0} não existe.",
   "game.problem.no_exe": "Não há {1} em {0}. Escolha a pasta onde o jogo foi extraído.",
   "game.problem.not_exe": "{0} não é um executável válido (cópia incompleta?).",
