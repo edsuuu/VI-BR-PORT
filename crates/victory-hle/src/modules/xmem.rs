@@ -572,7 +572,11 @@ impl Pages {
         });
         let mut used: Vec<usize> = self.pages.keys().copied().collect();
         used.sort_unstable();
-        free_run(used, len)
+        let first = free_run(used, len);
+        if first.is_some() {
+            GIVEN_AGAIN.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        first
     }
 }
 
@@ -781,8 +785,9 @@ const TITLE_NUMBERS: usize = FRAMES << 21;
 
 /// The line of physical pages handed out (`VICTORY_XMEM_PAGES_LINE`, on by
 /// default; `=0` off): at an allocation, at most every 5 s, the pages given
-/// since the start, those held now, and the next page number against
-/// [`TITLE_NUMBERS`]. Numbers past that come back truncated from the title,
+/// since the start, those held now, the next page number against
+/// [`TITLE_NUMBERS`], and how many pages got a number freed before (once
+/// [`Pages::take`] has reached it). Numbers past it come back truncated from the title,
 /// and one may be a live page's: two of the title's addresses on the same
 /// memory (the suspect of the `+0x4e9b54a` crashes, `docs\agente-queda.md`).
 fn pages_line() -> bool {
@@ -792,6 +797,9 @@ fn pages_line() -> bool {
 
 /// Pages handed out since the start, and when the line last went (ms + 1).
 static HANDED: AtomicU64 = AtomicU64::new(0);
+/// Of them, those given numbers freed before ([`Pages::take`], past the
+/// title's 21 bits).
+static GIVEN_AGAIN: AtomicU64 = AtomicU64::new(0);
 static LINE_AT: AtomicU64 = AtomicU64::new(0);
 
 /// `n` pages were handed out; `next` is the next number, `held` the pages
@@ -821,10 +829,12 @@ fn pages_handed(n: usize, next: usize, held: usize) {
     let first = 0x10_0000;
     tracing::info!(
         "physical pages handed out since the start (VICTORY_XMEM_PAGES_LINE): {handed} ({:.1} GiB), {held} held now ({:.1} \
-         GiB); next page number {next:#x}, the title keeps them below {TITLE_NUMBERS:#x} ({:.1} % used)",
+         GiB); next page number {next:#x}, the title keeps them below {TITLE_NUMBERS:#x} ({:.1} % used); {} given numbers \
+         freed before",
         handed as f64 * PAGE as f64 / (1u64 << 30) as f64,
         held as f64 * PAGE as f64 / (1u64 << 30) as f64,
         next.saturating_sub(first) as f64 * 100.0 / (TITLE_NUMBERS - first) as f64,
+        GIVEN_AGAIN.load(Ordering::Relaxed),
     );
 }
 
