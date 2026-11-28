@@ -359,7 +359,34 @@ impl Player {
             // The planes of depth formats come back as these.
             let format = if matches!(f.Format.0, 39 | 53 | 60) { f.Format.0 } else { own };
             let Some(bytes) = texel_bytes(format) else {
-                say(format!("{called}.{sub}: format {format} is not shown"));
+                // Block-compressed: its blocks as they are, row after row,
+                // named as `scripts/bc-png.mjs` takes them (the decoration
+                // bake's results and the decals it reads are such).
+                if let Some((block, 4)) = crate::resource::element(format as u32)
+                    && let Some(all) = self.contents_of(id, sub)?
+                {
+                    let (row, rows) = (f.Width.div_ceil(4) as usize * block as usize, f.Height.div_ceil(4) as usize);
+                    let mut blocks = Vec::with_capacity(row * rows);
+                    for y in 0..rows {
+                        let from = y * f.RowPitch as usize;
+                        blocks.extend_from_slice(&all[from..from + row]);
+                    }
+                    let look = crate::bake_probe::blocks(format as u32, &blocks).unwrap_or_default();
+                    say(format!(
+                        "{called}.{sub}: {}x{} f{format}, blocks as they are: looks {}, {} blocks, {} zero, {} with jumps of colour of {} read",
+                        f.Width,
+                        f.Height,
+                        look.looks(),
+                        look.blocks,
+                        look.zero,
+                        look.jumps,
+                        look.coloured
+                    ));
+                    let name = format!("{id:05}.{sub}-{}x{}-f{format}-s0.bin", f.Width, f.Height);
+                    std::fs::write(images.folder.join(name), &blocks)?;
+                } else {
+                    say(format!("{called}.{sub}: format {format} is not shown"));
+                }
                 continue;
             };
             let Some(all) = self.contents_of(id, sub)? else {
