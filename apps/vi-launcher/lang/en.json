@@ -41,6 +41,7 @@
 
   "update.checking": "Looking for an update…",
   "update.none": "You have the newest version.",
+  "update.no_release": "No version published yet.",
   "update.available": "Version {0} is available (from {1}).",
   "update.download": "Download",
   "update.downloading": "Downloading the update: {0}%",
@@ -53,5 +54,23 @@
   "prep.game_open": "THE GAME IS OPEN",
   "prep.game_ended": "The game closed with code {0}. The log is {1}.",
   "prep.logs": "Logs in {0}",
-  "prep.close_game": "Close the game"
+  "prep.close_game": "Close the game",
+  "prep.see_logs": "See the logs",
+
+  "play.status.build": "Ready to play. victory.exe is built first (seconds when nothing changed).",
+  "play.status.build_prepare": "Ready to play. The first time builds victory.exe and prepares the shaders.",
+
+  "panel.logs": "Logs",
+  "panel.check_updates": "Look for updates",
+
+  "logs.title": "LOGS",
+  "logs.empty": "Nothing yet. The log shows here as soon as the step starts.",
+  "logs.open_folder": "Open the folder",
+  "logs.copy": "Copy",
+
+  "advanced.victory.checkout": "Built from the repository in {0}",
+  "advanced.victory.hint": "The bundle's own, or another one you name",
+  "advanced.updates_now": "Updates",
+
+  "common.close": "Close"
 }

@@ -77,6 +77,10 @@ pub enum UpdateError {
     NoAsset(&'static str),
     Mismatch { expected: String, got: String },
     Unpack(String),
+    /// The address answered 404.
+    NotFound(String),
+    /// Neither Pages nor the releases have a release yet.
+    NoRelease,
 }
 
 impl std::fmt::Display for UpdateError {
@@ -88,6 +92,8 @@ impl std::fmt::Display for UpdateError {
             Self::NoAsset(p) => write!(f, "the release has no bundle for {p}"),
             Self::Mismatch { expected, got } => write!(f, "the download does not match the manifest (sha256 {got}, expected {expected})"),
             Self::Unpack(e) => write!(f, "unpacking: {e}"),
+            Self::NotFound(u) => write!(f, "not found: {u}"),
+            Self::NoRelease => write!(f, "no release published yet"),
         }
     }
 }
@@ -148,6 +154,9 @@ fn get(sources: &Sources, url: &str, accept: &str) -> Result<ureq::http::Respons
             url = next.to_owned();
             continue;
         }
+        if status.as_u16() == 404 {
+            return Err(UpdateError::NotFound(url));
+        }
         if !status.is_success() {
             return Err(UpdateError::Network(format!("{status} from {url}")));
         }
@@ -197,8 +206,10 @@ pub fn latest(sources: &Sources) -> Result<Found, UpdateError> {
         Ok(manifest) => return Ok(Found { manifest, source: "GitHub Pages" }),
         Err(e) => e,
     };
-    let mut response = get(sources, &sources.releases_api, "application/vnd.github+json")
-        .map_err(|e| UpdateError::Network(format!("{pages_error}; releases: {e}")))?;
+    let mut response = get(sources, &sources.releases_api, "application/vnd.github+json").map_err(|e| match (&pages_error, &e) {
+        (UpdateError::NotFound(_), UpdateError::NotFound(_)) => UpdateError::NoRelease,
+        _ => UpdateError::Network(format!("{pages_error}; releases: {e}")),
+    })?;
     let text = response
         .body_mut()
         .with_config()

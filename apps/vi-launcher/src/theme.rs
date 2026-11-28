@@ -425,6 +425,28 @@ pub fn outline_button(ui: &mut Ui, text: &str, width: Option<f32>, chevron: bool
     response
 }
 
+/// A square outline button with a drawn cross (close, remove): the text
+/// faces have no cross glyph.
+pub fn close_button(ui: &mut Ui, name: &str) -> Response {
+    let h = num("size", "controlHeight");
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(h), Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), name));
+    let r = radius("control");
+    let hovered = response.hovered() && ui.is_enabled();
+    if hovered {
+        ui.painter().rect_filled(rect, r, colour("rowLine"));
+    }
+    let stroke = if hovered { colour("textMuted") } else { colour("strokeStrong") };
+    ui.painter().rect_stroke(rect, r, Stroke::new(1.0, faded(ui, stroke)), StrokeKind::Inside);
+    let c = rect.center();
+    let d = h * 0.15;
+    let ink = Stroke::new(2.2, faded(ui, colour("text")));
+    ui.painter().line_segment([c + vec2(-d, -d), c + vec2(d, d)], ink);
+    ui.painter().line_segment([c + vec2(-d, d), c + vec2(d, -d)], ink);
+    focus_ring(ui, rect, r, &response);
+    response.on_hover_text(name)
+}
+
 /// One segment of a segmented choice: white when chosen, outlined if not.
 pub fn segment(ui: &mut Ui, text: &str, chosen: bool, width: f32) -> Response {
     let h = num("size", "controlHeight");

@@ -1,9 +1,9 @@
 //! The window, as the "Launcher" design draws it: a fixed 960 x 640 sunset
-//! with three views. Play: the scene with the game's folder, the Play button
+//! with four views. Play: the scene with the game's folder, the Play button
 //! and its status on the left, the options panel on the right. Preparing: a
-//! card in the middle with the steps of the run. More options: a card with
-//! every option in rows, the typed `VICTORY_*` switches and the advanced
-//! settings (where the build is, the language, updates).
+//! card in the middle with the steps of the run. Logs: what the build, the
+//! shaders and the game print, live. Settings: one column of every option,
+//! the typed `VICTORY_*` switches and the advanced settings.
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,6 +25,8 @@ use crate::theme::{self, StepMark, colour, num};
 use crate::update::{self, Found, Sources};
 
 const PROJECT_URL: &str = "https://github.com/edsuuu/VI-BR-PORT";
+/// How much of a log the Logs view shows.
+const LOG_TAIL: u64 = 256 * 1024;
 
 pub fn start() -> ExitCode {
     let size = [num("size", "windowWidth"), num("size", "windowHeight")];
@@ -49,8 +51,9 @@ pub fn start() -> ExitCode {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
     Play,
-    More,
+    Settings,
     Prep,
+    Logs,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -75,8 +78,9 @@ struct Prep {
 
 enum Update {
     Idle,
-    Checking(Receiver<Result<Option<Found>, String>>),
+    Checking(Receiver<Result<Option<Found>, update::UpdateError>>),
     UpToDate,
+    NoRelease,
     Available(Found),
     Downloading { found: Found, done: Arc<AtomicU64>, total: u64, result: Receiver<Result<PathBuf, String>> },
     Ready(PathBuf, Found),
@@ -84,10 +88,24 @@ enum Update {
     Failed(String),
 }
 
+/// The Logs view: which step's log, its text and when it was last read.
+struct Logs {
+    step: StepId,
+    /// Follow the step that is running.
+    follow: bool,
+    text: String,
+    read_at: Option<Instant>,
+    /// Where Close goes back to.
+    back: View,
+}
+
 pub struct App {
     language: Language,
     config: Config,
     config_path: PathBuf,
+    /// The repository `victory.exe` is built in, when the launcher runs from
+    /// a checkout with cargo.
+    checkout: Option<PathBuf>,
     notice: Option<String>,
     view: View,
     view_since: Instant,
@@ -95,6 +113,7 @@ pub struct App {
     game: Option<Result<PathBuf, GameProblem>>,
     prep: Option<Prep>,
     update: Update,
+    logs: Logs,
     new_flag: (String, String),
     pasted: String,
 }
@@ -111,6 +130,7 @@ impl App {
             language,
             config: loaded.config,
             config_path,
+            checkout: run::checkout(),
             notice,
             view: View::Play,
             view_since: Instant::now(),
@@ -118,11 +138,19 @@ impl App {
             game,
             prep: None,
             update: Update::Idle,
+            logs: Logs { step: StepId::Open, follow: true, text: String::new(), read_at: None, back: View::Play },
             new_flag: (String::new(), String::new()),
             pasted: String::new(),
         };
         if app.config.updates_on() {
             app.check_updates(ctx);
+        }
+        // VI_LAUNCHER_VIEW=settings|logs opens on that view (for screenshots
+        // of the window without clicking through it).
+        match std::env::var("VI_LAUNCHER_VIEW").as_deref() {
+            Ok("settings") => app.view = View::Settings,
+            Ok("logs") => app.view = View::Logs,
+            _ => {}
         }
         app
     }
@@ -133,6 +161,10 @@ impl App {
 
     fn go(&mut self, view: View) {
         if self.view != view {
+            if view == View::Logs {
+                self.logs.back = if self.view == View::Logs { View::Play } else { self.view };
+                self.logs.read_at = None;
+            }
             self.view = view;
             self.view_since = Instant::now();
         }
@@ -145,10 +177,13 @@ impl App {
     }
 
     fn check_updates(&mut self, ctx: &egui::Context) {
+        if matches!(self.update, Update::Checking(_) | Update::Downloading { .. }) {
+            return;
+        }
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(update::check(&Sources::fork()).map_err(|e| e.to_string()));
+            let _ = tx.send(update::check(&Sources::fork()));
             ctx.request_repaint();
         });
         self.update = Update::Checking(rx);
@@ -162,9 +197,12 @@ impl App {
     fn make_plan(&self) -> Result<Plan, PlanProblem> {
         let run = self.current_run();
         let chosen = self.config.victory_exe.as_deref().map(std::path::Path::new);
+        // A build named by hand is used as it is; else a checkout builds its own.
+        let checkout = if chosen.is_some() { None } else { self.checkout.clone() };
         run::plan(
             paths::find_victory(chosen, &run.build),
             paths::victory_candidates(chosen, &run.build),
+            checkout,
             self.game.as_ref().and_then(|g| g.as_ref().ok().cloned()),
             run,
             self.config.runner.as_deref(),
@@ -193,6 +231,7 @@ impl App {
             });
         }
         self.prep = Some(Prep { steps, events: rx, running, cancelled, message: None, finished: false, game_open: false });
+        self.logs.follow = true;
         self.go(View::Prep);
     }
 
@@ -209,6 +248,10 @@ impl App {
                     Event::Started(id) => {
                         set(prep, id, StepState::Running);
                         prep.game_open = id == StepId::Open;
+                        if self.logs.follow {
+                            self.logs.step = id;
+                            self.logs.read_at = None;
+                        }
                     }
                     Event::Skipped(id) => set(prep, id, StepState::Skipped),
                     Event::Done(id) => set(prep, id, StepState::Done),
@@ -233,7 +276,7 @@ impl App {
                         prep.finished = true;
                         prep.game_open = false;
                         if let Some(c) = code.filter(|c| *c != 0) {
-                            let log = paths::logs_dir().join("open.log");
+                            let log = run::log_path(StepId::Open);
                             prep.message = Some(text::fill(language, "prep.game_ended", &[&c.to_string(), &log.display().to_string()]));
                         }
                     }
@@ -244,7 +287,8 @@ impl App {
             Update::Checking(rx) => rx.try_recv().ok().map(|r| match r {
                 Ok(Some(found)) => Update::Available(found),
                 Ok(None) => Update::UpToDate,
-                Err(e) => Update::Failed(e),
+                Err(update::UpdateError::NoRelease) => Update::NoRelease,
+                Err(e) => Update::Failed(e.to_string()),
             }),
             Update::Downloading { found, result, .. } => result.try_recv().ok().map(|r| match r {
                 Ok(dir) => Update::Ready(dir, found.clone()),
@@ -264,6 +308,18 @@ impl App {
     fn game_open(&self) -> bool {
         self.prep.as_ref().is_some_and(|p| p.game_open)
     }
+
+    /// A short line on where the update check stands, if it says anything.
+    fn update_state(&self) -> Option<(String, &'static str)> {
+        let lang = self.language;
+        match &self.update {
+            Update::Checking(_) => Some((text::get(lang, "update.checking"), "textMuted")),
+            Update::UpToDate => Some((text::get(lang, "update.none"), "textMuted")),
+            Update::NoRelease => Some((text::get(lang, "update.no_release"), "textMuted")),
+            Update::Failed(e) => Some((text::fill(lang, "update.failed", &[e]), "gold")),
+            _ => None,
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -280,12 +336,22 @@ impl eframe::App for App {
             ui.multiply_opacity(view_alpha);
             match self.view {
                 View::Play => self.play_view(ui, full, &ctx),
-                View::More => self.more_view(ui, full, &ctx),
+                View::Settings => self.settings_view(ui, full, &ctx),
                 View::Prep => self.prep_view(ui, full),
+                View::Logs => self.logs_view(ui, full),
             }
         });
-        // The sun's glow breathes; nothing moves while the game is open.
-        let wait = if self.game_open() { 1000 } else if fade_in < 1.0 || view_alpha < 1.0 { 16 } else { 60 };
+        // The sun's glow breathes and the logs follow the run; slower while
+        // the game is open, unless its log is on screen.
+        let wait = if fade_in < 1.0 || view_alpha < 1.0 {
+            16
+        } else if self.view == View::Logs {
+            250
+        } else if self.game_open() {
+            1000
+        } else {
+            60
+        };
         ctx.request_repaint_after(Duration::from_millis(wait));
     }
 }
@@ -304,7 +370,7 @@ impl App {
             theme::panel().show(ui, |ui| {
                 let pp = num("layout", "panelPadding");
                 ui.set_min_size(aside.size() - vec2(pp * 2.0, pp * 2.0));
-                self.options_panel(ui);
+                self.options_panel(ui, ctx);
             });
         });
 
@@ -317,8 +383,11 @@ impl App {
 
         // At the foot of the scene, over the sea: Play and its status.
         let plan = self.make_plan();
+        let needs = |p: &Plan, id: StepId| p.steps.iter().any(|s| s.needed && s.id == id);
         let (status, dot) = match &plan {
-            Ok(p) if p.steps.iter().any(|s| s.needed && s.id == StepId::Shaders) => (self.t("play.status.prepare"), "gold"),
+            Ok(p) if needs(p, StepId::Build) && needs(p, StepId::Shaders) => (self.t("play.status.build_prepare"), "gold"),
+            Ok(p) if needs(p, StepId::Build) => (self.t("play.status.build"), "gold"),
+            Ok(p) if needs(p, StepId::Shaders) => (self.t("play.status.prepare"), "gold"),
             Ok(_) => (self.t("play.status.ready"), "gold"),
             Err(PlanProblem::NoGame) => (self.t("play.status.no_game"), "rose"),
             Err(PlanProblem::NoVictory(_)) => (self.t("build.missing_short"), "rose"),
@@ -344,19 +413,17 @@ impl App {
             let size = vec2(num("size", "playWidth"), num("size", "playHeight"));
             let font = FontId::new(theme::type_size("play"), FontFamily::Name("display".into()));
             let text = self.t("play.button").to_uppercase();
-            let clicked = theme::gradient_button(ui, &text, size, font, true, true, plan.is_ok()).clicked();
-            if clicked {
+            if theme::gradient_button(ui, &text, size, font, true, true, plan.is_ok()).clicked() {
                 self.play(ctx);
             }
         });
     }
 
-    fn options_panel(&mut self, ui: &mut egui::Ui) {
+    fn options_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         ui.spacing_mut().item_spacing.y = 18.0;
         ui.label(theme::title(&self.t("panel.title"), theme::type_size("titleSmall")));
-        let ids: Vec<&'static Opt> = options::catalog().options.iter().filter(|o| o.main).collect();
         let mut toggles = Vec::new();
-        for opt in ids {
+        for opt in options::catalog().options.iter().filter(|o| o.main) {
             match opt.kind {
                 Kind::Choice => self.segmented(ui, opt),
                 Kind::Toggle => toggles.push(opt),
@@ -371,7 +438,7 @@ impl App {
             });
         }
         ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.spacing_mut().item_spacing.y = 18.0;
+            ui.spacing_mut().item_spacing.y = 10.0;
             ui.horizontal(|ui| {
                 ui.set_min_height(num("layout", "linkRowHeight"));
                 ui.hyperlink_to(RichText::new(self.t("panel.github")).size(theme::type_size("caption")).strong(), PROJECT_URL);
@@ -379,8 +446,23 @@ impl App {
                     ui.label(theme::small(&format!("v{}", update::current_version()), "textMuted").size(theme::type_size("caption")));
                 });
             });
+            if let Some((state, ink)) = self.update_state() {
+                ui.add(egui::Label::new(theme::small(&state, ink).size(theme::type_size("caption"))).truncate());
+            }
+            let half = (ui.available_width() - 8.0) / 2.0;
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                if theme::outline_button(ui, &self.t("panel.logs"), Some(half), false).clicked() {
+                    self.go(View::Logs);
+                }
+                let checking = matches!(self.update, Update::Checking(_) | Update::Downloading { .. });
+                let r = ui.add_enabled_ui(!checking, |ui| theme::outline_button(ui, &self.t("panel.check_updates"), Some(half), false)).inner;
+                if r.clicked() {
+                    self.check_updates(ctx);
+                }
+            });
             if theme::outline_button(ui, &self.t("panel.more"), Some(ui.available_width()), true).clicked() {
-                self.go(View::More);
+                self.go(View::Settings);
             }
         });
     }
@@ -469,7 +551,7 @@ impl App {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.add(egui::Label::new(theme::small(&n, "textSoft")).wrap());
-                if theme::outline_button(ui, "✕", Some(44.0), false).clicked() {
+                if theme::close_button(ui, &text::get(self.language, "common.close")).clicked() {
                     self.notice = None;
                 }
             });
@@ -560,6 +642,7 @@ impl App {
         let card = Rect::from_center_size(full.center(), vec2(w, full.height() - 2.0 * num("layout", "viewPadding")));
         let mut back = false;
         let mut cancel = false;
+        let mut logs = false;
         ui.scope_builder(UiBuilder::new().max_rect(card).layout(Layout::top_down(egui::Align::Min)), |ui| {
             ui.with_layout(Layout::centered_and_justified(egui::Direction::TopDown), |ui| {
                 theme::card().inner_margin(num("layout", "cardPadding")).show(ui, |ui| {
@@ -589,12 +672,7 @@ impl App {
                             });
                         }
                         ui.horizontal(|ui| {
-                            let line = if prep.finished {
-                                text::fill(lang, "prep.logs", &[&paths::logs_dir().display().to_string()])
-                            } else {
-                                text::get(lang, "prep.opens_by_itself")
-                            };
-                            ui.add(egui::Label::new(theme::small(&line, "textSoft")).truncate());
+                            logs = theme::outline_button(ui, &text::get(lang, "prep.see_logs"), None, false).clicked();
                             ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                                 if prep.finished {
                                     back = theme::outline_button(ui, &text::get(lang, "prep.back"), None, false).clicked();
@@ -604,6 +682,9 @@ impl App {
                                 }
                             });
                         });
+                        if !prep.finished {
+                            ui.label(theme::small(&text::get(lang, "prep.opens_by_itself"), "textSoft"));
+                        }
                     });
                 });
             });
@@ -612,62 +693,137 @@ impl App {
             prep.cancelled.store(true, Ordering::SeqCst);
             run::cancel(&prep.running);
         }
+        if logs {
+            self.go(View::Logs);
+        }
         if back {
             self.prep = None;
             self.go(View::Play);
         }
     }
 
-    // ---- More options -----------------------------------------------------
+    // ---- Logs -------------------------------------------------------------
 
-    fn more_view(&mut self, ui: &mut egui::Ui, full: Rect, ctx: &egui::Context) {
+    fn logs_view(&mut self, ui: &mut egui::Ui, full: Rect) {
+        let lang = self.language;
+        if self.logs.read_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(250)) {
+            self.logs.text = run::tail(&run::log_path(self.logs.step), LOG_TAIL);
+            self.logs.read_at = Some(Instant::now());
+        }
+        let mut close = false;
+        self.big_card(ui, full, &text::get(lang, "logs.title"), &mut close, |app, ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                for id in run::LOG_STEPS {
+                    let exists = run::log_path(*id).is_file();
+                    let name = text::get(lang, &format!("prep.step.{}", id.key()));
+                    let r = ui.add_enabled_ui(exists, |ui| theme::segment(ui, &name, app.logs.step == *id, 150.0)).inner;
+                    if r.clicked() {
+                        app.logs.step = *id;
+                        app.logs.follow = false;
+                        app.logs.read_at = None;
+                    }
+                }
+            });
+            let h = ui.available_height() - num("size", "controlHeight") - 20.0;
+            egui::Frame::new().fill(colour("night")).stroke(egui::Stroke::new(1.0, colour("stroke"))).corner_radius(theme::radius("control")).inner_margin(12.0).show(ui, |ui| {
+                ui.set_min_size(vec2(ui.available_width(), h - 24.0));
+                egui::ScrollArea::both().max_height(h - 24.0).stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+                    let shown = if app.logs.text.is_empty() { text::get(lang, "logs.empty") } else { app.logs.text.clone() };
+                    ui.add(egui::Label::new(RichText::new(shown).monospace().color(colour("textSoft"))).extend());
+                });
+            });
+        }, |app, ui| {
+            let path = run::log_path(app.logs.step);
+            if theme::outline_button(ui, &text::get(lang, "logs.open_folder"), None, false).clicked() {
+                open_folder(&paths::logs_dir());
+            }
+            if theme::outline_button(ui, &text::get(lang, "logs.copy"), None, false).clicked() {
+                ui.ctx().copy_text(app.logs.text.clone());
+            }
+            ui.add(egui::Label::new(theme::small(&path.display().to_string(), "textMuted").size(theme::type_size("caption"))).truncate());
+        });
+        if close {
+            let back = if self.logs.back == View::Prep && self.prep.is_none() { View::Play } else { self.logs.back };
+            self.go(back);
+        }
+    }
+
+    /// A large card over the whole window: its title with a close button,
+    /// a body, and a row of buttons at its foot.
+    fn big_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        full: Rect,
+        title: &str,
+        close: &mut bool,
+        body: impl FnOnce(&mut Self, &mut egui::Ui),
+        foot: impl FnOnce(&mut Self, &mut egui::Ui),
+    ) {
         let card = full.shrink(num("layout", "moreMargin"));
         let (px, py) = (num("layout", "morePaddingX"), num("layout", "morePaddingY"));
         ui.scope_builder(UiBuilder::new().max_rect(card), |ui| {
             theme::card().inner_margin(egui::Margin::symmetric(px as i8, py as i8)).show(ui, |ui| {
                 ui.set_min_size(card.size() - vec2(2.0 * px, 2.0 * py));
                 ui.spacing_mut().item_spacing.y = 20.0;
-                ui.label(theme::title(&self.t("more.title"), theme::type_size("title")));
-                let footer = num("size", "controlHeight") + 20.0;
-                let scroll_h = ui.available_height() - footer;
-                egui::ScrollArea::vertical().max_height(scroll_h).auto_shrink([false, false]).show(ui, |ui| {
-                    let gap = num("layout", "columnGap");
-                    let col = (ui.available_width() - gap) / 2.0;
-                    ui.horizontal_top(|ui| {
-                        ui.spacing_mut().item_spacing.x = gap;
-                        // Profile, image and light on the left; performance and diagnostics on the right.
-                        let (left, right) = options::GROUPS.split_at(3);
-                        for groups in [left, right] {
-                            ui.vertical(|ui| {
-                                ui.set_width(col);
-                                ui.spacing_mut().item_spacing.y = num("layout", "sectionGap");
-                                for g in groups {
-                                    self.group_section(ui, g);
-                                }
-                            });
-                        }
-                    });
-                    ui.add_space(num("layout", "sectionGap"));
-                    self.flags_section(ui);
-                    ui.add_space(num("layout", "sectionGap"));
-                    self.advanced_section(ui, ctx);
-                });
                 ui.horizontal(|ui| {
-                    if theme::outline_button(ui, &self.t("more.reset"), None, false).clicked() {
-                        self.config.options.clear();
-                        self.save();
-                    }
+                    ui.label(theme::title(title, theme::type_size("title")));
                     ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                        let text = self.t("more.back");
-                        let font = FontId::new(theme::type_size("body"), FontFamily::Name("semibold".into()));
-                        let w = ui.painter().layout_no_wrap(text.clone(), font.clone(), colour("onAccent")).size().x + 44.0;
-                        if theme::gradient_button(ui, &text, vec2(w, num("size", "controlHeight")), font, false, false, true).clicked() {
-                            self.go(View::Play);
+                        let r = theme::close_button(ui, &text::get(self.language, "common.close"));
+                        if r.clicked() {
+                            *close = true;
                         }
                     });
                 });
+                let foot_h = num("size", "controlHeight");
+                let body_h = ui.available_height() - foot_h - 20.0;
+                ui.allocate_ui_with_layout(vec2(ui.available_width(), body_h), Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_min_height(body_h);
+                    body(self, ui);
+                });
+                ui.horizontal(|ui| foot(self, ui));
             });
         });
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            *close = true;
+        }
+    }
+
+    // ---- Settings ---------------------------------------------------------
+
+    fn settings_view(&mut self, ui: &mut egui::Ui, full: Rect, ctx: &egui::Context) {
+        let lang = self.language;
+        let mut close = false;
+        let mut save_back = false;
+        let mut reset = false;
+        self.big_card(ui, full, &text::get(lang, "more.title"), &mut close, |app, ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = num("layout", "sectionGap");
+                // One section under the other.
+                for g in options::GROUPS {
+                    app.group_section(ui, g);
+                }
+                app.flags_section(ui);
+                app.advanced_section(ui, ctx);
+            });
+        }, |app, ui| {
+            reset = theme::outline_button(ui, &text::get(app.language, "more.reset"), None, false).clicked();
+            ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
+                let text = text::get(app.language, "more.back");
+                let font = FontId::new(theme::type_size("body"), FontFamily::Name("semibold".into()));
+                let w = ui.painter().layout_no_wrap(text.clone(), font.clone(), colour("onAccent")).size().x + 44.0;
+                if theme::gradient_button(ui, &text, vec2(w, num("size", "controlHeight")), font, false, false, true).clicked() {
+                    save_back = true;
+                }
+            });
+        });
+        if reset {
+            self.config.options.clear();
+            self.save();
+        }
+        if close || save_back {
+            self.go(View::Play);
+        }
     }
 
     fn group_section(&mut self, ui: &mut egui::Ui, group: &str) {
@@ -694,7 +850,7 @@ impl App {
         });
     }
 
-    /// A choice in More options: label (and hint) left, a list on the right.
+    /// A choice in the settings: label (and hint) left, a list on the right.
     fn choice_row(&mut self, ui: &mut egui::Ui, opt: &'static Opt, h: f32) -> Rect {
         let lang = self.language;
         let label = text::get(lang, &format!("option.{}.label", opt.id));
@@ -767,7 +923,7 @@ impl App {
                     dirty |= ui
                         .add(egui::TextEdit::singleline(&mut f.value).desired_width(field_w).font(egui::TextStyle::Monospace).margin(vec2(10.0, 12.0)))
                         .changed();
-                    if theme::outline_button(ui, "✕", Some(44.0), false).on_hover_text(text::get(lang, "flags.remove")).clicked() {
+                    if theme::close_button(ui, &text::get(lang, "flags.remove")).clicked() {
                         remove = Some(i);
                     }
                 });
@@ -847,7 +1003,15 @@ impl App {
 
             let r = ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.set_min_height(h);
-                ui.label(theme::label(&text::get(lang, "advanced.victory")));
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(theme::label(&text::get(lang, "advanced.victory")));
+                    let how = match &self.checkout {
+                        Some(root) if self.config.victory_exe.is_none() => text::fill(lang, "advanced.victory.checkout", &[&root.display().to_string()]),
+                        _ => text::get(lang, "advanced.victory.hint"),
+                    };
+                    ui.add(egui::Label::new(theme::small(&how, "textMuted").size(theme::type_size("caption"))).truncate());
+                });
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                     if theme::outline_button(ui, "…", Some(44.0), false).clicked()
                         && let Some(file) = rfd::FileDialog::new().add_filter("victory", &["exe"]).pick_file()
@@ -858,7 +1022,7 @@ impl App {
                     let mut path = self.config.victory_exe.clone().unwrap_or_default();
                     let edit = egui::TextEdit::singleline(&mut path)
                         .hint_text(text::get(lang, "advanced.victory.auto"))
-                        .desired_width(ui.available_width() - 8.0)
+                        .desired_width(300.0)
                         .margin(vec2(10.0, 12.0));
                     if ui.add(edit).changed() {
                         self.config.victory_exe = Some(path.trim().to_owned()).filter(|p| !p.is_empty());
@@ -887,25 +1051,28 @@ impl App {
             });
             theme::row_line(ui, r.response.rect);
 
-            let before = ui.cursor().min;
-            let mut on = self.config.updates_on();
-            let state = match &self.update {
-                Update::Checking(_) => text::get(lang, "update.checking"),
-                Update::UpToDate => text::get(lang, "update.none"),
-                Update::Failed(e) => text::fill(lang, "update.failed", &[e]),
-                _ => String::new(),
-            };
-            let flipped = ui
-                .horizontal(|ui| {
+            let r = ui.allocate_ui_with_layout(vec2(ui.available_width(), h), Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.set_min_height(h);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.label(theme::label(&text::get(lang, "advanced.updates_now")));
+                    if let Some((state, ink)) = self.update_state() {
+                        ui.add(egui::Label::new(theme::small(&state, ink).size(theme::type_size("caption"))).truncate());
+                    }
+                });
+                ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
                     let checking = matches!(self.update, Update::Checking(_) | Update::Downloading { .. });
                     let r = ui.add_enabled_ui(!checking, |ui| theme::outline_button(ui, &text::get(lang, "advanced.check_now"), None, false)).inner;
                     if r.clicked() {
                         self.check_updates(ctx);
                     }
-                    theme::switch_row(ui, &text::get(lang, "advanced.updates"), &state, &mut on, h).changed()
-                })
-                .inner;
-            if flipped {
+                });
+            });
+            theme::row_line(ui, r.response.rect);
+
+            let before = ui.cursor().min;
+            let mut on = self.config.updates_on();
+            if theme::switch_row(ui, &text::get(lang, "advanced.updates"), "", &mut on, h).changed() {
                 self.config.check_updates = Some(on);
                 self.save();
             }
@@ -920,6 +1087,13 @@ impl App {
 fn value_text(lang: Language, id: &str, value: &str) -> String {
     let k = format!("option.{id}.value.{value}");
     if text::has(lang, &k) { text::get(lang, &k) } else { value.to_owned() }
+}
+
+/// Opens a folder in the system's file manager.
+fn open_folder(dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(dir);
+    let program = if cfg!(windows) { "explorer" } else { "xdg-open" };
+    let _ = std::process::Command::new(program).arg(dir).spawn();
 }
 
 fn step_row(ui: &mut egui::Ui, lang: Language, id: StepId, state: StepState) {

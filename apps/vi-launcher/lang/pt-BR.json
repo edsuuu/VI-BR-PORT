@@ -41,6 +41,7 @@
 
   "update.checking": "Procurando atualização…",
   "update.none": "Você está na versão mais nova.",
+  "update.no_release": "Nenhuma versão publicada ainda.",
   "update.available": "Versão {0} disponível (por {1}).",
   "update.download": "Baixar",
   "update.downloading": "Baixando a atualização: {0}%",
@@ -53,5 +54,23 @@
   "prep.game_open": "O JOGO ESTÁ ABERTO",
   "prep.game_ended": "O jogo fechou com o código {0}. O log é {1}.",
   "prep.logs": "Logs em {0}",
-  "prep.close_game": "Fechar o jogo"
+  "prep.close_game": "Fechar o jogo",
+  "prep.see_logs": "Ver logs",
+
+  "play.status.build": "Pronto para jogar. Antes, compila o victory.exe (segundos se nada mudou).",
+  "play.status.build_prepare": "Pronto para jogar. A primeira vez compila o victory.exe e prepara os shaders.",
+
+  "panel.logs": "Logs",
+  "panel.check_updates": "Procurar atualização",
+
+  "logs.title": "LOGS",
+  "logs.empty": "Nada ainda. O log aparece aqui assim que o passo começa.",
+  "logs.open_folder": "Abrir a pasta",
+  "logs.copy": "Copiar",
+
+  "advanced.victory.checkout": "Compilado do repositório em {0}",
+  "advanced.victory.hint": "O que vem no pacote, ou outro que você indicar",
+  "advanced.updates_now": "Atualização",
+
+  "common.close": "Fechar"
 }
