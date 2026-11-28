@@ -1626,6 +1626,13 @@ fn into_destination(
     len: usize,
     mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    // (Who wrote, for the GPU side's look at textures that changed with
+    // nothing told: `VICTORY_LOOK_WHOLE`.)
+    let _writer = victory_gpu::writes_as(if request.options & PAGE_DESTINATION == 0 {
+        victory_gpu::Writer::StreamAddress
+    } else {
+        victory_gpu::Writer::StreamPages
+    });
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first, and until the

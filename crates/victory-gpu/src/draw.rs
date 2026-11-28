@@ -754,6 +754,13 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
 
+/// Since the start, of the looks again that read a texture whole
+/// (`crate::texture::look_whole`): textures found changed with nothing
+/// told, their 64 KiB pieces that changed, and of those the ones written
+/// and told at that very address, told only at another address of the same
+/// page, and told nowhere (`crate::watch::who_wrote`).
+pub(crate) static LOOKED_WHOLE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
 const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
@@ -2569,7 +2576,8 @@ impl State {
             // was shown four frames late, over and over.
             let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
-                if crate::texture::fingerprint(at, len) == print {
+                let (now, pieces) = crate::texture::look_again(at, len);
+                if now == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
                     match RECHECK_FRAMES.get(usize::from(looks) + 1) {
                         Some(wait) => {
@@ -2583,6 +2591,38 @@ impl State {
                     again_in = 1;
                 }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
+                // Which 64 KiB pieces changed, and what was told of them
+                // (`VICTORY_LOOK_WHOLE=1`; nothing without it).
+                let (here, elsewhere_only, by, nowhere) = if pieces.is_empty() {
+                    (0, 0, None, 0)
+                } else {
+                    crate::watch::who_wrote(&pieces, uploaded)
+                };
+                if !pieces.is_empty() {
+                    let tiles = &LOOKED_WHOLE;
+                    tiles[0].fetch_add(1, Ordering::Relaxed);
+                    tiles[1].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+                    tiles[2].fetch_add(here as u64, Ordering::Relaxed);
+                    tiles[3].fetch_add(elsewhere_only as u64, Ordering::Relaxed);
+                    tiles[4].fetch_add(nowhere as u64, Ordering::Relaxed);
+                }
+                if !pieces.is_empty() && (n < 200 || n.is_multiple_of(1000)) {
+                    tracing::warn!(
+                        slot = index,
+                        address = format_args!("{at:#x}"),
+                        bytes = len,
+                        pieces = len.div_ceil(64 << 10),
+                        changed_pieces = pieces.len(),
+                        first_changed = format_args!("{:#x}", pieces[0]),
+                        told_there = here,
+                        told_only_at_another_address = elsewhere_only,
+                        the_other_writer = crate::watch::writer_name(by),
+                        told_nowhere = nowhere,
+                        frames_after_upload = frame.saturating_sub(uploaded),
+                        looks,
+                        "a texture picked by index had 64 KiB pieces left behind: written with nothing told at its address (VICTORY_LOOK_WHOLE=1)"
+                    );
+                }
                 if n < 200 || n.is_multiple_of(1000) {
                     // Whether its pages are the title's at other addresses
                     // too: what is written there is told of there alone.

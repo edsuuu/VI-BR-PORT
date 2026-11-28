@@ -2435,6 +2435,7 @@ pub(crate) fn landing(at: usize, len: usize) {
             }
         }
     }
+    let _landing = writes_as(Writer::Landing);
     writing(at, len);
 }
 
@@ -2522,6 +2523,9 @@ pub(crate) fn landed_beside(pages: &[usize], spans: &[(usize, usize)]) -> (u64, 
         for &(at, len) in spans {
             told_elsewhere(at, len);
         }
+    }
+    for &(at, len) in spans {
+        note_writer(at, len, Writer::Landing);
     }
     (noted, before)
 }
@@ -3108,6 +3112,123 @@ pub fn writing(at: usize, len: usize) {
     if writes_elsewhere() {
         told_elsewhere(at, len);
     }
+    note_writer(at, len, Writer::Ours);
+}
+
+/// Who wrote title memory by a way that tells the texture pass
+/// ([`note_writer`], [`who_wrote`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Writer {
+    /// Ours (`crate::host::copy_mapped`: the title's buffer copies, textures
+    /// copied back), or a caller that did not say.
+    Ours,
+    /// What shaders wrote, landing.
+    Landing,
+    /// A file read of the title's.
+    File,
+    /// DirectStorage, to an address.
+    StreamAddress,
+    /// DirectStorage, into physical pages (told where they are shown).
+    StreamPages,
+}
+
+impl Writer {
+    fn name(self) -> &'static str {
+        match self {
+            Writer::Ours => "ours (a buffer copy of the title's, a texture copied back)",
+            Writer::Landing => "what shaders wrote, landing",
+            Writer::File => "a file read",
+            Writer::StreamAddress => "DirectStorage to an address",
+            Writer::StreamPages => "DirectStorage into physical pages",
+        }
+    }
+}
+
+thread_local! {
+    /// The writer the runtime said it is on this thread ([`writes_as`]).
+    static WRITER: std::cell::Cell<Option<Writer>> = const { std::cell::Cell::new(None) };
+}
+
+/// The runtime's writes on this thread are `writer`'s until what this
+/// returns is dropped (for [`who_wrote`]; nothing else changes).
+pub fn writes_as(writer: Writer) -> WritesAs {
+    WritesAs(WRITER.with(|w| w.replace(Some(writer))))
+}
+
+/// See [`writes_as`].
+pub struct WritesAs(Option<Writer>);
+
+impl Drop for WritesAs {
+    fn drop(&mut self) {
+        WRITER.with(|w| w.set(self.0));
+    }
+}
+
+/// The last write told of each 64 KiB block of title memory: by whom, at
+/// which frame (`crate::texture::look_whole` only).
+static WRITERS: Mutex<Option<std::collections::HashMap<usize, (Writer, u64)>>> = Mutex::new(None);
+
+/// Blocks [`WRITERS`] keeps; past it, those not written in the last
+/// [`WRITERS_FRAMES`] frames go.
+const WRITERS_KEPT: usize = 1 << 20;
+const WRITERS_FRAMES: u64 = 2000;
+/// Blocks of one write noted at most (a title's `fread` asks for more than
+/// the file holds).
+const WRITER_BLOCKS: usize = 4096;
+
+/// Notes a write of `[at, at + len)` told at that address: by the writer
+/// the runtime said ([`writes_as`]), else by `by`.
+fn note_writer(at: usize, len: usize, by: Writer) {
+    if !crate::texture::look_whole() || len == 0 {
+        return;
+    }
+    let by = WRITER.with(|w| w.get()).unwrap_or(by);
+    let frame = crate::frame::current();
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK).min(at / BLOCK + WRITER_BLOCKS));
+    let mut writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let writers = writers.get_or_insert_with(std::collections::HashMap::new);
+    if writers.len() >= WRITERS_KEPT {
+        writers.retain(|_, (_, at)| frame.saturating_sub(*at) < WRITERS_FRAMES);
+    }
+    for block in first..last {
+        writers.insert(block, (by, frame));
+    }
+}
+
+/// What was told of the 64 KiB pieces at `pieces` (addresses) since frame
+/// `since`, for a texture picked by index found changed with nothing told:
+/// how many were written and told at that very address (the texture was
+/// made due, so it changed again after that); how many only at another
+/// address that shows the same page, with the writer of the first; and how
+/// many nowhere (the title's processor, or a way that tells nothing).
+pub(crate) fn who_wrote(pieces: &[u64], since: u64) -> (usize, usize, Option<Writer>, usize) {
+    let writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(writers) = writers.as_ref() else {
+        return (0, 0, None, pieces.len());
+    };
+    let told = |block: usize| writers.get(&block).filter(|(_, frame)| *frame >= since).map(|(by, _)| *by);
+    let (mut here, mut elsewhere, mut first, mut nowhere) = (0, 0, None, 0);
+    for &piece in pieces {
+        let block = piece as usize / BLOCK;
+        if told(block).is_some() {
+            here += 1;
+            continue;
+        }
+        let other = crate::inplace::pages_of(block * BLOCK).into_iter().find_map(|page| told(page / BLOCK));
+        match other {
+            Some(by) => {
+                elsewhere += 1;
+                first = first.or(Some(by));
+            }
+            None => nowhere += 1,
+        }
+    }
+    (here, elsewhere, first, nowhere)
+}
+
+/// [`Writer`]'s words, for a line.
+pub(crate) fn writer_name(writer: Option<Writer>) -> &'static str {
+    writer.map_or("none", Writer::name)
 }
 
 /// Whether a write of title memory through one address ([`writing`]) is
@@ -3196,6 +3317,7 @@ pub fn kernel_writing(at: usize, len: usize) -> KernelWrite {
     if writes_elsewhere() {
         told_elsewhere(at, len);
     }
+    note_writer(at, len, Writer::File);
     KernelWrite(first, if len == 0 { first } else { last }, at, len)
 }
 
@@ -3210,6 +3332,7 @@ impl Drop for KernelWrite {
         if writes_elsewhere() {
             crate::descriptor::host::remapped(self.2, self.3);
             told_elsewhere(self.2, self.3);
+            note_writer(self.2, self.3, Writer::File);
         }
         let mut g = guards();
         if let Some(i) = g.kernel.iter().position(|&r| r == (self.0, self.1)) {
@@ -3292,6 +3415,7 @@ pub fn title_memory_written(at: usize, len: usize, pages: bool) {
     }
     // A placed texture there changed with no descriptor written.
     crate::descriptor::host::page_written(at, len);
+    note_writer(at, len, if pages { Writer::StreamPages } else { Writer::File });
 }
 
 /// The runtime mapped a view of the physical bytes `[offset, offset + len)`

@@ -10234,6 +10234,18 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
             }
+            if crate::texture::look_whole() {
+                let [found, tiles, here, elsewhere, nowhere] =
+                    [0, 1, 2, 3, 4].map(|i| crate::draw::LOOKED_WHOLE[i].load(Ordering::Relaxed));
+                let [same, changed] = [0, 1].map(|i| crate::draw::HEAP_TEXTURES_RECHECKED[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "64 KiB pieces left behind in textures picked by index (VICTORY_LOOK_WHOLE=1), since the start: \
+                     {tiles} pieces in {found} textures, found by {} looks again ({same} found them as they were); \
+                     of the pieces, {here} written and told at their address, {elsewhere} told only at another address \
+                     of the same page, {nowhere} told nowhere",
+                    same + changed
+                );
+            }
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                 let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));

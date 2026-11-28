@@ -1548,8 +1548,145 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of
 /// it up to 48 KiB, else of 16 KiB at its start, its middle and its end
 /// (a texture streams in whole mips; the small ones lie first). Read
-/// through the kernel, so pages not there count as zeros.
+/// through the kernel, so pages not there count as zeros. With
+/// [`look_whole`], of all of it up to [`WHOLE_MOST`], 64 KiB piece by piece
+/// ([`look_again`]).
 pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
+    if look_whole() && len <= WHOLE_MOST {
+        return whole_print(at, len);
+    }
+    windows_print(at, len)
+}
+
+/// [`fingerprint`] of all of the range, piece by piece; the pieces are kept
+/// for [`whole_look`].
+fn whole_print(at: u64, len: u64) -> u64 {
+    let pieces = pieces_of(at, len);
+    let print = fold(&pieces);
+    keep_pieces(at, len, pieces);
+    print
+}
+
+/// Whether a texture picked by index is looked at again whole, 64 KiB by
+/// 64 KiB, and a change found is said piece by piece with who wrote there
+/// (`VICTORY_LOOK_WHOLE=1`; off by default: three windows of 16 KiB, as
+/// before).
+///
+/// Every 64 KiB of a streamed texture is a page of the title's pool, shown
+/// at the pool's address too, and each is written on its own. A write that
+/// nothing tells at the texture's address left that piece with what the
+/// page held before (another texture's bytes: a square of something else on
+/// a shirt, for the run) unless the look again fell on it, and three
+/// windows of 16 KiB fall on three pieces of 9 to 35. So the look reads it
+/// all (up to [`WHOLE_MOST`]; a look again costs reading the texture), finds
+/// every piece left behind, and has it uploaded; and the log names the
+/// pieces and the last write told where each page is shown
+/// (`crate::watch::who_wrote`), to say which writer did not tell.
+pub(crate) fn look_whole() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOK_WHOLE").is_some_and(|v| v == "1"))
+}
+
+/// The most bytes of a texture [`look_whole`] reads: bigger ones (videos'
+/// planes, screen-sized targets) are looked at by windows still.
+pub(crate) const WHOLE_MOST: u64 = 4 << 20;
+
+/// The digests of the 64 KiB pieces of each range a whole fingerprint was
+/// last taken of ([`look_whole`]), by its start: its length, and a digest
+/// per piece.
+static PIECES: Mutex<Option<HashMap<u64, (u64, Vec<u64>)>>> = Mutex::new(None);
+
+/// Ranges [`PIECES`] keeps at most: past it, it starts again (a look then
+/// finds the texture changed or not, without saying which pieces).
+const PIECES_KEPT: usize = 1 << 17;
+
+/// The pieces of `[at, at + len)` cut at 64 KiB boundaries of the address
+/// (the title's pages): (address, bytes) of each.
+fn pieces(at: u64, len: u64) -> impl Iterator<Item = (u64, u64)> {
+    const PAGE: u64 = 64 << 10;
+    let end = at.saturating_add(len);
+    let mut from = at;
+    std::iter::from_fn(move || {
+        if from >= end {
+            return None;
+        }
+        let to = ((from / PAGE + 1) * PAGE).min(end);
+        let piece = (from, to - from);
+        from = to;
+        Some(piece)
+    })
+}
+
+/// A digest of each of the pieces of `[at, at + len)` ([`pieces`]).
+fn pieces_of(at: u64, len: u64) -> Vec<u64> {
+    thread_local! {
+        static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    READ.with(|read| {
+        let mut read = read.borrow_mut();
+        read.resize(64 << 10, 0);
+        pieces(at, len)
+            .map(|(from, bytes)| {
+                let bytes = bytes as usize;
+                read[..bytes].fill(0);
+                crate::host::copy_mapped(read.as_mut_ptr(), from as *const u8, bytes, false);
+                let d = digest(&read[..bytes]).0;
+                d as u64 ^ (d >> 64) as u64
+            })
+            .collect()
+    })
+}
+
+/// One fingerprint of the pieces' digests, never 0.
+fn fold(pieces: &[u64]) -> u64 {
+    pieces.iter().fold(0u64, |print, &d| print.rotate_left(37) ^ d) | 1
+}
+
+/// Keeps the pieces' digests of the range at `at` for its next look.
+fn keep_pieces(at: u64, len: u64, pieces: Vec<u64>) {
+    let mut kept = PIECES.lock().unwrap_or_else(|e| e.into_inner());
+    let kept = kept.get_or_insert_with(HashMap::new);
+    if kept.len() >= PIECES_KEPT {
+        kept.clear();
+    }
+    kept.insert(at, (len, pieces));
+}
+
+/// The pieces whose digest differs between `before` and `now` (of the
+/// same range): their addresses ([`pieces`]).
+fn changed_pieces(at: u64, len: u64, before: &[u64], now: &[u64]) -> Vec<u64> {
+    pieces(at, len).zip(before.iter().zip(now)).filter(|(_, (b, n))| b != n).map(|((from, _), _)| from).collect()
+}
+
+/// The fingerprint of `[at, at + len)` now, for a look again at a texture
+/// uploaded with the fingerprint [`fingerprint`] gave; with [`look_whole`]
+/// also the addresses of the 64 KiB pieces that changed since that one
+/// (empty if none, or nothing was kept of the range).
+pub(crate) fn look_again(at: u64, len: u64) -> (u64, Vec<u64>) {
+    if !(look_whole() && len <= WHOLE_MOST) {
+        return (windows_print(at, len), Vec::new());
+    }
+    whole_look(at, len)
+}
+
+/// [`look_again`] of all of the range: against the pieces [`whole_print`]
+/// or the look before kept.
+fn whole_look(at: u64, len: u64) -> (u64, Vec<u64>) {
+    let now = pieces_of(at, len);
+    let print = fold(&now);
+    let changed = {
+        let kept = PIECES.lock().unwrap_or_else(|e| e.into_inner());
+        match kept.as_ref().and_then(|kept| kept.get(&at)) {
+            Some((was, before)) if *was == len && before.len() == now.len() => changed_pieces(at, len, before, &now),
+            _ => Vec::new(),
+        }
+    };
+    keep_pieces(at, len, now);
+    (print, changed)
+}
+
+/// [`fingerprint`] by three windows.
+fn windows_print(at: u64, len: u64) -> u64 {
     const WINDOW: usize = 16 << 10;
     thread_local! {
         static READ: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
@@ -1921,6 +2058,49 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod whole_look_tests {
+    use super::{pieces, whole_look, whole_print};
+
+    const K64: u64 = 64 << 10;
+
+    /// A range is cut at the title's 64 KiB pages, whatever its start.
+    #[test]
+    fn a_range_is_cut_at_its_pages() {
+        let at = 7 * K64 + 0x3000;
+        let cut: Vec<(u64, u64)> = pieces(at, 2 * K64).collect();
+        assert_eq!(cut, vec![(at, K64 - 0x3000), (8 * K64, K64), (9 * K64, 0x3000)]);
+        assert_eq!(pieces(8 * K64, K64).collect::<Vec<_>>(), vec![(8 * K64, K64)]);
+        assert_eq!(pieces(8 * K64, 0).count(), 0);
+    }
+
+    /// A whole look finds a change of one byte anywhere, and says which
+    /// pieces it was in; the next look compares with this one.
+    #[test]
+    fn a_whole_look_says_which_pieces_changed() {
+        let mut memory = vec![0x5au8; 6 * K64 as usize];
+        let base = memory.as_ptr() as u64;
+        // A texture 0x1000 past a page boundary, three and a half pages long.
+        let at = base.div_ceil(K64) * K64 + 0x1000;
+        let len = 3 * K64 + K64 / 2;
+        let print = whole_print(at, len);
+        assert_eq!(whole_look(at, len), (print, Vec::new()));
+        // A byte in the third piece (the windows of three looks miss it:
+        // past the middle's 16 KiB) and one in the last.
+        let third = at + K64 + (K64 - 0x1000) + 0x9000;
+        let windows = super::windows_print(at, len);
+        memory[(third - base) as usize] ^= 1;
+        assert_eq!(super::windows_print(at, len), windows, "the look by windows does not see it");
+        memory[(at + len - 1 - base) as usize] ^= 1;
+        let (now, changed) = whole_look(at, len);
+        assert_ne!(now, print);
+        assert_eq!(changed, vec![third & !(K64 - 1), (at + len - 1) & !(K64 - 1)]);
+        // As it is now: nothing changed since that look.
+        assert_eq!(whole_look(at, len), (now, Vec::new()));
+        drop(memory);
+    }
 }
 
 #[cfg(test)]
