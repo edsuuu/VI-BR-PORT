@@ -3812,6 +3812,27 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// A scalar bitwise mask can be read as data without balloting the result:
+    /// its operands already give the complete dwords, including lanes elsewhere.
+    fn scalar_mask_dword(&mut self, block: usize, lo: Value, word: Value) -> Option<V> {
+        let inst = self.x.p.blocks[block].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo))?;
+        let name = inst.name().strip_prefix("s_")?;
+        let op = name.strip_suffix("_b32").or_else(|| name.strip_suffix("_b64"))?;
+        if !matches!(op, "mov" | "not" | "and" | "or" | "xor" | "andn2" | "orn2" | "nand" | "nor" | "xnor") {
+            return None;
+        }
+        let at = if block == self.cur_ir { self.cur } else { self.tail[block]? };
+        let (saved_block, saved_ir) = (self.cur, self.cur_ir);
+        self.cur = at;
+        self.cur_ir = block;
+        let lowered = self.sop(inst, true).is_ok();
+        (self.cur, self.cur_ir) = (saved_block, saved_ir);
+        match self.vals.get(&word) {
+            Some(&Val::I32(x)) if lowered => Some(x),
+            _ => None,
+        }
+    }
+
     /// A dword of a lane mask as a number: the ballot of the lanes' bits,
     /// taken in the block that writes the mask (see [`MaskData`]).
     fn mask_dword(&mut self, v: Value) -> Result<V, Why> {
@@ -3826,6 +3847,11 @@ impl<'a> Lower<'a> {
         let made = self.def_block.get(&lo).copied();
         let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
+            if self.mask_data == MaskData::Console && !self.local
+                && let Some(x) = made.and_then(|b| self.scalar_mask_dword(b, lo, v))
+            {
+                return Ok(x);
+            }
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));
             }
@@ -5769,7 +5795,7 @@ impl<'a> Lower<'a> {
             self.memory_fence();
         }
         let r = match &inst.fields {
-            Fields::Sop { .. } => self.sop(inst),
+            Fields::Sop { .. } => self.sop(inst, false),
             Fields::Sopp { .. } if name == "s_barrier" && self.no_barrier.contains(&b) => Ok(()),
             Fields::Sopp { .. } if name == "s_barrier" => {
                 // Thread-group sync with a shared-memory fence, and a UAV
@@ -5936,7 +5962,7 @@ impl<'a> Lower<'a> {
         v.is_some_and(|v| self.x.st.masks.contains_key(&v))
     }
 
-    fn sop(&mut self, inst: &Inst) -> Result<(), Why> {
+    fn sop(&mut self, inst: &Inst, scalar_mask: bool) -> Result<(), Why> {
         let Fields::Sop { dst, src, imm } = &inst.fields else {
             unreachable!()
         };
@@ -5947,7 +5973,7 @@ impl<'a> Lower<'a> {
             _ => None,
         };
         let lo = dst_code.and_then(|c| inst.write(Reg::S(c)));
-        if inst.write(Reg::S(EXEC)).is_some() || self.is_mask(lo) {
+        if inst.write(Reg::S(EXEC)).is_some() || !scalar_mask && self.is_mask(lo) {
             return Err(LANE_MASK);
         }
         if matches!(

@@ -654,6 +654,49 @@ fn a_lane_mask_joined_with_a_number_is_read_as_the_number_it_is() {
     eprintln!("ran on the hardware device: the mask's bits, or the number");
 }
 
+/// A scalar OR sets lane 31's bit even when that lane skips the block.
+#[test]
+fn a_scalar_mask_read_as_data_keeps_bits_for_lanes_outside_the_branch() {
+    let native = native_of(
+        &[
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0x7D88_0000, // v_cmp_gt_u32 vcc_lo, s0, v0
+            0xBE8D_3C6A, // s_and_saveexec_b32 s13, vcc_lo
+            0xBF88_0005, // s_cbranch_execz to the restore
+            0x8806_FF6A,
+            0x8000_0000, // s_or_b32 s6, vcc_lo, 0x80000000
+            0x7E04_0206, // v_mov_b32 v2, s6
+            0xE070_1000,
+            0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+            0xBEFE_030D, // s_mov_b32 exec_lo, s13
+        ],
+        false,
+        32,
+    );
+    let (shader, _) = super::intersect_tests::build_compute_shader(&native).expect("translates the mask as data");
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else { return };
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+    for below in [0u32, 1, 16, 31, 32] {
+        let mut user_data = vec![0; shader.user_data_dwords() as usize];
+        for u in &shader.user_data {
+            if (u.root, u.slot, u.dword) == (RootType::Constants, 0, 0) {
+                user_data[u.index as usize] = below;
+            }
+        }
+        let out = host.dispatch(&root, &pso, &Dispatch {
+            roots: vec![(0, Root::Constants(user_data))],
+            views: &[View::RawUav(32)],
+            samplers: &[],
+            groups: [1, 1, 1],
+        }).expect("dispatch");
+        let mask = ((1u64 << below) - 1) as u32 | 0x8000_0000;
+        let expected: Vec<u32> = (0..32).map(|lane| if lane < below { mask } else { 0 }).collect();
+        assert_eq!(out[0], expected, "{below} lanes in the branch");
+    }
+    eprintln!("ran on the hardware device: the scalar mask retains bits for lanes outside the branch");
+}
+
 /// A 32-lane console wave. `if (t < s0) { ... SCC = (s1 == 7) }` and a branch on SCC after
 /// the join: the skip brings the SCC of `s_and_saveexec` ("some lane is left") along
 /// (`rtdirectionalshadows:CS_RTShadowTrace32HQ_TiledFarOnly`, 0x360-0x39c). On the console
