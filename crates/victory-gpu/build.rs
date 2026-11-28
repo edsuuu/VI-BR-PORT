@@ -41,5 +41,7 @@ fn main() {
         hash.update(&bytes);
     }
     println!("cargo:rerun-if-changed=build.rs");
+    // The window title names a dev build (host.rs).
+    println!("cargo:rerun-if-env-changed=VI_CHANNEL");
     println!("cargo:rustc-env=VICTORY_TRANSLATOR={}", hash.finalize().to_hex());
 }

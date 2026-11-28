@@ -12,6 +12,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
+/// A dev build (VI_CHANNEL=dev when it was built): its name and version say so;
+/// a stable one keeps the plain name.
+pub const DEV: bool = match option_env!("VI_CHANNEL") {
+    Some(c) => c.len() == 3 && c.as_bytes()[0] == b'd' && c.as_bytes()[1] == b'e' && c.as_bytes()[2] == b'v',
+    None => false,
+};
+
+/// The version as the window shows it: "dev 0.1.0" for a dev build.
+pub fn shown_version() -> String {
+    if DEV { format!("dev {}", current_version()) } else { format!("v{}", current_version()) }
+}
+
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }

@@ -3,6 +3,8 @@
 #                                            (vi-launcher.exe, victory\victory.exe)
 #   scripts\build-bundle.ps1 -NoLauncher     target\bundle\VIctory-<version>-windows-x64.zip
 #                                            (victory.exe alone)
+# -Channel   stable (the plain names: what a release of main ships) or dev (the default here:
+#            "dev-" before the file names, and the build calls itself dev in its titles)
 # -Version   the version in the file names (default: Cargo.toml's)
 # -Built     use what target\release already has (the release workflow builds first)
 # -Out       the folder the zip goes to (default: target\bundle)
@@ -10,6 +12,7 @@ param(
     [string]$Version,
     [switch]$NoLauncher,
     [switch]$Built,
+    [ValidateSet('stable', 'dev')][string]$Channel = 'dev',
     [string]$Out
 )
 $ErrorActionPreference = 'Stop'
@@ -25,6 +28,8 @@ if (-not $Version) {
 if (-not $Out) { $Out = Join-Path $root 'target\bundle' }
 if (-not [System.IO.Path]::IsPathRooted($Out)) { $Out = Join-Path $root $Out }
 
+# The builds read VI_CHANNEL when they are compiled (their titles say dev).
+if ($Channel -eq 'dev') { $env:VI_CHANNEL = 'dev' } else { Remove-Item Env:VI_CHANNEL -ErrorAction SilentlyContinue }
 if (-not $Built) {
     $packages = if ($NoLauncher) { @('-p', 'victory') } else { @('-p', 'vi-launcher') }
     Push-Location $root
@@ -33,6 +38,7 @@ if (-not $Built) {
 
 $release = Join-Path $root 'target\release'
 $name = if ($NoLauncher) { "VIctory-$Version-windows-x64" } else { "VI-BR-PORT-$Version-windows-x64" }
+if ($Channel -eq 'dev') { $name = "dev-$name" }
 $stage = Join-Path $Out $name
 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
 New-Item -ItemType Directory -Force $stage | Out-Null

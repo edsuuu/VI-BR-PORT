@@ -22,6 +22,12 @@ on:
         required: true
         type: boolean
         default: true
+      channel:
+        description: "stable: plain names, release v<version>, Pages updated. dev: names start with dev-, a pre-release dev-v<version>, Pages untouched"
+        required: true
+        type: choice
+        options: [stable, dev]
+        default: stable
       publish:
         description: "Make the release and update GitHub Pages"
         required: true
@@ -34,6 +40,11 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   VERSION: ${{ inputs.version }}
+  # Read by the builds when they are compiled: a dev build names itself so.
+  VI_CHANNEL: ${{ inputs.channel == 'dev' && 'dev' || '' }}
+  # The release's tag and the bundles' name prefix.
+  TAG: ${{ inputs.channel == 'dev' && format('dev-v{0}', inputs.version) || format('v{0}', inputs.version) }}
+  PREFIX: ${{ inputs.channel == 'dev' && 'dev-' || '' }}
 
 jobs:
   windows:
@@ -60,8 +71,8 @@ jobs:
       - name: Bundles
         shell: pwsh
         run: |
-          scripts\build-bundle.ps1 -Version $env:VERSION -Built -Out bundle -NoLauncher
-          if ('${{ inputs.launcher }}' -eq 'true') { scripts\build-bundle.ps1 -Version $env:VERSION -Built -Out bundle }
+          scripts\build-bundle.ps1 -Version $env:VERSION -Channel ${{ inputs.channel }} -Built -Out bundle -NoLauncher
+          if ('${{ inputs.launcher }}' -eq 'true') { scripts\build-bundle.ps1 -Version $env:VERSION -Channel ${{ inputs.channel }} -Built -Out bundle }
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64
@@ -105,7 +116,7 @@ jobs:
           cp target/release/vi-launcher "$out/"
           cp victory-exe/victory.exe "$out/victory/"
           cp victory.example.toml LICENSE README.md "$out/"
-          (cd "$out" && zip -r "../VI-BR-PORT-$VERSION-linux-x64.zip" .)
+          (cd "$out" && zip -r "../${PREFIX}VI-BR-PORT-$VERSION-linux-x64.zip" .)
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x64
@@ -126,10 +137,10 @@ jobs:
         env:
           REPO: ${{ github.repository }}
         run: |
-          base="https://github.com/$REPO/releases/download/v$VERSION"
+          base="https://github.com/$REPO/releases/download/$TAG"
           entries=()
           entry() {
-            f="bundles/$2-$VERSION-$1.zip"
+            f="bundles/${PREFIX}$2-$VERSION-$1.zip"
             [ -f "$f" ] || return 0
             entries+=("$(printf '"%s":{"url":"%s/%s","sha256":"%s","size":%s}' "$3" "$base" "$(basename "$f")" \
               "$(sha256sum "$f" | cut -d' ' -f1)" "$(stat -c %s "$f")")")
@@ -138,8 +149,8 @@ jobs:
           entry linux-x64 VI-BR-PORT linux-x64
           entry windows-x64 VIctory victory-windows-x64
           assets=$(IFS=,; echo "${entries[*]}")
-          printf '{"format":1,"version":"%s","published":"%s","notes_url":"https://github.com/%s/releases/tag/v%s","assets":{%s}}\n' \
-            "$VERSION" "$(date -u +%F)" "$REPO" "$VERSION" "$assets" > latest.json
+          printf '{"format":1,"version":"%s","published":"%s","notes_url":"https://github.com/%s/releases/tag/%s","assets":{%s}}\n' \
+            "$VERSION" "$(date -u +%F)" "$REPO" "$TAG" "$assets" > latest.json
           python3 -m json.tool latest.json
           sha256sum bundles/*.zip > SHA256SUMS
       - uses: actions/upload-artifact@v4
@@ -164,14 +175,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "v$VERSION" --repo "${{ github.repository }}" --target "${{ github.sha }}" \
-            --title "VI-BR-PORT $VERSION" --generate-notes \
+          extra=()
+          if [ "${{ inputs.channel }}" = dev ]; then extra=(--prerelease); fi
+          gh release create "$TAG" --repo "${{ github.repository }}" --target "${{ github.sha }}" \
+            --title "VI-BR-PORT ${PREFIX}$VERSION" --generate-notes "${extra[@]}" \
             out/*.zip out/latest.json out/SHA256SUMS
 
   # Pages tells the launchers about the release: only when there is a launcher
   # bundle for them to take.
   pages:
-    if: ${{ inputs.publish && inputs.launcher && !cancelled() && needs.publish.result == 'success' }}
+    if: ${{ inputs.publish && inputs.launcher && inputs.channel == 'stable' && !cancelled() && needs.publish.result == 'success' }}
     needs: publish
     runs-on: ubuntu-latest
     permissions:

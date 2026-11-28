@@ -34,7 +34,7 @@ pub fn start() -> ExitCode {
     let fullscreen = config::load(&paths::config_path()).config.fullscreen.unwrap_or(false);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("VI-BR-PORT")
+            .with_title(if update::DEV { "VI-BR-PORT dev" } else { "VI-BR-PORT" })
             // The same mark as the executable's icon (mark.rs, build.rs).
             .with_icon(std::sync::Arc::new(egui::IconData { rgba: crate::mark::rgba(64), width: 64, height: 64 }))
             .with_inner_size(size)
@@ -43,7 +43,7 @@ pub fn start() -> ExitCode {
             .with_fullscreen(fullscreen),
         ..Default::default()
     };
-    match eframe::run_native("VI-BR-PORT", options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
+    match eframe::run_native(if update::DEV { "VI-BR-PORT dev" } else { "VI-BR-PORT" }, options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");
@@ -552,7 +552,7 @@ impl App {
                 ui.set_min_height(num("layout", "linkRowHeight"));
                 ui.hyperlink_to(RichText::new(self.t("panel.github")).size(theme::type_size("caption")).strong(), PROJECT_URL);
                 ui.with_layout(Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(theme::small(&format!("v{}", update::current_version()), "textMuted").size(theme::type_size("caption")));
+                    ui.label(theme::small(&update::shown_version(), "textMuted").size(theme::type_size("caption")));
                 });
             });
             if let Some((state, ink)) = self.update_state() {

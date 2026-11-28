@@ -15,6 +15,8 @@ const SIZES: [u32; 7] = [16, 24, 32, 48, 64, 128, 256];
 fn main() {
     println!("cargo:rerun-if-changed=src/mark.rs");
     println!("cargo:rerun-if-changed=build.rs");
+    // update.rs reads VI_CHANNEL (a dev build names itself so).
+    println!("cargo:rerun-if-env-changed=VI_CHANNEL");
     let windows_msvc = std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|v| v == "windows")
         && std::env::var("CARGO_CFG_TARGET_ENV").is_ok_and(|v| v == "msvc");
     if !windows_msvc {
