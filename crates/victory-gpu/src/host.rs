@@ -10346,7 +10346,10 @@ impl Meter {
             self.caption = Some(CAPTION.encode_utf16().collect());
         }
         let Some(caption) = &self.caption else { return };
-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+        // The diagnostics build says so, next to the name: it runs slower on
+        // purpose (its checks), and a run's numbers are not the release's.
+        let build = if cfg!(feature = "diagnostics") { " (diagnostics build)" } else { "" };
+        let text = format!(" | VIctory{build} {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
         let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
