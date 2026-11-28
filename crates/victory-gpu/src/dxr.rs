@@ -19,6 +19,10 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_FEATURE_D3D12_OPTIONS5, D3D12_FEATURE_DATA_D3D12_OPTIONS5, ID3D12Device,
 };
 
+// The bookkeeping of the host's own structures (nothing builds one yet).
+mod pool;
+mod table;
+
 /// `D3D12_RAYTRACING_TIER_1_1`: inline ray tracing (ray queries in any
 /// program), which a translated program needs to ask the host's hardware.
 pub(crate) const TIER_1_1: i32 = 11;
