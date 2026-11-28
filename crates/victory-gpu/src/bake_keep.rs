@@ -220,7 +220,27 @@ fn barrier(list: &HostList, resource: &ID3D12Resource, before: D3D12_RESOURCE_ST
     unsafe { list.list.ResourceBarrier(&[b]) };
 }
 
+/// Box `b` of a level of `level` texels of a texture of DXGI format `format`
+/// as a texture copy may name it: in a block-compressed texture, widened to
+/// the 4x4 blocks it touches. The runtime takes nothing else, and a level
+/// narrower than a block counts as one whole block: a box of 2x2 or 1x1
+/// texels on the last levels of a BC3 chain, or one ending at an odd texel
+/// inside a level, makes the list fail to close with an invalid parameter
+/// (measured on the card, `copied_boxes_are_valid_for_block_compressed_levels`;
+/// the end of the prison walk `prisao-tk1` of 28 Nov, the first result kept
+/// a 1024x1024 BC3 sRGB texture of 11 levels).
+pub(crate) fn copyable(format: u32, level: [u32; 3], b: [u32; 6]) -> [u32; 6] {
+    if !block_compressed(format) {
+        return b;
+    }
+    let up = |v: u32| v.saturating_add(3) & !3;
+    [b[0] & !3, b[1] & !3, b[2], up(b[3]).min(up(level[0])), up(b[4]).min(up(level[1])), b[5]]
+}
+
 fn copy_box(list: &HostList, to: &ID3D12Resource, from: &ID3D12Resource, r: Region) {
+    // SAFETY: a live resource.
+    let d = unsafe { from.GetDesc() };
+    let r = Region { sub: r.sub, b: copyable(d.Format.0 as u32, level_size(&d, r.sub), r.b) };
     let location = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: a borrowed pointer the location never releases.
         pResource: unsafe { std::mem::transmute_copy(resource) },
@@ -229,7 +249,7 @@ fn copy_box(list: &HostList, to: &ID3D12Resource, from: &ID3D12Resource, r: Regi
     };
     let b = D3D12_BOX { left: r.b[0], top: r.b[1], front: r.b[2], right: r.b[3], bottom: r.b[4], back: r.b[5] };
     // SAFETY: an open list; both textures live, of one description, in the
-    // copy states; the box lies in the subresource.
+    // copy states; the box lies in the subresource, in whole blocks.
     unsafe { list.list.CopyTextureRegion(&location(to), r.b[0], r.b[1], r.b[2], &location(from), Some(&b)) };
 }
 
@@ -797,6 +817,182 @@ mod tests {
                 Region { sub: 2, b: [0, 0, 0, 512, 512, 1] },
             ]
         );
+    }
+
+    #[test]
+    fn copyable_boxes_are_whole_blocks() {
+        const BC3_SRGB: u32 = 78;
+        // The last levels of a chain: one whole block each.
+        assert_eq!(copyable(BC3_SRGB, [2, 2, 1], [0, 0, 0, 2, 2, 1]), [0, 0, 0, 4, 4, 1]);
+        assert_eq!(copyable(BC3_SRGB, [1, 1, 1], [0, 0, 0, 1, 1, 1]), [0, 0, 0, 4, 4, 1]);
+        assert_eq!(copyable(BC3_SRGB, [2, 2, 1], [1, 1, 0, 2, 2, 1]), [0, 0, 0, 4, 4, 1]);
+        // Odd texels inside a level: the blocks they touch.
+        assert_eq!(copyable(BC3_SRGB, [1024, 1024, 1], [3, 5, 0, 67, 69, 1]), [0, 4, 0, 68, 72, 1]);
+        // Whole blocks and ends at the level's edge stay.
+        assert_eq!(copyable(BC3_SRGB, [1024, 1024, 1], [4, 4, 0, 1024, 1024, 1]), [4, 4, 0, 1024, 1024, 1]);
+        // Formats without blocks stay as given.
+        assert_eq!(copyable(28, [2, 2, 1], [1, 1, 0, 2, 2, 1]), [1, 1, 0, 2, 2, 1]);
+    }
+
+    /// Measured on the card (the runtime alone, without the debug layer):
+    /// the list closed with an invalid parameter for a copy box of 2x2 or 1x1
+    /// texels on the last levels of a 1024x1024 BC3 sRGB chain, or one ending
+    /// at an odd texel inside a level, whether the textures were committed or
+    /// reserved (64 KiB layout, as the result's host copy is). Every box
+    /// `copy_box` records now closes, and carries the blocks.
+    #[test]
+    fn copied_boxes_are_valid_for_block_compressed_levels() {
+        use windows::Win32::Graphics::Dxgi::Common::*;
+        let Some(host) = crate::host::host() else { return };
+        let d = |layout| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 1024,
+            Height: 1024,
+            DepthOrArraySize: 1,
+            MipLevels: 11,
+            Format: DXGI_FORMAT(78),
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: layout,
+            ..Default::default()
+        };
+        // A committed texture, and a reserved one as `crate::tiles` makes a
+        // result's host copy (its levels without memory: copies from them
+        // read zeros and into them are dropped, which is all the same here).
+        let plain = keeper(&d(D3D12_TEXTURE_LAYOUT_UNKNOWN)).unwrap();
+        let reserved = {
+            let mut out: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a texture of ours.
+            unsafe {
+                host.device.CreateReservedResource(
+                    &d(D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut out,
+                )
+            }
+            .unwrap();
+            out.unwrap()
+        };
+        // The keeper as the code makes it, from the reserved result's description.
+        // SAFETY: a live resource.
+        let keeper = keeper(&unsafe { reserved.GetDesc() }).unwrap();
+        let level = |sub: u32| {
+            let s = (1024u32 >> sub).max(1);
+            Region { sub, b: [0, 0, 0, s, s, 1] }
+        };
+        let r = |sub, b| Region { sub, b };
+        // Partial regions at odd texels, ends inside a level and at its edge,
+        // every level whole (as `add_region` puts back past the most), the
+        // 2x2 and 1x1 levels.
+        let mut regions = vec![
+            r(0, [3, 5, 0, 67, 69, 1]),
+            r(0, [1021, 1022, 0, 1024, 1024, 1]),
+            r(3, [4, 4, 0, 66, 66, 1]),
+            r(8, [1, 2, 0, 3, 4, 1]),
+            r(9, [1, 1, 0, 2, 2, 1]),
+            r(10, [0, 0, 0, 1, 1, 1]),
+        ];
+        regions.extend((0..11).map(level));
+        // Into the keeper (as at a copy of the title's) and back (as at a
+        // putting back), from and into the committed and the reserved texture.
+        for (to, from) in [(&keeper, &plain), (&keeper, &reserved), (&plain, &keeper), (&reserved, &keeper)] {
+            let list = host.new_list().unwrap();
+            list.close();
+            list.reset();
+            barrier(&list, to, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+            barrier(&list, from, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            for &region in &regions {
+                copy_box(&list, to, from, region);
+            }
+            barrier(&list, to, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+            barrier(&list, from, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+            // SAFETY: our open list (closed here, not submitted).
+            let closed = unsafe { list.list.Close() };
+            assert!(closed.is_ok(), "a copy recorded was invalid: {closed:?}");
+            // With the debug layer (`VICTORY_D3D12_DEBUG=1`, diagnostics).
+            assert_eq!(host.log_messages(), None);
+        }
+        // What the copies carry: a pattern in levels 0, 9 and 10 of the
+        // committed texture, its odd region and its last levels copied into
+        // the keeper, the blocks they touch read back.
+        let footprint = |sub: u32| {
+            let d = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN, ..d(D3D12_TEXTURE_LAYOUT_UNKNOWN) };
+            let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0u64;
+            // SAFETY: outputs for one subresource.
+            unsafe { host.device.GetCopyableFootprints(&d, sub, 1, 0, Some(&mut f), None, None, Some(&mut total)) };
+            f.Offset = 0;
+            (f, total)
+        };
+        let pattern = |sub: u32, i: usize| ((i * 31 + sub as usize * 7) % 251) as u8 + 1;
+        let buffer_location = |buffer: &ID3D12Resource, f| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: f },
+        };
+        let texture_location = |texture: &ID3D12Resource, sub| D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+        };
+        let subs = [0u32, 9, 10];
+        let list = host.new_list().unwrap();
+        list.close();
+        list.reset();
+        barrier(&list, &plain, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        for sub in subs {
+            let (f, total) = footprint(sub);
+            let (buffer, data) = host.upload_buffer(total).unwrap();
+            for i in 0..total as usize {
+                // SAFETY: a mapped buffer of `total` bytes.
+                unsafe { data.add(i).write(pattern(sub, i)) };
+            }
+            // SAFETY: an open list; both live; the buffer holds the level.
+            unsafe { list.list.CopyTextureRegion(&texture_location(&plain, sub), 0, 0, 0, &buffer_location(&buffer, f), None) };
+            list.keep(&buffer);
+        }
+        barrier(&list, &plain, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier(&list, &keeper, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+        for region in [regions[0], regions[4], regions[5]] {
+            copy_box(&list, &keeper, &plain, region);
+        }
+        barrier(&list, &keeper, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        let mut backs = Vec::new();
+        for sub in subs {
+            let (f, total) = footprint(sub);
+            let back = host.read_back_buffer(total).unwrap();
+            // SAFETY: an open list; both live; the buffer holds the level.
+            unsafe { list.list.CopyTextureRegion(&buffer_location(&back, f), 0, 0, 0, &texture_location(&keeper, sub), None) };
+            list.keep(&back);
+            backs.push((sub, f, total, back));
+        }
+        barrier(&list, &keeper, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        barrier(&list, &plain, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+        list.close();
+        host.execute(&[&list]);
+        for (sub, f, total, back) in backs {
+            let mut data = std::ptr::null_mut();
+            // SAFETY: a read-back buffer of `total` bytes whose copy has run.
+            let bytes = unsafe {
+                back.Map(0, None, Some(&mut data)).unwrap();
+                let bytes = std::slice::from_raw_parts(data.cast::<u8>(), total as usize).to_vec();
+                back.Unmap(0, None);
+                bytes
+            };
+            // The blocks the region touches: of (3, 5)-(67, 69) on level 0
+            // the block columns 0 to 16 and rows 1 to 17; the one block of
+            // the last levels. 16 bytes a BC3 block.
+            let (columns, rows) = if sub == 0 { (0..17usize, 1..18usize) } else { (0..1, 0..1) };
+            let pitch = f.Footprint.RowPitch as usize;
+            for row in rows {
+                for i in row * pitch + columns.start * 16..row * pitch + columns.end * 16 {
+                    assert_eq!(bytes[i], pattern(sub, i), "level {sub} byte {i}");
+                }
+            }
+        }
+        assert_eq!(host.log_messages(), None);
     }
 
     /// Writes `fill` into every byte of level 0 of `texture` in `list` (as a
