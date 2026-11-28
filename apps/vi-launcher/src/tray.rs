@@ -63,19 +63,7 @@ impl Tray {
 /// A 32 x 32 sun: the design's gold at the top to its accent at the bottom.
 #[cfg(windows)]
 fn icon() -> Option<tray_icon::Icon> {
-    let n = 32u32;
-    let (top, low) = (crate::theme::colour("gold"), crate::theme::colour("accent"));
-    let mut rgba = Vec::with_capacity((n * n * 4) as usize);
-    for y in 0..n {
-        for x in 0..n {
-            let (dx, dy) = (x as f32 - 15.5, y as f32 - 15.5);
-            let inside = (dx * dx + dy * dy).sqrt() <= 15.0;
-            let t = y as f32 / (n - 1) as f32;
-            let mix = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
-            rgba.extend_from_slice(&[mix(top.r(), low.r()), mix(top.g(), low.g()), mix(top.b(), low.b()), if inside { 255 } else { 0 }]);
-        }
-    }
-    tray_icon::Icon::from_rgba(rgba, n, n).ok()
+    tray_icon::Icon::from_rgba(crate::mark::rgba(32), 32, 32).ok()
 }
 
 /// Elsewhere there is no tray here: the window is only minimized.

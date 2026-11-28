@@ -35,6 +35,8 @@ pub fn start() -> ExitCode {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("VI-BR-PORT")
+            // The same mark as the executable's icon (mark.rs, build.rs).
+            .with_icon(std::sync::Arc::new(egui::IconData { rgba: crate::mark::rgba(64), width: 64, height: 64 }))
             .with_inner_size(size)
             .with_min_inner_size(size)
             .with_maximized(true)
