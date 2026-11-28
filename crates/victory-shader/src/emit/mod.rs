@@ -111,8 +111,7 @@ mod valu_tests;
 #[cfg(all(test, windows))]
 mod waterfall_tests;
 #[cfg(all(test, windows))]
-mod wave64_tests;
-mod wave;
+mod wave64_tests;mod wave;
 
 use crate::dxbc::{Container, FourCC};
 use crate::native::{HwStage, NativeProgram, RootType};
@@ -488,6 +487,14 @@ pub fn with_wide_first<R>(on: bool, f: impl FnOnce() -> R) -> R {
 thread_local! {
     /// See [`with_paired_first`].
     static PAIRED_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether a program every other form refuses on a lane mask exchanged where not every lane
+/// runs (`lower::MASK_EXCHANGED`) tries the paired form ([`emit_paired`]) last:
+/// `VICTORY_WAVE_PAIRED_MASKS=1`. Off by default.
+fn paired_masks_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_PAIRED_MASKS").is_some_and(|v| v == "1"))
 }
 
 /// Runs `f` (a translation) with the paired form ([`emit_paired`]) tried for this program before
@@ -1084,6 +1091,25 @@ pub fn emit(
             && let Some(shader) = try_paired("paired for a divergent first-lane read")
         {
             return Ok(shader);
+        }
+        // A lane mask the two host waves would exchange in a block not every lane runs (the
+        // FSR4 network passes' wait on a flag in memory, `s_and_b64 exec` then `s_cbranch_scc0`
+        // inside a per-lane loop) stops every form above. In the paired form one host wave runs
+        // the whole console wave, so the mask is its own wave's ballot and nothing is exchanged:
+        // exact. Tried here, past every other form, only with `VICTORY_WAVE_PAIRED_MASKS=1`
+        // (off by default: the form doubles each lane's vector work and is new to these programs).
+        if paired_masks_on()
+            && !paired_requested()
+            && !PAIRED_FIRST.get()
+            && matches!(&original, Err(ShaderError::Unsupported { what, .. }) if *what == lower::MASK_EXCHANGED)
+        {
+            let again = emit_paired(c, native, p, st);
+            lower::take_needs();
+            lower::take_meets();
+            report("paired, for a lane mask exchanged where not every lane runs", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
         }
     }
     // SCC of a mask operation joined with a scalar test behind a per-lane skip (the 32-lane
