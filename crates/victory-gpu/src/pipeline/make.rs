@@ -208,6 +208,18 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
+        // A bake of the colour grading's table runs once: dropped, the
+        // table stays wrong for the session. It is made here (or waited
+        // for, if a worker is making it), however long that takes.
+        if crate::lutwatch::bake_wait()
+            && p.shaders.iter().any(|s| s.lut == Some(crate::lutwatch::Role::Bake))
+            && !super::creates_skipped(&p.shaders)
+        {
+            let began = Instant::now();
+            p.make();
+            tracing::info!(shaders = %hashes(p), ms = began.elapsed().as_millis() as u64, "a LUT bake dispatch waited for its host pipeline (VICTORY_LUT_BAKE_WAIT=1)");
+            return p.made.get()?.as_ref();
+        }
         let frame = crate::frame::current();
         let first = match p.waited_frame.compare_exchange(
             u64::MAX,

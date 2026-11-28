@@ -16,6 +16,7 @@
 //! texture and a sampler slot without a sampler gets a linear one there).
 
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 /// A program's part in the colour grading.
@@ -50,6 +51,20 @@ static DROPPED_HASHES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static TONE_MAP: Mutex<Option<String>> = Mutex::new(None);
 /// Whether the line has been written (the probes stop then).
 static LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a bake dispatch waits for its host pipeline without limit
+/// (`VICTORY_LUT_BAKE_WAIT=1`; off by default: it is dropped past the
+/// frame's waiting budget, as every other dispatch).
+pub(crate) fn bake_wait() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_LUT_BAKE_WAIT").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("LUT bake dispatches wait for their host pipeline (VICTORY_LUT_BAKE_WAIT=1)");
+        }
+        on
+    })
+}
 
 /// A bake dispatch ran (`ran`) or was dropped without a host pipeline.
 pub(crate) fn note_bake(ran: bool, hashes: impl FnOnce() -> String) {
@@ -98,6 +113,7 @@ pub(crate) fn presented(frame: u64, world: bool) {
         bakes_ran = ran,
         bakes_dropped = dropped,
         dropped_bakes = %hashes,
+        bake_wait = bake_wait(),
         "colour grading at the world's first frame: the tone map's LUT view and sampler, and the LUT bakes"
     );
 }
