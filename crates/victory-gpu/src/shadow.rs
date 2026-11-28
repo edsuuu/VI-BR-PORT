@@ -5764,6 +5764,9 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
+    // (The ask, for [`made_apart`] to make again: `len` names the
+    // buffer's length below.)
+    let len_asked = len;
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
         return Some(shadow);
@@ -5819,76 +5822,151 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        // With `private_sides` the buffer in the PC's memory is made only
-        // for a copy that has no card side: a card copy's CPU side is then
-        // memory of our own.
-        let early = if private_sides() { None } else { Some(host()?.shared_buffer(size)?) };
-        let on_card = card_for(size);
-        let (side, data) = match (early, &on_card) {
-            (Some((buffer, data)), _) => (Side::Shared(buffer), data),
-            (None, Some(_)) => match private_side(size) {
-                Some(made) => made,
-                None => {
-                    CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
-                    return None;
-                }
-            },
-            (None, None) => {
-                let (buffer, data) = host()?.shared_buffer(size)?;
-                (Side::Shared(buffer), data)
-            }
-        };
-        if let Some(buffer) = side.resource() {
-            crate::host::name(buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
+        if make_apart() {
+            drop(map);
+            return made_apart(key, len, size, (address, len_asked, any));
         }
-        // A big one, with `cards`: shaders get a buffer in the card's own
-        // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match on_card {
-            Some(on_card) => {
-                crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
-                tracing::info!(
-                    start = format_args!("{:#x}", key.0),
-                    len,
-                    "a buffer's host copy is in the card's memory"
-                );
-                let card = Card {
-                    staging: side,
-                    before: Mutex::default(),
-                    dirty: Mutex::default(),
-                    sent: Mutex::default(),
-                touched: Default::default(),
-                me: Default::default(),
-                    size,
-                };
-                (on_card, Some(card))
-            }
-            // (Always a buffer: made above when there is no card side.)
-            None => (side.resource()?.clone(), None),
-        };
-        // SAFETY: a live buffer.
-        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-        if len >= 16 << 20 {
-            tracing::info!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "large buffer copied to the host"
-            );
-        } else {
-            tracing::debug!(
-                start = format_args!("{:#x}", key.0),
-                len,
-                "buffer copied to the host"
-            );
-        }
-        let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
-        shadow.card = card;
-        let shadow = Arc::new(shadow);
+        let shadow = make_copy(key.0, len, size)?;
         if shadow.card.is_some() {
             card_joins(&shadow);
         }
         entry.shadow = Some(shadow);
     }
     entry.shadow.clone()
+}
+
+/// Whether a title buffer's copy is made with the map of buffers let go
+/// (`VICTORY_MAKE_APART=1`; off by default: made under its write lock, as
+/// before).
+///
+/// Making one is two buffers created, made resident and waited for until
+/// the card has them mapped ([`crate::host::resident`], [`crate::host::mapped`]):
+/// a millisecond or more. Under the write lock every thread that looks a
+/// buffer up waits for it, and so do the title's threads that create or
+/// release buffers ([`register`]). In the opening's first scene (run
+/// intro-fim-1, 28 Nov, 10:49:12 to :22) 3,478 copies in the card's memory
+/// were made in ten seconds, beside 10,000 waits for new memory (1.9 s) and
+/// 8,800 for mappings (0.6 s); the threads that translate lists worked 4.5 s
+/// a frame for 13,359 calls, and the card stood 608 ms a frame with nothing
+/// of ours because the title had not submitted.
+fn make_apart() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_MAKE_APART"))
+}
+
+/// The buffers ([`BUFFERS`]'s keys) whose copies a thread is making with
+/// [`make_apart`]; others asking for one of them wait on [`MADE_APART`].
+static MAKING_APART: Mutex<Vec<(u64, usize)>> = Mutex::new(Vec::new());
+static MADE_APART: std::sync::Condvar = std::sync::Condvar::new();
+
+/// [`lookup`]'s making of the copy of the buffer `key` (`len` bytes, the
+/// host buffer `size`) with the map let go ([`make_apart`]). One thread makes
+/// a buffer's copy; another asking for it meanwhile waits for that and asks
+/// again. The copy goes into the map if the buffer is still there as it was
+/// and has none yet; else it is dropped and the ask (`again`: address,
+/// length, any) is made anew.
+fn made_apart(key: (u64, usize), len: u64, size: u64, again: (u64, u64, bool)) -> Option<Arc<Shadow>> {
+    {
+        let mut making = MAKING_APART.lock().unwrap_or_else(|e| e.into_inner());
+        if making.contains(&key) {
+            while making.contains(&key) {
+                making = MADE_APART.wait(making).unwrap_or_else(|e| e.into_inner());
+            }
+            drop(making);
+            return lookup(again.0, again.1, again.2);
+        }
+        making.push(key);
+    }
+    let made = make_copy(key.0, len, size);
+    let out = {
+        let mut map = buffers();
+        match map.get_mut(&key) {
+            Some(entry) if entry.end == key.0 + len => {
+                if entry.shadow.is_none()
+                    && let Some(shadow) = &made
+                {
+                    if shadow.card.is_some() {
+                        card_joins(shadow);
+                    }
+                    entry.shadow = Some(shadow.clone());
+                }
+                Some(entry.shadow.clone())
+            }
+            // Released (or another buffer at the place) meanwhile.
+            _ => None,
+        }
+    };
+    {
+        let mut making = MAKING_APART.lock().unwrap_or_else(|e| e.into_inner());
+        making.retain(|k| *k != key);
+    }
+    MADE_APART.notify_all();
+    match out {
+        Some(found) => found,
+        None => lookup(again.0, again.1, again.2),
+    }
+}
+
+/// The copy of title buffer memory `[start, start + len)`, in a host buffer
+/// of `size` bytes (and in the card's memory too, if [`card_for`] gives it
+/// room); not yet in the map.
+fn make_copy(start: u64, len: u64, size: u64) -> Option<Arc<Shadow>> {
+    // With `private_sides` the buffer in the PC's memory is made only
+    // for a copy that has no card side: a card copy's CPU side is then
+    // memory of our own.
+    let early = if private_sides() { None } else { Some(host()?.shared_buffer(size)?) };
+    let on_card = card_for(size);
+    let (side, data) = match (early, &on_card) {
+        (Some((buffer, data)), _) => (Side::Shared(buffer), data),
+        (None, Some(_)) => match private_side(size) {
+            Some(made) => made,
+            None => {
+                CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+                return None;
+            }
+        },
+        (None, None) => {
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            (Side::Shared(buffer), data)
+        }
+    };
+    if let Some(buffer) = side.resource() {
+        crate::host::name(buffer, || format!("title buffer {start:#x}+{len:#x}"));
+    }
+    // A big one, with `cards`: shaders get a buffer in the card's own
+    // memory, and the one just made is the CPU's side.
+    let (buffer, card) = match on_card {
+        Some(on_card) => {
+            crate::host::name(&on_card, || format!("title buffer {start:#x}+{len:#x} on the card"));
+            if crate::pipeline::quiet_firsts() {
+                tracing::debug!(start = format_args!("{start:#x}"), len, "a buffer's host copy is in the card's memory");
+            } else {
+                tracing::info!(start = format_args!("{start:#x}"), len, "a buffer's host copy is in the card's memory");
+            }
+            let card = Card {
+                staging: side,
+                before: Mutex::default(),
+                dirty: Mutex::default(),
+                sent: Mutex::default(),
+                touched: Default::default(),
+                me: Default::default(),
+                size,
+            };
+            (on_card, Some(card))
+        }
+        // (Always a buffer: made above when there is no card side.)
+        None => (side.resource()?.clone(), None),
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    if len >= 16 << 20 {
+        tracing::info!(start = format_args!("{start:#x}"), len, "large buffer copied to the host");
+    } else {
+        tracing::debug!(start = format_args!("{start:#x}"), len, "buffer copied to the host");
+    }
+    let mut shadow = Shadow::new(buffer, data, gpu, start, len);
+    shadow.card = card;
+    Some(Arc::new(shadow))
 }
 
 /// Titles also use memory outside any buffer object as GPU memory (

@@ -177,6 +177,13 @@ impl Shader {
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 match &done {
+                    Ok(t) if quiet_firsts() => tracing::debug!(
+                        stage = self.stage,
+                        hash = %self.hash,
+                        user_data = t.host.user_data.len(),
+                        samplers = t.host.samplers.len(),
+                        "shader translated"
+                    ),
                     Ok(t) => tracing::info!(
                         stage = self.stage,
                         hash = %self.hash,
@@ -595,8 +602,29 @@ pub(crate) fn bound(this: This) {
     }
     let frame = crate::frame::current();
     for shader in &p.shaders {
-        tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        if quiet_firsts() {
+            tracing::debug!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        } else {
+            tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        }
     }
+}
+
+/// Whether the lines said once per object as it comes ("first bind", "shader
+/// translated", "host pipeline", "a buffer's host copy is in the card's
+/// memory") are left to the debug level (`VICTORY_QUIET_FIRSTS=1`; off by
+/// default: said, as before).
+///
+/// They come in thousands where a scene loads, from the threads that
+/// translate the title's calls, each a write to the console the run's log
+/// is read from: in the opening's first scene (run intro-fim-1, 28 Nov,
+/// 10:49:05 to :24) 1,758 "first bind" lines, 3,478 copies in the card's
+/// memory, 1,428 mesh pipelines and 1,417 shaders, about 8,500 lines in 20 s
+/// beside 70 lines a second the rest of the run. (What a line costs there
+/// was not measured.)
+pub(crate) fn quiet_firsts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_QUIET_FIRSTS"))
 }
 
 /// The host pipeline of a title pipeline; `None` if one of its shaders does

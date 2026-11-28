@@ -795,6 +795,7 @@ fn started() -> bool {
             // SAFETY: this thread's own priority.
             unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
             crate::cores::keep_submitting_thread("victory-submit");
+            crate::timeline::time_this_thread();
             OURS.set(true);
             let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| LANE.serve()));
             if ended.is_err() {
