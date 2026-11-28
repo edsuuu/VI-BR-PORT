@@ -2107,6 +2107,11 @@ impl State {
     /// title's bake programs. The uploads are recorded into `list` ahead
     /// of the draw being bound, as the world's pass records them.
     fn early_textures(&self, list: &HostList, p: &HostPipeline, compute: bool) {
+        // The list draws a decoration bake: its copies into block-compressed
+        // textures are the bake's results (`VICTORY_BAKE_KEEP`).
+        if crate::bake_keep::on() && !compute && p.stages.iter().any(|s| bake_shader(&s.shader)) {
+            crate::bake_keep::bake_drawn(list);
+        }
         let (early_ms, bake_ms) = early_budgets();
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
@@ -2376,6 +2381,9 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
+        // Decoration bakes' results due to be put back, ahead of this list's
+        // draws (`VICTORY_BAKE_KEEP`; off by default).
+        crate::bake_keep::tick(list);
         let memory = crate::host::host().and_then(|h| h.video_memory());
         // `VICTORY_TEXTURE_STAGE_MB` sets it: a backlog of tens of thousands of
         // textures (a scene's first minutes) then drains in fewer frames.

@@ -19,6 +19,8 @@
 mod ambient;
 #[cfg(windows)]
 mod bake;
+#[cfg(windows)]
+mod bake_keep;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
 pub mod console;
