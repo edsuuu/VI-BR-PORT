@@ -119,6 +119,9 @@ pub struct App {
     /// The flags as typed in their text box, saved by its button.
     flags_text: String,
     flags_note: Option<String>,
+    /// The key bindings as typed in their text box (read when first shown).
+    bindings_text: Option<String>,
+    bindings_note: Option<String>,
     /// The tray icon while the game is open.
     tray: Option<crate::tray::Tray>,
 }
@@ -146,6 +149,8 @@ impl App {
             logs: Logs { step: StepId::Open, follow: true, text: String::new(), read_at: None, back: View::Play },
             flags_text: String::new(),
             flags_note: None,
+            bindings_text: None,
+            bindings_note: None,
             tray: None,
         };
         app.flags_text = flags::to_text(&app.config.flags);
@@ -219,6 +224,12 @@ impl App {
     fn play(&mut self, ctx: &egui::Context) {
         let Ok(mut plan) = self.make_plan() else { return };
         plan.data_dir = self.config.saves_dir.as_ref().map(PathBuf::from);
+        // Mouse and keyboard: the bindings file, made the first time, for the build.
+        if self.config.mouse_keyboard == Some(true)
+            && let Ok(bindings) = crate::controls::ensure()
+        {
+            plan.run.env.insert("VICTORY_MNK_BINDINGS".to_owned(), bindings.display().to_string());
+        }
         let (tx, rx) = channel();
         let running: run::Running = Arc::new(Mutex::new(None));
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -492,6 +503,7 @@ impl App {
                 for opt in toggles {
                     self.switch(ui, opt, num("layout", "switchRowHeight"));
                 }
+                self.mouse_keyboard_switch(ui);
             });
         }
         ui.with_layout(Layout::bottom_up(egui::Align::Min), |ui| {
@@ -890,6 +902,7 @@ impl App {
                 for g in options::GROUPS {
                     app.group_section(ui, g);
                 }
+                app.controls_section(ui);
                 app.flags_section(ui);
                 app.advanced_section(ui, ctx);
             });
@@ -980,6 +993,47 @@ impl App {
             options::set(&mut self.config.options, &opt.id, v);
             self.save();
         }
+    }
+
+    /// The mouse and keyboard switch, for the options panel and the settings.
+    fn mouse_keyboard_switch(&mut self, ui: &mut egui::Ui) {
+        let lang = self.language;
+        let mut on = self.config.mouse_keyboard == Some(true);
+        let r = theme::switch_row(ui, &text::get(lang, "controls.label"), &text::get(lang, "controls.hint"), &mut on, num("layout", "switchRowHeight"));
+        if r.changed() {
+            self.config.mouse_keyboard = Some(on);
+            self.save();
+        }
+    }
+
+    /// Mouse and keyboard: the switch and the bindings in a text box, saved
+    /// by its button into the file the build reads.
+    fn controls_section(&mut self, ui: &mut egui::Ui) {
+        let lang = self.language;
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.label(theme::caption(&self.t("controls.title")));
+            self.mouse_keyboard_switch(ui);
+            ui.add(egui::Label::new(theme::small(&text::fill(lang, "controls.help", &[&crate::controls::path().display().to_string()]), "textMuted")).wrap());
+            let text = self.bindings_text.get_or_insert_with(crate::controls::read);
+            ui.add(egui::TextEdit::multiline(text).desired_rows(10).desired_width(f32::INFINITY).font(egui::TextStyle::Monospace).margin(vec2(10.0, 10.0)));
+            ui.horizontal(|ui| {
+                if theme::outline_button(ui, &text::get(lang, "flags.save"), None, false).clicked() {
+                    let typed = self.bindings_text.clone().unwrap_or_default();
+                    self.bindings_note = Some(match crate::controls::write(&typed) {
+                        Ok(()) => text::get(lang, "controls.saved"),
+                        Err(e) => e.to_string(),
+                    });
+                }
+                if theme::outline_button(ui, &text::get(lang, "controls.reset"), None, false).clicked() {
+                    self.bindings_text = Some(crate::controls::DEFAULT.to_owned());
+                    self.bindings_note = None;
+                }
+                if let Some(n) = &self.bindings_note {
+                    ui.label(theme::small(n, "textMuted"));
+                }
+            });
+        });
     }
 
     /// The flags: one text box, one switch per line (`NAME=value`), and a

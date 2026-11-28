@@ -1,7 +1,6 @@
 {
   "notice.set_aside": "The settings file could not be read and was kept as {0}. Starting from the defaults.",
   "notice.not_saved": "The settings could not be saved: {0}",
-
   "game.title": "GAME",
   "game.folder": "Game folder",
   "game.folder.hint": "The folder you extracted the game to. It has to hold {0}.",
@@ -11,11 +10,9 @@
   "game.problem.no_folder": "The folder {0} does not exist.",
   "game.problem.no_exe": "There is no {1} in {0}. Choose the folder the game was extracted to.",
   "game.problem.not_exe": "{0} is not a valid executable (an unfinished copy?).",
-
   "build.missing": "victory.exe was not found. Looked in:\n{0}\nUse the full bundle (the launcher with the engine) or run the launcher from the repository.",
   "build.found": "Build: {0}",
   "build.missing_short": "victory.exe is not next to the launcher. Use the full bundle.",
-
   "flags.title": "VICTORY FLAGS",
   "flags.hint": "One per line, NAME=value. A line starting with # is off. They win over the options above; an empty value removes the switch.",
   "flags.value": "value",
@@ -29,7 +26,6 @@
   "flags.problem.prefix": "The name starts with VICTORY_.",
   "flags.problem.characters": "Only capital letters, digits and _.",
   "flags.problem.kept": "This switch says where the files are; the launcher leaves it alone.",
-
   "advanced.title": "ADVANCED",
   "advanced.language": "Language",
   "advanced.victory": "victory.exe",
@@ -39,7 +35,6 @@
   "advanced.updates": "Look for updates when opened",
   "advanced.check_now": "Look now",
   "advanced.data": "Settings and logs in {0}",
-
   "update.checking": "Looking for an update…",
   "update.none": "You have the newest version.",
   "update.no_release": "No version published yet.",
@@ -51,30 +46,23 @@
   "update.installed": "Update installed. Restart the launcher to use it.",
   "update.restart": "Restart",
   "update.failed": "The update failed: {0}",
-
   "prep.game_open": "THE GAME IS OPEN",
   "prep.game_ended": "The game closed with code {0}. The log is {1}.",
   "prep.logs": "Logs in {0}",
   "prep.close_game": "Close the game",
   "prep.see_logs": "See the logs",
-
   "play.status.build": "Ready to play. victory.exe is built first (seconds when nothing changed).",
   "play.status.build_prepare": "Ready to play. The first time builds victory.exe and prepares the shaders.",
-
   "panel.logs": "Logs",
   "panel.check_updates": "Look for updates",
-
   "logs.title": "LOGS",
   "logs.empty": "Nothing yet. The log shows here as soon as the step starts.",
   "logs.open_folder": "Open the folder",
   "logs.copy": "Copy",
-
   "advanced.victory.checkout": "Built from the repository in {0}",
   "advanced.victory.hint": "The bundle's own, or another one you name",
   "advanced.updates_now": "Updates",
-
   "common.close": "Close",
-
   "flags.save": "Save",
   "flags.saved": "Saved: {0} flags.",
   "flags.saved_skipped": "Saved: {0} flags. {1} lines were not NAME=value and were left out.",
@@ -86,5 +74,11 @@
   "saves.folder": "Saves folder",
   "saves.default": "VIctory's default folder (%LOCALAPPDATA%\\victory\\data)",
   "saves.reset": "Use the default",
-  "tray.show": "Show the launcher"
+  "tray.show": "Show the launcher",
+  "controls.title": "MOUSE AND KEYBOARD",
+  "controls.label": "Mouse and keyboard",
+  "controls.hint": "WASD moves, the mouse turns the camera, the buttons shoot and aim",
+  "controls.help": "The keys are in {0}. One per line, BUTTON = KEY; several keys separated by commas. Mouse1 is the left button, Mouse2 the right. It takes effect the next time the game opens.",
+  "controls.saved": "Keys saved.",
+  "controls.reset": "Back to the default"
 }

@@ -1,7 +1,6 @@
 {
   "notice.set_aside": "O arquivo de configurações não pôde ser lido e foi guardado em {0}. Começando do padrão.",
   "notice.not_saved": "Não deu para salvar as configurações: {0}",
-
   "game.title": "JOGO",
   "game.folder": "Pasta do jogo",
   "game.folder.hint": "A pasta onde você extraiu o jogo. Ela precisa ter o {0}.",
@@ -11,11 +10,9 @@
   "game.problem.no_folder": "A pasta {0} não existe.",
   "game.problem.no_exe": "Não há {1} em {0}. Escolha a pasta onde o jogo foi extraído.",
   "game.problem.not_exe": "{0} não é um executável válido (cópia incompleta?).",
-
   "build.missing": "Não achei o victory.exe. Procurei em:\n{0}\nUse o pacote completo (launcher com a engine) ou rode o launcher de dentro do repositório.",
   "build.found": "Build: {0}",
   "build.missing_short": "Não achei o victory.exe ao lado do launcher. Use o pacote completo.",
-
   "flags.title": "FLAGS DO VICTORY",
   "flags.hint": "Uma por linha, NOME=valor. Uma linha com # na frente fica desligada. Valem mais que as opções acima; valor vazio tira a chave.",
   "flags.value": "valor",
@@ -29,7 +26,6 @@
   "flags.problem.prefix": "O nome começa com VICTORY_.",
   "flags.problem.characters": "Só letras maiúsculas, números e _.",
   "flags.problem.kept": "Essa chave diz onde ficam os arquivos e não é mudada pelo launcher.",
-
   "advanced.title": "AVANÇADO",
   "advanced.language": "Idioma",
   "advanced.victory": "victory.exe",
@@ -39,7 +35,6 @@
   "advanced.updates": "Procurar atualização ao abrir",
   "advanced.check_now": "Procurar agora",
   "advanced.data": "Configurações e logs em {0}",
-
   "update.checking": "Procurando atualização…",
   "update.none": "Você está na versão mais nova.",
   "update.no_release": "Nenhuma versão publicada ainda.",
@@ -51,30 +46,23 @@
   "update.installed": "Atualização instalada. Reinicie o launcher para usar.",
   "update.restart": "Reiniciar",
   "update.failed": "A atualização falhou: {0}",
-
   "prep.game_open": "O JOGO ESTÁ ABERTO",
   "prep.game_ended": "O jogo fechou com o código {0}. O log é {1}.",
   "prep.logs": "Logs em {0}",
   "prep.close_game": "Fechar o jogo",
   "prep.see_logs": "Ver logs",
-
   "play.status.build": "Pronto para jogar. Antes, compila o victory.exe (segundos se nada mudou).",
   "play.status.build_prepare": "Pronto para jogar. A primeira vez compila o victory.exe e prepara os shaders.",
-
   "panel.logs": "Logs",
   "panel.check_updates": "Procurar atualização",
-
   "logs.title": "LOGS",
   "logs.empty": "Nada ainda. O log aparece aqui assim que o passo começa.",
   "logs.open_folder": "Abrir a pasta",
   "logs.copy": "Copiar",
-
   "advanced.victory.checkout": "Compilado do repositório em {0}",
   "advanced.victory.hint": "O que vem no pacote, ou outro que você indicar",
   "advanced.updates_now": "Atualização",
-
   "common.close": "Fechar",
-
   "flags.save": "Salvar",
   "flags.saved": "Salvo: {0} flags.",
   "flags.saved_skipped": "Salvo: {0} flags. {1} linhas não eram NOME=valor e ficaram de fora.",
@@ -86,5 +74,11 @@
   "saves.folder": "Pasta dos saves",
   "saves.default": "A pasta padrão do VIctory (%LOCALAPPDATA%\\victory\\data)",
   "saves.reset": "Usar a padrão",
-  "tray.show": "Mostrar o launcher"
+  "tray.show": "Mostrar o launcher",
+  "controls.title": "MOUSE E TECLADO",
+  "controls.label": "Mouse e teclado",
+  "controls.hint": "WASD anda, o mouse mexe a câmera, os botões atiram e miram",
+  "controls.help": "As teclas ficam em {0}. Uma por linha, BOTÃO = TECLA; várias teclas separadas por vírgula. Mouse1 é o botão esquerdo, Mouse2 o direito. Vale na próxima vez que o jogo abrir.",
+  "controls.saved": "Teclas salvas.",
+  "controls.reset": "Voltar ao padrão"
 }

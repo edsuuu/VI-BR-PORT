@@ -41,6 +41,9 @@ pub struct Config {
     /// The window full screen (F11), as it was left.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fullscreen: Option<bool>,
+    /// Mouse and keyboard drive the pad (VICTORY_MNK_BINDINGS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse_keyboard: Option<bool>,
     #[serde(flatten)]
     pub rest: Map<String, Value>,
 }
@@ -62,6 +65,7 @@ impl Default for Config {
             runner: None,
             check_updates: None,
             fullscreen: None,
+            mouse_keyboard: None,
             rest: Map::new(),
         }
     }
