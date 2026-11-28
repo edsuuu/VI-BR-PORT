@@ -205,12 +205,21 @@ fn triangle_count(t: &Triangles) -> u64 {
 const FAST_TRACE: u32 = 0x4;
 const FAST_BUILD: u32 = 0x8;
 
-/// The flags the host builds with: the title's, but never both preferences
-/// (Direct3D refuses that; the walks matter more), and for an unpacked
-/// structure (built once, walked for as long as it is streamed in) a
-/// preference for fast walks if it has none.
+/// The build flags the console and the PC share: allow update, allow
+/// compaction, the two preferences, minimize memory, perform update. The
+/// console's own (`DEHYDRATE`, `0x40000000`) the PC does not know.
+const SHARED_BUILD_FLAGS: u32 = 0x3f;
+
+/// The flags the host builds with: the title's that the PC knows (builds
+/// with more are counted), but never both preferences (Direct3D refuses
+/// that; the walks matter more), and for an unpacked structure (built once,
+/// walked for as long as it is streamed in) a preference for fast walks if
+/// it has none.
 pub(super) fn host_flags(flags: u32, origin: Origin) -> u32 {
-    let mut flags = flags & !PERFORM_UPDATE;
+    if flags & !SHARED_BUILD_FLAGS != 0 {
+        add(C::BuildsConsoleFlags, 1);
+    }
+    let mut flags = flags & SHARED_BUILD_FLAGS & !PERFORM_UPDATE;
     if flags & FAST_TRACE != 0 {
         flags &= !FAST_BUILD;
     }
@@ -387,6 +396,17 @@ mod tests {
         assert_eq!(host_flags(ALLOW_COMPACTION, Origin::Rehydrated), FAST_TRACE | ALLOW_COMPACTION);
         assert_eq!(host_flags(FAST_BUILD, Origin::Rehydrated), FAST_BUILD);
         assert_eq!(host_flags(0, Origin::Batched), 0);
+    }
+
+    #[test]
+    fn the_host_builds_without_the_consoles_own_flags() {
+        // DEHYDRATE is the console's alone.
+        const DEHYDRATE: u32 = 0x4000_0000;
+        assert_eq!(host_flags(DEHYDRATE | FAST_TRACE | ALLOW_COMPACTION, Origin::Batched), FAST_TRACE | ALLOW_COMPACTION);
+        assert_eq!(host_flags(DEHYDRATE | PERFORM_UPDATE | 0x1, Origin::Batched), 0x1);
+        // Bits neither defines go too; an unpacked one still prefers fast walks.
+        assert_eq!(host_flags(0x8000_0100, Origin::Rehydrated), FAST_TRACE);
+        assert_eq!(host_flags(0x10, Origin::Batched), 0x10);
     }
 
     #[test]

@@ -115,6 +115,8 @@ pub(super) enum C {
     InstancesUnreadable,
     /// Instances whose flags held the console's own bits (taken off).
     InstancesConsoleFlags,
+    /// Builds whose flags held bits the PC does not know (taken off).
+    BuildsConsoleFlags,
     /// Data read from the copy shaders wrote where a draw would read another.
     ShadersCopy,
     /// Data outside title buffers with a page in an arena of by-address

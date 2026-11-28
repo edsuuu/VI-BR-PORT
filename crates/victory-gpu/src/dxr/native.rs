@@ -432,6 +432,9 @@ pub(crate) fn line() {
     if per(C::InstancesConsoleFlags) > 0.0 {
         let _ = write!(text, "; {:.0} instances held the console's own flags (taken off)", per(C::InstancesConsoleFlags));
     }
+    if per(C::BuildsConsoleFlags) > 0.0 {
+        let _ = write!(text, "; {:.2} builds held flags the PC does not know (taken off)", per(C::BuildsConsoleFlags));
+    }
     if per(C::Rebuilt) > 0.0 {
         let _ = write!(text, "; of the builds {:.1} were updates built from scratch (", per(C::Rebuilt));
         for (k, (w, n)) in rebuilt.iter().enumerate() {
