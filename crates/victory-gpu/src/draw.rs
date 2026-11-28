@@ -2824,6 +2824,7 @@ impl State {
         list.note_after(|| format!("after {}", p.name));
         self.buffers_written();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        crate::rtcalls::dispatched(p, Some([x, y, z]));
         self.after_dispatch(list, p);
     }
 
@@ -4169,6 +4170,7 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            crate::rtcalls::dispatched(p, None);
             // The lamps' shadow-mask table is last written by an indirect
             // dispatch (the other passes follow direct ones only, as before).
             if p.stages.first().and_then(|s| s.shader.ambient) == Some(crate::ambient::Role::LampShadows) {

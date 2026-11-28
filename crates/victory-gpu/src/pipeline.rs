@@ -198,6 +198,12 @@ impl Shader {
 
 #[cfg(windows)]
 impl Shader {
+    /// The container as the title gave it (the ray-program census reads
+    /// its entry point's name, `crate::rtcalls`).
+    pub(crate) fn container(&self) -> &[u8] {
+        &self.container
+    }
+
     /// The console programs of the container; `None` if they are not known.
     pub(crate) fn programs(&self) -> Option<Vec<victory_shader::NativeProgram>> {
         use victory_shader::{Container, FourCC};
