@@ -639,7 +639,13 @@ pub(crate) fn save(now: bool) {
     };
     // Through `used`: a process that asked for none yet (`victory shaders`)
     // must not write the earlier runs' list over with nothing.
-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+    let mut used: Vec<String> = used().iter().flatten().cloned().collect();
+    if crate::load_hold::on() {
+        let first = FIRST_USES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(first) = first.as_ref() {
+            used = early_list(&first.order, EARLIER.get().map_or(&[], Vec::as_slice), EARLY_MAX);
+        }
+    }
     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
     if bytes > 0 && library_written.is_ok() {
         // In place unless the system refused and the new one waits beside it.
@@ -776,8 +782,39 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
         let set: HashSet<String> = listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect();
         tracing::info!(pipelines = set.len(), "title pipelines to start early");
         *used = Some(set);
+        let _ = EARLIER.set(listed.lines().filter(|l| !l.is_empty()).map(str::to_owned).collect());
     }
     used
+}
+
+/// The early list as read, in its order (most recent run first once it was
+/// saved by [`early_list`]).
+static EARLIER: OnceLock<Vec<String>> = OnceLock::new();
+
+/// This run's title pipeline keys in the order of their first use, at most
+/// [`EARLY_MAX`] (`VICTORY_LOAD_HOLD`; from upstream's "keep first-used
+/// pipelines in the early-start list"). Without it, the list is the earlier
+/// runs' keys and this run's in one set that stops taking keys once full:
+/// a full list never took the pipelines of a newer build or a scene not
+/// seen before, and the ones a load needs first were not kept first.
+#[derive(Default)]
+struct FirstUses {
+    seen: HashSet<String>,
+    order: Vec<String>,
+}
+
+static FIRST_USES: Mutex<Option<FirstUses>> = Mutex::new(None);
+
+/// The early list to save in first-use order: this run's keys as first
+/// used, then the earlier list's others in its order, at most `max`.
+fn early_list(now: &[String], earlier: &[String], max: usize) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    now.iter()
+        .chain(earlier)
+        .filter(|k| seen.insert(k.as_str()))
+        .take(max)
+        .cloned()
+        .collect()
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
@@ -800,11 +837,36 @@ pub(crate) fn note_used(key: &str) {
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
     }
+    drop(used);
+    if crate::load_hold::on() {
+        let mut first = FIRST_USES.lock().unwrap_or_else(|e| e.into_inner());
+        let first = first.get_or_insert_with(FirstUses::default);
+        if first.order.len() < EARLY_MAX && first.seen.insert(key.to_owned()) {
+            first.order.push(key.to_owned());
+            USED_CHANGED.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// This run's first uses lead, in their order; earlier keys fill up to
+    /// the cap in theirs; none twice.
+    #[test]
+    fn the_early_list_keeps_this_runs_first_uses_first() {
+        let keys = |r: std::ops::Range<usize>| r.map(|i| format!("{i:032x}")).collect::<Vec<_>>();
+        let now = keys(90..110);
+        let earlier = keys(0..100);
+        let list = early_list(&now, &earlier, 100);
+        assert_eq!(list.len(), 100);
+        assert_eq!(&list[..20], &now[..]);
+        assert_eq!(&list[20..], &earlier[..80]);
+        // A run that used more than the cap keeps its first ones.
+        let many = keys(0..150);
+        assert_eq!(early_list(&many, &earlier, 100), keys(0..100));
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {

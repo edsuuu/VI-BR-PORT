@@ -317,6 +317,12 @@ pub(crate) fn mapped(device: &ID3D12Device) -> windows::core::Result<()> {
 /// Times, microseconds and the longest of [`mapped`].
 static MAPPED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
+/// Waits for new card memory since the start ([`mapped`]), for
+/// `crate::load_hold`.
+pub(crate) fn memory_waits() -> u64 {
+    MAPPED[0].load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// New memory (made with [`not_resident`]) is resident when this returns.
 pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> windows::core::Result<()> {
     if !wait_resident() {

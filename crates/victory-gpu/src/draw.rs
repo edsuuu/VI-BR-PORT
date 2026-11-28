@@ -2113,6 +2113,11 @@ impl State {
             crate::bake_keep::bake_drawn(list);
         }
         let (early_ms, bake_ms) = early_budgets();
+        // While the title's loads are held back (VICTORY_LOAD_HOLD), its
+        // loading screen's frames have the time: the backlog goes up then,
+        // not in the scene's first seconds.
+        let held = crate::load_hold::early_texture_budget(early_ms);
+        let early_ms = held.map_or(early_ms, |(ms, _)| ms);
         if compute || (early_ms == 0 && bake_ms == 0) {
             return;
         }
@@ -2149,7 +2154,7 @@ impl State {
             // What a bake may read must be there now: up to 2 GiB.
             (left, 2 << 30)
         } else if first && early_ms > 0 {
-            (early_ms, 64 << 20)
+            (early_ms, held.map_or(64 << 20, |(_, bytes)| bytes))
         } else if admit {
             (0, 0)
         } else {
