@@ -124,6 +124,7 @@ report counts them). `--no-merge` runs the copies as recorded.
 | `--diverge 10 --lists 76 --draws <text>` | each draw of the pipelines named, alone, this often: how many outcomes, and what it reads |
 | `--watch <id>:<offset>:<bytes>` | which lists (with `--lists`: commands) change those words |
 | `--slots <list>:<command>` | the heap slots its constants name |
+| `VICTORY_SLOTS_EXTRA=<n>,<n>` / `VICTORY_RES_EXTRA=<id>,<id>` | with `--slots`: also what those heap slots hold (and every write of them in the frame), and those resources ("not there" when the capture has none): for textures a shader picks by an index read from a constant buffer |
 | `--check-written` | that everything the frame changes is put back |
 | `--upcopies` | runs the frame twice: which words the copies of the CPU's sides of card buffers bring that the card holds another value of (those the card wrote alike in both runs are the ones to look at), and which pieces shaders wrote that were not declared as written. The live check is `VICTORY_UPCOPY_CHECK=1` (`host/upcheck.rs`) |
 | `--flow <lists>` | what the dispatches (`--flow-draws`: draws too) have bound: pipeline, root arguments, heap slots their constants lead to; no device is made |
