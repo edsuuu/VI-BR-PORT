@@ -346,7 +346,7 @@ impl Seen {
         if stream.empty() {
             return;
         }
-        if stream.bytes % desc::RECORD as u64 != 0 {
+        if !stream.bytes.is_multiple_of(desc::RECORD as u64) {
             self.odd += 1;
         }
         match records {

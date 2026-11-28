@@ -519,7 +519,7 @@ pub fn describe_extensions(stream: &Stream, records: Option<&[Record]>, inputs: 
         "{} bytes of extension records at {:#x}",
         stream.bytes, stream.at
     );
-    if stream.bytes % RECORD as u64 != 0 {
+    if !stream.bytes.is_multiple_of(RECORD as u64) {
         text.push_str(" (SIZE NOT A MULTIPLE OF 16)");
     }
     match records {
