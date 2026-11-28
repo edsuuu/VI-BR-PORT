@@ -115,7 +115,15 @@ pub(crate) mod stat {
     pub(crate) const HAD_BYTES: usize = 24;
     /// Jobs.
     pub(crate) const JOBS: usize = 25;
-    pub(crate) const COUNT: usize = 26;
+    /// Pieces put through a view of ours without the mapping lock, a change
+    /// of mapping being under way (`VICTORY_LAND_ANYTIME=1`); pieces that
+    /// waited for one to be done (`=2`), those that gave up, and the
+    /// microseconds both waited.
+    pub(crate) const UNLOCKED: usize = 26;
+    pub(crate) const WAITED: usize = 27;
+    pub(crate) const GAVE_UP: usize = 28;
+    pub(crate) const WAITED_US: usize = 29;
+    pub(crate) const COUNT: usize = 30;
 }
 
 static STATS: [AtomicU64; stat::COUNT] = [const { AtomicU64::new(0) }; stat::COUNT];
@@ -193,6 +201,25 @@ pub(crate) fn log(frames: f64) {
         mb(s[stat::HAD_BYTES]),
         u8::from(skip_on()),
     );
+    // Counted over the whole stretch since the last line, not per frame:
+    // these are rare, and one is enough to matter.
+    let most = WAITED_MOST.swap(0, Ordering::Relaxed);
+    let all = |i: usize| (s[i] * frames).round();
+    if anytime() == 2 || all(stat::UNLOCKED) > 0.0 {
+        tracing::info!(
+            "landing while the runtime changed a mapping, in {:.0} frames: {:.0} pieces through a view of ours without the \
+             mapping lock; {:.0} pieces waited for the change to be done, {:.0} gave up after {} ms and went through the \
+             title's address, {:.2} ms waited in all, the longest {:.2} ms (VICTORY_LAND_ANYTIME={})",
+            frames,
+            all(stat::UNLOCKED),
+            all(stat::WAITED),
+            all(stat::GAVE_UP),
+            WAIT_MOST.as_millis(),
+            all(stat::WAITED_US) / 1000.0,
+            most as f64 / 1000.0,
+            anytime(),
+        );
+    }
 }
 
 /// Threads kept for landing, and the work they are at.
@@ -476,9 +503,66 @@ impl Had {
 /// there), so the change is one of other memory, or one the title makes of
 /// memory its shaders are writing at that moment, which it may not (its
 /// fences are signalled after the landing).
-fn anytime() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ANYTIME").is_none_or(|v| v != "0"))
+///
+/// That reasoning holds for the title's address, not for the physical page:
+/// the record may have been read just before the run left it, and from then
+/// until the merge is done the runtime is free to show the same page
+/// elsewhere, so the card's dwords would go into whatever the title keeps
+/// there now. `VICTORY_LAND_ANYTIME=2` (off unless set; 1 is the default,
+/// as before) closes that: the piece waits for the change under way and
+/// holds the mapping lock through the merge ([`reading_waited`]).
+fn anytime() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var_os("VICTORY_LAND_ANYTIME") {
+        Some(v) if v == "0" => 0,
+        Some(v) if v == "2" => 2,
+        _ => 1,
+    })
+}
+
+/// Longest a piece waits for a change of mapping (`VICTORY_LAND_ANYTIME=2`)
+/// before it goes through the title's address instead.
+const WAIT_MOST: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Since the last frame-rate line: the longest wait of [`reading_waited`],
+/// in microseconds.
+static WAITED_MOST: AtomicU64 = AtomicU64::new(0);
+
+/// [`crate::watch::title_memory_reading`], once the change of mapping under
+/// way is done; `None` if none could be had in [`WAIT_MOST`].
+///
+/// Asked again and again rather than waited for on the lock: a landing job
+/// holds its copy's `merging` lock, and a thread that holds the mapping lock
+/// shared and wants that one alone (a settle under shader writes) would
+/// then wait for us while the runtime, which waits for that thread, keeps
+/// every new reader out. Giving up after a while breaks such a ring; the
+/// piece then goes through the title's address, as with
+/// `VICTORY_LAND_ANYTIME=0`.
+fn reading_waited() -> Option<crate::watch::Reading> {
+    let started = std::time::Instant::now();
+    let mut tries = 0u32;
+    loop {
+        if let Some(reading) = crate::watch::title_memory_reading_now() {
+            let us = started.elapsed().as_micros() as u64;
+            count(stat::WAITED, 1);
+            count(stat::WAITED_US, us);
+            WAITED_MOST.fetch_max(us, Ordering::Relaxed);
+            return Some(reading);
+        }
+        if started.elapsed() >= WAIT_MOST {
+            let us = started.elapsed().as_micros() as u64;
+            count(stat::GAVE_UP, 1);
+            count(stat::WAITED_US, us);
+            WAITED_MOST.fetch_max(us, Ordering::Relaxed);
+            return None;
+        }
+        tries += 1;
+        if tries < 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::yield_now();
+        }
+    }
 }
 
 /// What a job wrote beside the guards, to be noted ([`Notes::flush`]).
@@ -568,10 +652,11 @@ pub(crate) unsafe fn piece(
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
     // SAFETY: the caller's.
-    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), copy) }
+    unsafe { piece_at(title, now, held, parts, take, notes, beside_on(), anytime(), copy) }
 }
 
-/// [`piece`], and whether a view of ours is looked for.
+/// [`piece`], whether a view of ours is looked for, and what is done while
+/// the runtime changes a mapping ([`anytime`]).
 ///
 /// # Safety
 /// [`piece`]'s.
@@ -584,17 +669,25 @@ unsafe fn piece_at(
     take: bool,
     notes: &mut Notes,
     beside: bool,
+    anytime: u8,
     copy: *const crate::shadow::Shadow,
 ) -> u64 {
     let Some(end) = parts.last().map(|p| p.1) else {
         return 0;
     };
     // From here until the piece is put the runtime changes no mapping: our
-    // view's address stays where the title sees `title`. Not waited for: if
-    // a change is under way, what the record of the views says now does
-    // ([`anytime`]), or the title's own address.
-    let reading = beside.then(crate::watch::title_memory_reading_now).flatten();
-    let beside = if reading.is_some() || beside && anytime() { crate::inplace::beside(title, end) } else { None };
+    // view's address stays where the title sees `title`. If a change is under
+    // way: what the record of the views says now ([`anytime`] 1), waited for
+    // (2: the record is then read under the lock), or the title's own
+    // address (0).
+    let mut reading = beside.then(crate::watch::title_memory_reading_now).flatten();
+    if beside && reading.is_none() && anytime == 2 {
+        reading = reading_waited();
+    }
+    let beside = if reading.is_some() || beside && anytime == 1 { crate::inplace::beside(title, end) } else { None };
+    if beside.is_some() && reading.is_none() {
+        count(stat::UNLOCKED, 1);
+    }
     count(stat::PIECES, 1);
     count(if beside.is_some() { stat::BESIDE } else { stat::DIRECT }, 1);
     // The pages that differ, before any is written: none, and the guard
