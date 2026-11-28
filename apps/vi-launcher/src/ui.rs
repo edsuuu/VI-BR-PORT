@@ -28,13 +28,16 @@ const PROJECT_URL: &str = "https://github.com/edsuuu/VI-BR-PORT";
 /// How much of a log the Logs view shows.
 const LOG_TAIL: u64 = 256 * 1024;
 
+/// The window's title (a second launcher finds the first by it).
+pub const TITLE: &str = if update::DEV { "VI-BR-Launcher dev · edsuuu" } else { "VI-BR-Launcher · edsuuu" };
+
 pub fn start() -> ExitCode {
     let size = [num("size", "windowWidth"), num("size", "windowHeight")];
     // Full screen as it was left (F11 or Alt+Enter), maximized otherwise.
     let fullscreen = config::load(&paths::config_path()).config.fullscreen.unwrap_or(false);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(if update::DEV { "VI-BR-Launcher dev · edsuuu" } else { "VI-BR-Launcher · edsuuu" })
+            .with_title(TITLE)
             // The same mark as the executable's icon (mark.rs, build.rs).
             .with_icon(std::sync::Arc::new(egui::IconData { rgba: crate::mark::rgba(64), width: 64, height: 64 }))
             .with_inner_size(size)
@@ -43,7 +46,7 @@ pub fn start() -> ExitCode {
             .with_fullscreen(fullscreen),
         ..Default::default()
     };
-    match eframe::run_native(if update::DEV { "VI-BR-Launcher dev · edsuuu" } else { "VI-BR-Launcher · edsuuu" }, options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
+    match eframe::run_native(TITLE, options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{e}");

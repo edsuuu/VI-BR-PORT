@@ -23,6 +23,7 @@ mod mark;
 mod options;
 mod paths;
 mod run;
+mod single;
 mod text;
 mod theme;
 mod tray;
@@ -34,6 +35,10 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.is_empty() {
+        // A launcher already open (maybe in the tray) is brought back instead.
+        if !single::first(ui::TITLE) {
+            return ExitCode::SUCCESS;
+        }
         return ui::start();
     }
     attach_console();
